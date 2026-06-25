@@ -1,0 +1,94 @@
+obj_id: gsk_sisense_commerce_lb
+liveboard:
+  name: PS-ECommerce Overview
+  description: Demo liveboard for the cross-cluster promotion (built on the PS-ECommerce model).
+  visualizations:
+    - id: Viz_1
+      answer:
+        name: Revenue by Brand
+        tables:
+          - name: PS-ECommerce
+        search_query: "[Brand] [Revenue]"
+        answer_columns:
+          - name: Brand
+          - name: Total Revenue
+        table:
+          table_columns:
+            - column_id: Brand
+            - column_id: Total Revenue
+          ordered_column_ids:
+            - Brand
+            - Total Revenue
+        chart:
+          type: COLUMN
+          chart_columns:
+            - column_id: Brand
+            - column_id: Total Revenue
+          axis_configs:
+            - x:
+                - Brand
+              y:
+                - Total Revenue
+        display_mode: CHART_MODE
+    - id: Viz_2
+      answer:
+        name: Revenue by Category
+        tables:
+          - name: PS-ECommerce
+        search_query: "[Category] [Revenue]"
+        answer_columns:
+          - name: Category
+          - name: Total Revenue
+        table:
+          table_columns:
+            - column_id: Category
+            - column_id: Total Revenue
+          ordered_column_ids:
+            - Category
+            - Total Revenue
+        chart:
+          type: COLUMN
+          chart_columns:
+            - column_id: Category
+            - column_id: Total Revenue
+          axis_configs:
+            - x:
+                - Category
+              y:
+                - Total Revenue
+        display_mode: CHART_MODE
+    - id: Viz_3
+      answer:
+        name: Revenue over Time
+        tables:
+          - name: PS-ECommerce
+        search_query: "[Date].monthly [Revenue]"
+        answer_columns:
+          - name: Month(Date)
+          - name: Total Revenue
+        table:
+          table_columns:
+            - column_id: Month(Date)
+            - column_id: Total Revenue
+          ordered_column_ids:
+            - Month(Date)
+            - Total Revenue
+        chart:
+          type: LINE
+          chart_columns:
+            - column_id: Month(Date)
+            - column_id: Total Revenue
+          axis_configs:
+            - x:
+                - Month(Date)
+              y:
+                - Total Revenue
+        display_mode: CHART_MODE
+  layout:
+    tiles:
+      - visualization_id: Viz_1
+        size: MEDIUM
+      - visualization_id: Viz_2
+        size: MEDIUM
+      - visualization_id: Viz_3
+        size: LARGE

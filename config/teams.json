@@ -1,0 +1,9 @@
+{
+  "Commercial SBU": {
+    "tags": ["TEST_TS"],
+    "source_connection": "DB - Dev - PS",
+    "target_connection": "DB - Test - PS",
+    "db_map": {},
+    "schema_map": {}
+  }
+}

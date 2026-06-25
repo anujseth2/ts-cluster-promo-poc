@@ -1,0 +1,238 @@
+"""
+TML transformation logic — pure dict/JSON operations, no thoughtspot_tml library.
+
+Cross-cluster promotion keeps object names IDENTICAL across clusters (identity is
+carried by obj_id, not by name). The only rewrites are on the data layer:
+
+  1. FQN stripping on table refs inside models (force obj_id resolution on import)
+  2. Connection name remap   source -> target   (clusters point at different connections)
+  3. db / schema remap        source -> target   (clusters point at different warehouses)
+
+Any value that is already a ThoughtSpot variable token (e.g. ${dc_db}) is left
+untouched, so a future move to parameterised TML is a no-op here.
+"""
+
+import json
+import yaml
+from typing import Dict, List, Tuple, Optional
+
+
+# Top-level TML type keys
+TML_TYPE_KEYS = ("liveboard", "answer", "model", "worksheet", "table")
+
+
+def _tml_type(doc: dict) -> Optional[str]:
+    for key in TML_TYPE_KEYS:
+        if key in doc:
+            return key
+    return None
+
+
+def _is_var(v) -> bool:
+    """True if the value is a ThoughtSpot variable token like ${dc_db} — leave those alone."""
+    return isinstance(v, str) and v.strip().startswith("${")
+
+
+# ── Dependency extraction ──────────────────────────────────────────────────────
+
+def extract_model_refs(doc: dict) -> List[str]:
+    """
+    Return the names of models/worksheets referenced by a liveboard or answer.
+    Liveboard: liveboard.visualizations[].answer.tables[].name
+    Answer:    answer.tables[].name
+    """
+    refs = []
+    for viz in doc.get("liveboard", {}).get("visualizations", []):
+        for tbl in viz.get("answer", {}).get("tables", []):
+            name = tbl.get("name") or tbl.get("alias")
+            if name:
+                refs.append(name)
+    for tbl in doc.get("answer", {}).get("tables", []):
+        name = tbl.get("name") or tbl.get("alias")
+        if name:
+            refs.append(name)
+    return list(set(refs))
+
+
+def extract_table_refs(doc: dict) -> List[str]:
+    """
+    Return the names of physical/logical tables referenced by a model or worksheet.
+    Used to walk the dependency chain down to the tables a model sits on.
+    """
+    refs = []
+    typ = _tml_type(doc)
+    if typ in ("model", "worksheet"):
+        node = doc[typ]
+        # Worksheets use `tables`; Models (10.12+) use `model_tables`.
+        for key in ("tables", "model_tables"):
+            for t in node.get(key, []):
+                name = t.get("name") or t.get("alias")
+                if name:
+                    refs.append(name)
+    return list(set(refs))
+
+
+# ── Data-layer remap helpers ────────────────────────────────────────────────────
+
+def _remap_connection(node: dict, source_connection: str, target_connection: str):
+    """Point a table/model's connection reference at the target cluster's connection."""
+    conn = node.get("connection")
+    if not isinstance(conn, dict) or not conn.get("name") or _is_var(conn["name"]):
+        return
+    if not source_connection or conn["name"] == source_connection:
+        # The source connection's GUID is meaningless on the target cluster, so drop
+        # fqn and let the import resolve the connection by name on the target.
+        conn.pop("fqn", None)
+        if target_connection:
+            conn["name"] = target_connection
+
+
+def _remap_location(node: dict, db_map: dict, schema_map: dict):
+    """Rewrite db / schema to the target warehouse's names (skip variable tokens)."""
+    for key, mapping in (("db", db_map), ("schema", schema_map)):
+        val = node.get(key)
+        if val and not _is_var(val) and mapping and val in mapping:
+            node[key] = mapping[val]
+
+
+# ── Single-document transform ──────────────────────────────────────────────────
+
+def transform_doc(
+    doc: dict,
+    source_connection: str = "",
+    target_connection: str = "",
+    db_map: Optional[dict] = None,
+    schema_map: Optional[dict] = None,
+) -> Tuple[dict, List[str]]:
+    """
+    Apply the data-layer transforms to a single TML document dict.
+    Names are preserved. Returns (transformed_doc, warnings).
+    """
+    warnings = []
+    db_map    = db_map or {}
+    schema_map = schema_map or {}
+
+    typ = _tml_type(doc)
+    if not typ:
+        return doc, ["Unknown TML type — skipped"]
+
+    obj = doc[typ]
+
+    if typ == "table":
+        # Physical table: this is where db / schema / connection actually live.
+        obj.pop("fqn", None)
+        _remap_connection(obj, source_connection, target_connection)
+        _remap_location(obj, db_map, schema_map)
+
+    elif typ in ("model", "worksheet"):
+        # Model references tables by name + fqn; strip fqn so import resolves by obj_id.
+        # Worksheets use `tables`; Models (10.12+) use `model_tables`.
+        for key in ("tables", "model_tables"):
+            for t in obj.get(key, []):
+                t.pop("fqn", None)
+                _remap_connection(t, source_connection, target_connection)
+                _remap_location(t, db_map, schema_map)
+
+    # liveboard / answer: names are preserved cross-cluster, nothing to rewrite.
+    return doc, warnings
+
+
+# ── Batch transform ─────────────────────────────────────────────────────────────
+
+def transform_items(
+    items: List[dict],
+    source_connection: str = "",
+    target_connection: str = "",
+    db_map: Optional[dict] = None,
+    schema_map: Optional[dict] = None,
+) -> Tuple[List[dict], List[dict]]:
+    """
+    Transform a list of raw API items (each with 'edoc' string + 'info' dict).
+    Returns (transformed_items, all_warnings).
+    """
+    result = []
+    all_warnings = []
+
+    for item in items:
+        info = item.get("info", {})
+        name = info.get("name", "unknown")
+        edoc = item.get("edoc", "{}")
+        doc  = json.loads(edoc) if edoc.strip().startswith("{") else yaml.safe_load(edoc)
+
+        doc, warns = transform_doc(doc, source_connection, target_connection, db_map, schema_map)
+        for w in warns:
+            all_warnings.append({"object": name, "issue": w})
+
+        result.append({**item, "edoc": json.dumps(doc)})
+
+    return result, all_warnings
+
+
+# ── Issue detection ─────────────────────────────────────────────────────────────
+
+def detect_issues(items: List[dict]) -> List[dict]:
+    """Flag objects with no obj_id — required for cross-cluster identity matching."""
+    issues = []
+    for item in items:
+        info = item.get("info", {})
+        name = info.get("name", "")
+        typ  = info.get("type", "")
+        edoc = item.get("edoc", "{}")
+        doc  = json.loads(edoc) if edoc.strip().startswith("{") else yaml.safe_load(edoc)
+        if not doc.get("obj_id"):
+            issues.append({
+                "object": name,
+                "type":   typ,
+                "issue":  "No obj_id set — required for cross-cluster identity matching",
+            })
+    return issues
+
+
+# ── Serialisation helpers ────────────────────────────────────────────────────────
+
+def items_to_files(items: List[dict]) -> Dict[str, str]:
+    """
+    Convert transformed API items → {relative_path: json_string} for git commit.
+    Structure:  tables/<name>.table.tml
+                models/<name>.model.tml
+                liveboards/<name>.liveboard.tml
+                answers/<name>.answer.tml
+    """
+    TYPE_FOLDER = {
+        "model":     "models",
+        "worksheet": "models",
+        "liveboard": "liveboards",
+        "answer":    "answers",
+        "table":     "tables",
+    }
+    files = {}
+    for item in items:
+        info     = item.get("info", {})
+        name     = info.get("name", "unknown")
+        edoc     = item.get("edoc", "{}")
+        doc      = json.loads(edoc) if edoc.strip().startswith("{") else yaml.safe_load(edoc)
+        typ      = _tml_type(doc)
+        if not typ:
+            continue
+        obj_name  = doc[typ].get("name", name)
+        folder    = TYPE_FOLDER.get(typ, typ + "s")
+        safe_name = obj_name.replace(" ", "_").replace("/", "-")
+        path      = f"{folder}/{safe_name}.{typ}.tml"
+        files[path] = json.dumps(doc, indent=2)
+    return files
+
+
+def files_to_tml_strings(files: Dict[str, str]) -> List[str]:
+    """
+    Convert {path: content} from git back to a list of TML strings for import,
+    ordered so dependencies import first: tables -> models -> liveboards/answers.
+    """
+    tables, models, others = [], [], []
+    for path, content in files.items():
+        if path.startswith("tables/"):
+            tables.append(content)
+        elif path.startswith("models/"):
+            models.append(content)
+        else:
+            others.append(content)
+    return tables + models + others

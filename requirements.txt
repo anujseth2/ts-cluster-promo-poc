@@ -1,0 +1,8 @@
+streamlit>=1.35.0
+requests>=2.31.0
+PyGithub>=2.3.0
+python-dotenv>=1.0.0
+pandas>=2.0.0
+PyYAML>=6.0
+# scripts/seed_databricks.py only
+databricks-sql-connector>=3.0.0

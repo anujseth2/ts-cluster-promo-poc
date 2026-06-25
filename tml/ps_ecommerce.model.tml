@@ -1,0 +1,107 @@
+obj_id: gsk_sisense_commerce
+model:
+  name: PS-ECommerce
+  description: |
+    Commerce star schema for the cross-cluster promotion demo.
+    Fact: commerce. Dimensions: brand, category, country.
+  model_tables:
+    - name: commerce
+      joins:
+        - with: brand
+          on: "[commerce::Brand_ID] = [brand::Brand_ID]"
+          type: LEFT_OUTER
+          cardinality: MANY_TO_ONE
+        - with: category
+          on: "[commerce::Category_ID] = [category::Category_ID]"
+          type: LEFT_OUTER
+          cardinality: MANY_TO_ONE
+        - with: country
+          on: "[commerce::Country_ID] = [country::Country_ID]"
+          type: LEFT_OUTER
+          cardinality: MANY_TO_ONE
+    - name: brand
+    - name: category
+    - name: country
+  columns:
+    # ── commerce (fact) ──
+    - name: Visit ID
+      column_id: commerce::Visit_ID
+      properties:
+        column_type: ATTRIBUTE
+    - name: Date
+      column_id: commerce::Date
+      properties:
+        column_type: ATTRIBUTE
+        calendar: default
+    - name: Age Range
+      column_id: commerce::Age_Range
+      properties:
+        column_type: ATTRIBUTE
+    - name: Gender
+      column_id: commerce::Gender
+      properties:
+        column_type: ATTRIBUTE
+    - name: Condition
+      column_id: commerce::Condition
+      properties:
+        column_type: ATTRIBUTE
+    - name: Quantity
+      column_id: commerce::Quantity
+      properties:
+        column_type: MEASURE
+        aggregation: SUM
+    - name: Cost
+      column_id: commerce::Cost
+      properties:
+        column_type: MEASURE
+        aggregation: SUM
+    - name: Revenue
+      column_id: commerce::Revenue
+      properties:
+        column_type: MEASURE
+        aggregation: SUM
+    - name: Brand_ID
+      column_id: commerce::Brand_ID
+      properties:
+        column_type: ATTRIBUTE
+        is_hidden: true
+    - name: Category_ID
+      column_id: commerce::Category_ID
+      properties:
+        column_type: ATTRIBUTE
+        is_hidden: true
+    - name: Country_ID
+      column_id: commerce::Country_ID
+      properties:
+        column_type: ATTRIBUTE
+        is_hidden: true
+    # ── brand (dim) ──
+    - name: Brand
+      column_id: brand::Brand
+      properties:
+        column_type: ATTRIBUTE
+    - name: Brand_ID (brand)
+      column_id: brand::Brand_ID
+      properties:
+        column_type: ATTRIBUTE
+        is_hidden: true
+    # ── category (dim) ──
+    - name: Category
+      column_id: category::Category
+      properties:
+        column_type: ATTRIBUTE
+    - name: Category_ID (category)
+      column_id: category::Category_ID
+      properties:
+        column_type: ATTRIBUTE
+        is_hidden: true
+    # ── country (dim) ──
+    - name: Country
+      column_id: country::Country
+      properties:
+        column_type: ATTRIBUTE
+    - name: Country_ID (country)
+      column_id: country::Country_ID
+      properties:
+        column_type: ATTRIBUTE
+        is_hidden: true

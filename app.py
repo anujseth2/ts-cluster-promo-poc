@@ -1,0 +1,768 @@
+"""
+ThoughtSpot Cross-Cluster TML Promotion Tool
+Streamlit POC
+"""
+
+import json
+import os
+import yaml
+from pathlib import Path
+from dotenv import load_dotenv
+
+import streamlit as st
+
+from services.ts_client import TSClient
+from services.git_client import GitClient
+from services.tml_transformer import (
+    detect_issues,
+    transform_items,
+    extract_model_refs,
+    items_to_files,
+    files_to_tml_strings,
+)
+from services.import_diagnostics import classify_import_errors, drop_columns, silent_drop_findings
+
+load_dotenv(Path(__file__).parent / ".env")
+
+# ── Config ────────────────────────────────────────────────────────────────────
+
+TEAMS_FILE = Path(__file__).parent / "config" / "teams.json"
+
+STEPS = [
+    "1 · Select Assets",
+    "2 · obj_id Setup",
+    "3 · Review",
+    "4 · Git Operations",
+    "5 · Import Results",
+]
+
+
+def load_teams() -> dict:
+    return json.loads(TEAMS_FILE.read_text())
+
+
+def save_teams(teams: dict):
+    TEAMS_FILE.write_text(json.dumps(teams, indent=2))
+
+
+def get_env(key: str) -> str:
+    val = os.environ.get(key, "")
+    if not val:
+        st.error(f"Missing environment variable: `{key}`. Check your `.env` file.")
+        st.stop()
+    return val
+
+
+def opt_env(key: str) -> str:
+    """Optional env var — empty string if unset."""
+    return os.environ.get(key, "")
+
+
+def _parse_edoc(edoc: str) -> dict:
+    return json.loads(edoc) if edoc.strip().startswith("{") else yaml.safe_load(edoc)
+
+
+# ── Clients (cached per session) ──────────────────────────────────────────────
+
+def _make_client(prefix: str) -> TSClient:
+    """Build a cluster client from TS_<prefix>_* env vars. Token wins over user/pass."""
+    host  = get_env(f"TS_{prefix}_HOST")
+    proxy = opt_env("TS_PROXY")
+    token = opt_env(f"TS_{prefix}_TOKEN")
+    if token:
+        return TSClient(host, token=token,
+                        org_id=opt_env(f"TS_{prefix}_ORG"), proxy=proxy)
+    return TSClient(host,
+                    username=get_env(f"TS_{prefix}_USERNAME"),
+                    password=get_env(f"TS_{prefix}_PASSWORD"),
+                    org_id=opt_env(f"TS_{prefix}_ORG"), proxy=proxy)
+
+
+@st.cache_resource
+def source_client() -> TSClient:
+    return _make_client("SOURCE")
+
+
+@st.cache_resource
+def target_client() -> TSClient:
+    return _make_client("TARGET")
+
+
+@st.cache_resource
+def git_client() -> GitClient:
+    return GitClient(get_env("GITHUB_TOKEN"), get_env("GITHUB_REPO"))
+
+
+# ── Navigation helpers ────────────────────────────────────────────────────────
+
+def _go(step: int):
+    st.session_state.step = step
+    st.rerun()
+
+
+def _nav(step: int, can_next: bool = True):
+    st.divider()
+    col_back, _, col_next = st.columns([1, 6, 1])
+    with col_back:
+        if step > 0 and st.button("← Back", key=f"back_{step}"):
+            _go(step - 1)
+    with col_next:
+        if step < len(STEPS) - 1 and can_next:
+            if st.button("Next →", type="primary", key=f"next_{step}"):
+                _go(step + 1)
+
+
+# ── Page setup ────────────────────────────────────────────────────────────────
+
+st.set_page_config(
+    page_title="TS Cross-Cluster Promotion",
+    page_icon="🔄",
+    layout="wide",
+)
+
+st.title("ThoughtSpot Cross-Cluster Promotion")
+
+# ── Sidebar ───────────────────────────────────────────────────────────────────
+
+teams = load_teams()
+
+with st.sidebar:
+    st.header("Team")
+    team_name = st.selectbox("Select team", list(teams.keys()))
+    team_cfg  = teams[team_name]
+    team_tags = team_cfg.get("tags", [])
+    st.caption("Scope tag(s): " + (", ".join(f"`{t}`" for t in team_tags) or "_none set_"))
+
+    st.divider()
+    st.subheader("Connections")
+    st.caption("Remap connection references from the source to the target cluster.")
+
+    src_conn = st.text_input("Source connection name",
+                             value=team_cfg.get("source_connection", ""),
+                             key="src_conn")
+    tgt_conn = st.text_input("Target connection name",
+                             value=team_cfg.get("target_connection", ""),
+                             key="tgt_conn")
+
+    if st.button("Save connection config"):
+        teams[team_name]["source_connection"] = src_conn
+        teams[team_name]["target_connection"] = tgt_conn
+        save_teams(teams)
+        st.success("Saved.")
+
+    st.divider()
+    st.caption("Names are preserved across clusters; identity is by obj_id.")
+
+# ── Step indicator ─────────────────────────────────────────────────────────────
+
+step = st.session_state.get("step", 0)
+
+cols = st.columns(len(STEPS))
+for i, (col, label) in enumerate(zip(cols, STEPS)):
+    with col:
+        if i == step:
+            st.markdown(
+                f"<div style='text-align:center;padding:6px 0;border-bottom:3px solid #ff4b4b;"
+                f"font-weight:700;font-size:13px'>{label}</div>",
+                unsafe_allow_html=True,
+            )
+        elif i < step:
+            if st.button(label, key=f"step_{i}", use_container_width=True):
+                _go(i)
+        else:
+            st.markdown(
+                f"<div style='text-align:center;padding:6px 0;color:#94a3b8;font-size:13px'>{label}</div>",
+                unsafe_allow_html=True,
+            )
+
+st.divider()
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 0 — Select Assets
+# ══════════════════════════════════════════════════════════════════════════════
+
+if step == 0:
+    st.subheader(f"Source-cluster assets — team: {team_name}")
+
+    if not team_tags:
+        st.warning("No scope tag configured for this team in `config/teams.json`.")
+
+    if st.button("Fetch tagged content", type="primary", disabled=not team_tags):
+        with st.spinner("Searching the source cluster by tag…"):
+            st.session_state.assets   = source_client().search_by_tags(team_tags)
+            st.session_state.leaf_ids = []
+            for key in ("selected_ids", "dep_info", "obj_id_status", "table_alignment",
+                        "transformed_items", "import_results"):
+                st.session_state.pop(key, None)
+
+    assets = st.session_state.get("assets", [])
+
+    if not assets:
+        if "assets" in st.session_state:
+            st.info("No liveboards or answers found with tag(s): "
+                    + ", ".join(f"`{t}`" for t in team_tags))
+    else:
+        import pandas as pd
+
+        df = pd.DataFrame(assets)[["name", "type", "author", "modified", "id"]]
+        df.insert(0, "select", False)
+
+        edited = st.data_editor(
+            df,
+            column_config={
+                "select":   st.column_config.CheckboxColumn("Promote?", default=False),
+                "name":     st.column_config.TextColumn("Name",     width="large"),
+                "type":     st.column_config.TextColumn("Type",     width="medium"),
+                "author":   st.column_config.TextColumn("Author",   width="medium"),
+                "modified": st.column_config.TextColumn("Modified", width="medium"),
+                "id":       st.column_config.TextColumn("ID",       width="small"),
+            },
+            disabled=["name", "type", "author", "modified", "id"],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        leaf_ids = edited[edited["select"] == True]["id"].tolist()
+        st.session_state.leaf_ids = leaf_ids
+
+        # Resolve the dependency chain: leaves -> models -> tables
+        if leaf_ids and st.button("Resolve dependencies"):
+            with st.spinner("Walking dependencies on the source cluster…"):
+                dep = source_client().resolve_dependencies(leaf_ids)
+                st.session_state.selected_ids = list(dict.fromkeys(
+                    dep["table_ids"] + dep["model_ids"] + leaf_ids
+                ))
+                st.session_state.dep_info = dep
+
+        dep = st.session_state.get("dep_info")
+        if dep:
+            promo = st.session_state.get("selected_ids", [])
+            st.success(
+                f"Promotion set: {len(promo)} object(s) — "
+                f"{len(st.session_state.get('leaf_ids', []))} leaf, "
+                f"{len(dep['model_ids'])} model(s), {len(dep['table_ids'])} table(s)."
+            )
+            missing = dep["missing_models"] + dep["missing_tables"]
+            if missing:
+                st.warning("Unresolved on the source cluster: "
+                           + ", ".join(f"`{n}`" for n in missing))
+
+    can_next = bool(st.session_state.get("selected_ids"))
+    _nav(0, can_next=can_next)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 1 — obj_id Setup
+# ══════════════════════════════════════════════════════════════════════════════
+
+elif step == 1:
+    st.subheader("obj_id Health Check")
+    st.markdown(
+        "Every object being promoted needs `obj_id` set on the **source**. Tables that already "
+        "exist on the **target** must share the same `obj_id` (otherwise import duplicates them); "
+        "tables absent on the target are created on import with the source `obj_id`."
+    )
+
+    selected_ids = st.session_state.get("selected_ids", [])
+
+    if not selected_ids:
+        st.info("Select assets in Step 1 first.")
+    else:
+        if st.button("Check obj_id status", type="primary"):
+            with st.spinner("Exporting TML from the source cluster…"):
+                raw   = source_client().export_tml(selected_ids)
+                items = raw if isinstance(raw, list) else raw.get("object", [])
+
+                # Part A: object-level obj_ids
+                status_rows = []
+                for item in items:
+                    info     = item.get("info", {})
+                    obj_name = info.get("name", "unknown")
+                    obj_type = info.get("type", "")
+                    doc      = _parse_edoc(item.get("edoc", "{}"))
+                    oid      = doc.get("obj_id", "")
+                    status_rows.append({
+                        "object": obj_name,
+                        "type":   obj_type,
+                        "obj_id": oid,
+                        "ok":     bool(oid),
+                    })
+
+                # Part B: table obj_id — source value vs target. Read the table obj_id
+                # from the TABLE TML (the model's table-reference does not carry one).
+                dev_table_refs = {}
+                for item in items:
+                    doc = _parse_edoc(item.get("edoc", "{}"))
+                    if "table" in doc:
+                        tname = doc["table"].get("name")
+                        if tname:
+                            dev_table_refs[tname] = doc.get("obj_id", "")
+
+                prod_resp  = target_client()._post(
+                    "/api/rest/2.0/metadata/search",
+                    {"metadata": [{"type": "LOGICAL_TABLE"}], "record_size": 200},
+                )
+                prod_items = prod_resp if isinstance(prod_resp, list) else prod_resp.get("metadata", [])
+                prod_by_name = {o.get("metadata_name"): o for o in prod_items}
+
+                # state: aligned | mismatch (exists on target with a different obj_id ->
+                # import would duplicate) | create (absent on target -> created on import).
+                table_rows = []
+                for tname, dev_oid in dev_table_refs.items():
+                    prod_obj = prod_by_name.get(tname)
+                    prod_oid = prod_obj.get("metadata_obj_id", "") if prod_obj else None
+                    if prod_obj is None:
+                        state = "create"
+                    elif dev_oid and prod_oid == dev_oid:
+                        state = "aligned"
+                    else:
+                        state = "mismatch"
+                    table_rows.append({
+                        "table":         tname,
+                        "source_obj_id": dev_oid or "NOT SET",
+                        "target_obj_id": (prod_oid or "NOT SET") if prod_obj else "WILL CREATE",
+                        "state":         state,
+                    })
+
+                st.session_state.obj_id_status   = status_rows
+                st.session_state._raw_items      = items
+                st.session_state.table_alignment = table_rows
+                st.session_state.prod_by_name    = prod_by_name
+                st.session_state.dev_table_refs  = dev_table_refs
+
+    import pandas as pd
+
+    status = st.session_state.get("obj_id_status", [])
+    if status:
+        st.markdown("#### Selected objects")
+        missing_objs = [r for r in status if not r["ok"]]
+        if not missing_objs:
+            st.success("All selected objects have `obj_id` set.")
+        else:
+            st.warning(f"{len(missing_objs)} object(s) missing `obj_id`.")
+
+        df_obj = pd.DataFrame(status)[["object", "type", "obj_id", "ok"]]
+        edited_status = st.data_editor(
+            df_obj,
+            column_config={
+                "object": st.column_config.TextColumn("Object", width="large"),
+                "type":   st.column_config.TextColumn("Type",   width="medium"),
+                "obj_id": st.column_config.TextColumn("obj_id (edit to set)", width="large"),
+                "ok":     st.column_config.CheckboxColumn("Has obj_id", disabled=True),
+            },
+            disabled=["object", "type", "ok"],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        if st.button("Apply obj_id on the source cluster", type="primary"):
+            raw_items = st.session_state._raw_items
+            patched = []
+            for row, item in zip(edited_status.itertuples(), raw_items):
+                new_id = str(row.obj_id).strip()
+                if new_id:
+                    doc = _parse_edoc(item.get("edoc", "{}"))
+                    doc["obj_id"] = new_id
+                    patched.append(json.dumps(doc))
+            if not patched:
+                st.warning("No obj_id values to apply.")
+            else:
+                with st.spinner(f"Writing obj_id to {len(patched)} object(s)…"):
+                    results = source_client().import_tml(patched, policy="PARTIAL")
+                ok  = [r for r in results if r["status"] == "OK"]
+                err = [r for r in results if r["status"] != "OK"]
+                if ok:
+                    st.success(f"obj_id applied to {len(ok)} object(s) on the source cluster.")
+                for e in err:
+                    st.error(f"{e['name']}: {e['error']}")
+
+    table_rows = st.session_state.get("table_alignment", [])
+    if table_rows:
+        st.divider()
+        st.markdown("#### Table obj_id (source → target)")
+        misaligned  = [r for r in table_rows if r["state"] == "mismatch"]
+        will_create = [r for r in table_rows if r["state"] == "create"]
+        if misaligned:
+            st.warning(f"{len(misaligned)} table(s) already exist on the target with a different "
+                       "`obj_id` — importing would create duplicates. Fix below before continuing.")
+        elif will_create:
+            st.info(f"{len(will_create)} table(s) are absent on the target and will be created on "
+                    "import with the source `obj_id` (ensure the source `obj_id` is set above).")
+        else:
+            st.success("All target tables exist and are aligned on `obj_id`.")
+
+        df_tables = pd.DataFrame(table_rows)[["table", "source_obj_id", "target_obj_id", "state"]]
+        st.dataframe(
+            df_tables,
+            column_config={"state": st.column_config.TextColumn("State")},
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        if misaligned:
+            if st.button("Fix target table obj_ids", type="primary"):
+                prod_by_name   = st.session_state.get("prod_by_name", {})
+                dev_table_refs = st.session_state.get("dev_table_refs", {})
+                to_fix, not_found = [], []
+                for r in misaligned:
+                    tname   = r["table"]
+                    dev_oid = dev_table_refs.get(tname, "")
+                    if not dev_oid:
+                        continue
+                    prod_obj = prod_by_name.get(tname)
+                    if not prod_obj:
+                        not_found.append(tname)
+                        continue
+                    to_fix.append({
+                        "guid":   prod_obj.get("metadata_id"),
+                        "name":   tname,
+                        "obj_id": dev_oid,
+                    })
+
+                if not_found:
+                    st.error(f"Tables not found on the target cluster — import from its connection first: {', '.join(not_found)}")
+
+                if to_fix:
+                    with st.spinner(f"Setting obj_id on {len(to_fix)} target table(s)…"):
+                        guids       = [t["guid"] for t in to_fix]
+                        guid_to_oid = {t["guid"]: t["obj_id"] for t in to_fix}
+
+                        raw_exp   = target_client().export_tml(guids)
+                        exp_items = raw_exp if isinstance(raw_exp, list) else raw_exp.get("object", [])
+
+                        patched = []
+                        for item in exp_items:
+                            info    = item.get("info", {})
+                            guid    = info.get("id") or info.get("metadata_id")
+                            desired = guid_to_oid.get(guid)
+                            if not desired:
+                                continue
+                            doc = _parse_edoc(item.get("edoc", "{}"))
+                            doc["obj_id"] = desired
+                            patched.append(json.dumps(doc))
+
+                        results = target_client().import_tml(patched, policy="PARTIAL")
+                        ok_res  = [r for r in results if r["status"] == "OK"]
+                        err_res = [r for r in results if r["status"] != "OK"]
+                    if ok_res:
+                        st.success(f"obj_id fixed on {len(ok_res)} target table(s).")
+                    for e in err_res:
+                        st.error(f"{e['name']}: {e['error']}")
+
+    all_ok = (
+        bool(status) and not [r for r in status if not r["ok"]]
+        and not [r for r in table_rows if r["state"] == "mismatch"]
+    )
+    _nav(1, can_next=all_ok)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 2 — Review
+# ══════════════════════════════════════════════════════════════════════════════
+
+elif step == 2:
+    st.subheader("Review — data-layer remap preview")
+
+    selected_ids = st.session_state.get("selected_ids", [])
+
+    if not selected_ids:
+        st.info("Select assets in Step 1 first.")
+    else:
+        if st.button("Load & preview transformation", type="primary"):
+            with st.spinner("Exporting TML from the source cluster…"):
+                raw   = source_client().export_tml(selected_ids)
+                items = raw if isinstance(raw, list) else raw.get("object", [])
+
+                issues = detect_issues(items)
+                transformed_items, warnings = transform_items(
+                    items,
+                    source_connection=teams[team_name].get("source_connection", ""),
+                    target_connection=teams[team_name].get("target_connection", ""),
+                    db_map=teams[team_name].get("db_map", {}),
+                    schema_map=teams[team_name].get("schema_map", {}),
+                )
+
+                st.session_state.transformed_items = transformed_items
+                st.session_state.issues            = issues
+                st.session_state.warnings          = warnings
+
+        transformed_items = st.session_state.get("transformed_items")
+        issues            = st.session_state.get("issues", [])
+        warnings          = st.session_state.get("warnings", [])
+
+        if transformed_items is not None:
+            st.markdown("**Objects to promote:**")
+            for item in transformed_items:
+                info = item.get("info", {})
+                name = info.get("name", "unknown")
+                typ  = info.get("type", "")
+                doc  = _parse_edoc(item.get("edoc", "{}"))
+                oid  = doc.get("obj_id", "")
+                badge = "✅" if oid else "⚠️"
+                st.markdown(
+                    f"- {badge} `{name}` ({typ})"
+                    + (f" — obj_id: `{oid}`" if oid else " — **no obj_id**")
+                )
+
+            if issues:
+                st.divider()
+                st.warning(f"{len(issues)} object(s) flagged for review:")
+                for issue in issues:
+                    with st.expander(f"⚠️  {issue['object']} ({issue['type']})"):
+                        st.write(issue["issue"])
+                        action = st.radio(
+                            "Action",
+                            ["Include anyway", "Skip this object"],
+                            key=f"action_{issue['object']}",
+                        )
+                        if action == "Skip this object":
+                            st.session_state.setdefault("skip_objects", set()).add(issue["object"])
+                        else:
+                            st.session_state.get("skip_objects", set()).discard(issue["object"])
+
+            if warnings:
+                st.divider()
+                st.error(f"{len(warnings)} transformation warning(s):")
+                for w in warnings:
+                    st.markdown(f"- **{w['object']}**: {w['issue']}")
+
+    _nav(2, can_next=bool(st.session_state.get("transformed_items") is not None))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 3 — Git Operations
+# ══════════════════════════════════════════════════════════════════════════════
+
+elif step == 3:
+    st.subheader("Git Operations")
+
+    transformed_items = st.session_state.get("transformed_items")
+
+    if transformed_items is None:
+        st.info("Complete Step 3 (Review) first.")
+    else:
+        skip_objects  = st.session_state.get("skip_objects", set())
+        filtered_items = [
+            i for i in transformed_items
+            if i.get("info", {}).get("name") not in skip_objects
+        ]
+
+        def _run_validation(items):
+            """Commit items to dev, create/update PR, validate models from dev. Returns (pr_url, errors, ok)."""
+            files  = items_to_files(items)
+            gc     = git_client()
+            sha    = gc.commit_tml(team_name, files)
+            pr_url = gc.create_pr(team_name, sha)
+
+            # Read from dev branch — not main — so we validate what we just committed.
+            # Validate tables AND models (tables first): table validation is what surfaces
+            # a source column missing from the target warehouse (err 14536) and a drop
+            # blocked by target dependents; models catch the rest.
+            tml_files   = gc.get_tml_files(team_name, branch=gc.DEV_BRANCH)
+            val_strings = ([c for p, c in tml_files.items() if p.startswith("tables/")]
+                           + [c for p, c in tml_files.items() if p.startswith("models/")])
+            if not val_strings:
+                return pr_url, [], []
+            results = target_client().import_tml(val_strings, policy="VALIDATE_ONLY")
+            ok  = [r for r in results if r["status"] == "OK"]
+            err = [r for r in results if r["status"] != "OK"]
+            return pr_url, err, ok
+
+        def _detect_silent_drops(items):
+            """Target columns absent from the source -> dropped on import, SILENTLY when
+            they have no dependents (the platform raises no error). Diff source tables
+            against their current target versions before the final import."""
+            tgt = target_client()
+            src_docs, names = [], []
+            for i in items:
+                d = _parse_edoc(i.get("edoc", "{}"))
+                if "table" in d and d["table"].get("name"):
+                    src_docs.append(d)
+                    names.append(d["table"]["name"])
+            if not names:
+                return []
+            name_to_id = tgt._resolve_names_to_ids(names, "LOGICAL_TABLE")
+            target_docs = {}
+            if name_to_id:
+                raw    = tgt.export_tml(list(name_to_id.values()))
+                titems = raw if isinstance(raw, list) else raw.get("object", [])
+                for it in titems:
+                    td = _parse_edoc(it.get("edoc", "{}"))
+                    if "table" in td and td["table"].get("name"):
+                        target_docs[td["table"]["name"]] = td
+            return silent_drop_findings(src_docs, target_docs)
+
+        # ── Stage 1: Export & validate ─────────────────────────────────────
+        if "pr_url" not in st.session_state:
+            if st.button("Export & Validate", type="primary", disabled=not filtered_items):
+                with st.spinner("Committing TML and validating models…"):
+                    pr_url, err, ok = _run_validation(filtered_items)
+                    st.session_state.pr_url            = pr_url
+                    st.session_state.validation_errors = err
+                    st.session_state.validation_ok     = ok
+                    st.session_state.pop("silent_drops", None)
+                st.rerun()
+        else:
+            st.markdown(f"**PR:** [{st.session_state.pr_url}]({st.session_state.pr_url})")
+
+        # ── Stage 2: Column drop (if validation failed) ────────────────────
+        val_errors = st.session_state.get("validation_errors", [])
+        val_ok     = st.session_state.get("validation_ok", [])
+
+        if val_errors:
+            findings     = classify_import_errors(val_errors)
+            wh_missing   = [f for f in findings if f["kind"] == "missing_in_target_warehouse"]
+            dep_blocked  = [f for f in findings if f["kind"] == "drop_blocked_by_dependents"]
+            other        = [f for f in findings if f["kind"] == "other"]
+
+            st.error(f"Validation found {len(findings)} issue(s) to resolve before import.")
+
+            # ── source-extra: a source column the target warehouse doesn't have ──
+            if wh_missing:
+                st.markdown("#### Columns missing from the target warehouse")
+                st.caption(
+                    "Referenced by the source but absent from the target warehouse, so the TML "
+                    "cannot import as-is. **Default is to keep them** — add the column to the target "
+                    "warehouse, then re-run. Tick a column only to **drop** it from this promotion "
+                    "(along with any visualization that uses it).")
+                drop_set = set()
+                for f in wh_missing:
+                    if st.checkbox(f"Drop  `{f['column']}`   ·   {f['object']}   ·   {f['connection']}",
+                                   value=False, key=f"dropwh_{f['object']}_{f['column']}"):
+                        drop_set.add(f["column"])
+                if st.button("Apply choices, re-export & re-validate", type="primary"):
+                    if drop_set:
+                        fixed, dc, dv = drop_columns(st.session_state.transformed_items, drop_set)
+                        st.session_state.transformed_items = fixed
+                        st.session_state.dropped_cols_count = st.session_state.get("dropped_cols_count", 0) + dc
+                        st.session_state.dropped_vizs_count = st.session_state.get("dropped_vizs_count", 0) + dv
+                    filtered_fixed = [i for i in st.session_state.transformed_items
+                                      if i.get("info", {}).get("name") not in skip_objects]
+                    with st.spinner("Re-committing and re-validating…"):
+                        pr_url, err, ok = _run_validation(filtered_fixed)
+                        st.session_state.pr_url            = pr_url
+                        st.session_state.validation_errors = err
+                        st.session_state.validation_ok     = ok
+                        st.session_state.pop("silent_drops", None)
+                    st.rerun()
+
+            # ── target-extra with dependents: the drop is blocked on the target ──
+            if dep_blocked:
+                st.markdown("#### Target columns with dependents (drop blocked)")
+                for f in dep_blocked:
+                    st.warning(
+                        f"Promoting **{f['object']}** would remove target column(s) "
+                        + ", ".join(f"`{c}`" for c in f["columns"])
+                        + " that the target still uses: "
+                        + ", ".join(f"**{d}**" for d in f["dependents"]) + ".\n\n"
+                        "Resolve by **preserving** the column (add it back to the source) or by "
+                        "**removing those dependents** on the target, then re-run.")
+
+            # ── anything unrecognised ──
+            if other:
+                st.markdown("#### Other validation errors")
+                for f in other:
+                    st.markdown(f"- **{f['object']}**: {f['error']}")
+
+        elif val_ok or val_ok == []:
+            other_count   = sum(1 for i in filtered_items if i.get("info", {}).get("type") != "model")
+            dropped_count = st.session_state.get("dropped_cols_count", 0)
+            dropped_vizs  = st.session_state.get("dropped_vizs_count", 0)
+            msg = f"Model validation passed ({len(val_ok)} model(s) OK)."
+            if dropped_count:
+                msg += f" {dropped_count} column(s) dropped."
+            if dropped_vizs:
+                msg += f" {dropped_vizs} dependent viz(s) removed from liveboard(s)."
+            if other_count:
+                msg += f" {other_count} liveboard/answer(s) will be imported after models."
+            st.success(msg)
+
+        # ── Stage 3: Merge & Import (only when validation passed) ──────────
+        validation_passed = "pr_url" in st.session_state and not val_errors
+        if validation_passed:
+            st.divider()
+
+            # Pre-import safety net: a target column absent from the source is dropped on
+            # import — SILENTLY when it has no dependents (the platform raises no error;
+            # if it has dependents, validation above already blocked it). Diff first.
+            if "silent_drops" not in st.session_state:
+                with st.spinner("Checking the target for columns that would be dropped…"):
+                    st.session_state.silent_drops = _detect_silent_drops(filtered_items)
+            silent = st.session_state.silent_drops
+
+            proceed = True
+            if silent:
+                st.warning("**Silent-drop risk** — these columns exist on the target but not in the "
+                           "source, so import will **remove them from the target table** (no platform "
+                           "error when they have no dependents):")
+                for s in silent:
+                    st.markdown(f"- **{s['table']}**: " + ", ".join(f"`{c}`" for c in s["columns"]))
+                st.caption("To keep one, add it back to the source. Otherwise acknowledge to proceed.")
+                proceed = st.checkbox("I understand these target columns will be removed — proceed.",
+                                      key="ack_silent")
+
+            if st.button("Merge & Import to Target", type="primary", disabled=not proceed):
+                gc = git_client()
+
+                with st.spinner("Merging PR…"):
+                    merged = gc.merge_pr()
+                    if not merged:
+                        # PR was already merged — re-commit and open a fresh PR
+                        pr_url, err, ok = _run_validation(filtered_items)
+                        st.session_state.pr_url = pr_url
+                        if err:
+                            st.session_state.validation_errors = err
+                            st.session_state.validation_ok = ok
+                            st.session_state.pop("silent_drops", None)
+                            st.rerun()
+                        merged = gc.merge_pr()
+                    if not merged:
+                        st.error("Could not find or create a PR to merge.")
+                        st.stop()
+
+                with st.spinner("Pulling TML from main and importing to the target cluster…"):
+                    tml_files   = gc.get_tml_files(team_name)
+                    tml_strings = files_to_tml_strings(tml_files)
+                    all_results = target_client().import_tml(tml_strings)
+                    st.session_state.import_results = all_results
+
+                st.success("Import complete.")
+
+    _nav(3, can_next="import_results" in st.session_state)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 4 — Import Results
+# ══════════════════════════════════════════════════════════════════════════════
+
+elif step == 4:
+    st.subheader("Import Results")
+
+    results = st.session_state.get("import_results")
+
+    if not results:
+        st.info("No import run yet.")
+    else:
+        import pandas as pd
+
+        df      = pd.DataFrame(results)[["name", "type", "status", "error", "new_id"]]
+        success = df[df["status"] == "OK"]
+        failed  = df[df["status"] != "OK"]
+
+        col1, col2 = st.columns(2)
+        col1.metric("Succeeded", len(success))
+        col2.metric("Failed",    len(failed))
+
+        st.divider()
+
+        if not success.empty:
+            st.markdown("**Succeeded**")
+            st.dataframe(success[["name", "type", "new_id"]],
+                         use_container_width=True, hide_index=True)
+
+        if not failed.empty:
+            st.markdown("**Failed**")
+            st.dataframe(failed[["name", "type", "status", "error"]],
+                         use_container_width=True, hide_index=True)
+
+    _nav(4)
