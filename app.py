@@ -184,11 +184,16 @@ st.divider()
 if step == 0:
     st.subheader(f"Source-cluster assets — team: {team_name}")
 
-    if not team_tags:
-        st.warning("No scope tag configured for this team in `config/teams.json`.")
+    if team_tags:
+        st.caption("Fetching liveboards/answers tagged: " + ", ".join(f"`{t}`" for t in team_tags))
+        fetch_label = "Fetch tagged content"
+    else:
+        st.info("No tag set for this team — fetching **all** liveboards & answers you can access "
+                "(use this when the assets can't be tagged). Tick the ones to promote.")
+        fetch_label = "Fetch all liveboards & answers"
 
-    if st.button("Fetch tagged content", type="primary", disabled=not team_tags):
-        with st.spinner("Searching the source cluster by tag…"):
+    if st.button(fetch_label, type="primary"):
+        with st.spinner("Searching the source cluster…"):
             st.session_state.assets   = source_client().search_by_tags(team_tags)
             st.session_state.leaf_ids = []
             for key in ("selected_ids", "dep_info", "obj_id_status", "table_alignment",
@@ -199,12 +204,15 @@ if step == 0:
 
     if not assets:
         if "assets" in st.session_state:
-            st.info("No liveboards or answers found with tag(s): "
-                    + ", ".join(f"`{t}`" for t in team_tags))
+            st.info("No liveboards or answers found.")
     else:
         import pandas as pd
 
         df = pd.DataFrame(assets)[["name", "type", "author", "modified", "id"]]
+        flt = st.text_input("Filter by name", "", key="asset_filter",
+                            placeholder="type to narrow the list").strip()
+        if flt:
+            df = df[df["name"].str.contains(flt, case=False, na=False)]
         df.insert(0, "select", False)
 
         edited = st.data_editor(

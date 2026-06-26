@@ -98,8 +98,10 @@ class TSClient:
 
     def search_by_tags(self, tags: List[str], types: Optional[List[str]] = None) -> List[Dict]:
         """
-        Return objects carrying any of the given tags. Defaults to the leaf
-        content types (liveboards + answers); dependencies are resolved separately.
+        Return leaf objects (liveboards + answers by default). If `tags` is non-empty,
+        only objects carrying those tags are returned; if `tags` is empty, ALL leaves the
+        caller can access are returned (so assets that can't be tagged can still be
+        selected). Dependencies are resolved separately.
         """
         types = types or LEAF_TYPES
         results = []
@@ -108,10 +110,11 @@ class TSClient:
             while True:
                 payload = {
                     "metadata": [{"type": obj_type}],
-                    "tag_identifiers": tags,
                     "record_size": 200,
                     "record_offset": offset,
                 }
+                if tags:
+                    payload["tag_identifiers"] = tags
                 data  = self._post("/api/rest/2.0/metadata/search", payload)
                 items = data if isinstance(data, list) else data.get("metadata", [])
                 results.extend(self._row(it, obj_type) for it in items)
