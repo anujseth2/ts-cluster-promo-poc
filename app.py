@@ -482,6 +482,123 @@ elif step == 1:
                     except Exception as e:
                         st.error(f"Failed to set obj_id (account needs DATAMANAGEMENT or ADMINISTRATION): {e}")
 
+    # ── Matcher: pair source tables to their target counterpart (handles renames) ──
+    if selected_ids:
+        st.divider()
+        st.markdown("#### Table matcher — pair source → target (incl. renamed / drifted)")
+        st.caption("Finds each source table's counterpart on the target by **column structure + "
+                   "physical coordinates** (not just name), with a confidence score and column "
+                   "drift. Use it to align tables the name-based step above can't match (e.g. a "
+                   "table renamed on the target). Re-run after changing the selection or obj_ids.")
+
+        def _derive_oid(coords):
+            base = (str(coords.get("schema", "")) + "_" + str(coords.get("db_table", ""))).lower()
+            return "".join(c if (c.isalnum() or c == "_") else "_" for c in base).strip("_") or "obj"
+
+        if st.button("Run table matcher"):
+            from services.table_matcher import match_tables
+            with st.spinner("Exporting source + target tables and matching…"):
+                raw_s   = source_client().export_tml(selected_ids)
+                s_items = raw_s if isinstance(raw_s, list) else raw_s.get("object", [])
+                src_docs, src_g = [], {}
+                for it in s_items:
+                    d = _parse_edoc(it.get("edoc", "{}"))
+                    if "table" in d and d["table"].get("name"):
+                        src_docs.append(d)
+                        src_g[d["table"]["name"]] = (it.get("info") or {}).get("id")
+
+                metas     = target_client().list_metadata("LOGICAL_TABLE")
+                truncated = len(metas) > 500
+                metas     = metas[:500]
+                tgt_g     = {m["name"]: m["id"] for m in metas if m.get("name")}
+                tgt_docs  = []
+                if metas:
+                    raw_t   = target_client().export_tml([m["id"] for m in metas])
+                    t_items = raw_t if isinstance(raw_t, list) else raw_t.get("object", [])
+                    for it in t_items:
+                        td = _parse_edoc(it.get("edoc", "{}"))
+                        if "table" in td:
+                            tgt_docs.append(td)
+
+                cfg = teams[team_name]
+                st.session_state.match_results    = match_tables(
+                    src_docs, tgt_docs,
+                    db_map=cfg.get("db_map", {}), schema_map=cfg.get("schema_map", {}),
+                    source_connection=cfg.get("source_connection", ""),
+                    target_connection=cfg.get("target_connection", ""))
+                st.session_state.src_name_to_guid = src_g
+                st.session_state.tgt_name_to_guid = tgt_g
+                st.session_state.tgt_truncated    = truncated
+            st.rerun()
+
+        mr = st.session_state.get("match_results")
+        if mr is not None:
+            if st.session_state.get("tgt_truncated"):
+                st.warning("Target has >500 tables — matched against the first 500 only. "
+                           "Scope the target connection to be exhaustive.")
+
+            def _drift(c):
+                bits = []
+                if c.get("missing_on_target"): bits.append(f"missing→{len(c['missing_on_target'])}")
+                if c.get("extra_on_target"):   bits.append(f"extra→{len(c['extra_on_target'])}")
+                if c.get("type_mismatch"):     bits.append(f"type→{len(c['type_mismatch'])}")
+                return ", ".join(bits) or "identical"
+
+            rows = []
+            for r in mr:
+                s, b = r["source"], r["best"]
+                tgt_oid = b["target"].get("obj_id") if b else ""
+                aligned = bool(b and s.get("obj_id") and s["obj_id"] == tgt_oid)
+                rows.append({
+                    "source table":   s["name"],
+                    "best target":    b["target"]["name"] if b else "—",
+                    "confidence":     (f"{b['confidence']}%" if b else "—"),
+                    "decision":       r["decision"],
+                    "col drift":      _drift(b["columns"]) if b else "—",
+                    "obj_id aligned": "yes" if aligned else ("n/a" if r["decision"] == "NO_MATCH" else "no"),
+                })
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+            review   = [r for r in mr if r["decision"] in ("REVIEW", "AMBIGUOUS")]
+            no_match = [r for r in mr if r["decision"] == "NO_MATCH"]
+            if review:
+                st.warning(f"{len(review)} table(s) are REVIEW/AMBIGUOUS — low confidence or multiple "
+                           "candidates. Align/rename those manually before promoting.")
+            if no_match:
+                st.info(f"{len(no_match)} source table(s) have no target counterpart — created on import.")
+
+            needing = [r for r in mr if r["decision"] == "MATCH" and r["best"]
+                       and not (r["source"].get("obj_id")
+                                and r["source"]["obj_id"] == r["best"]["target"].get("obj_id"))]
+            if needing and st.button(f"Align {len(needing)} matched pair(s) — set shared obj_id",
+                                     type="primary"):
+                src_g = st.session_state.get("src_name_to_guid", {})
+                tgt_g = st.session_state.get("tgt_name_to_guid", {})
+                src_up, tgt_up, skipped = [], [], []
+                for r in needing:
+                    s, t  = r["source"], r["best"]["target"]
+                    canon = s.get("obj_id") or _derive_oid(s)
+                    sg, tg = src_g.get(s["name"]), tgt_g.get(t["name"])
+                    if not sg or not tg:
+                        skipped.append(s["name"]); continue
+                    if not s.get("obj_id"):
+                        src_up.append({"identifier": sg, "new_obj_id": canon})
+                    tgt_up.append({"identifier": tg, "new_obj_id": canon})
+                try:
+                    with st.spinner(f"Aligning {len(tgt_up)} pair(s)…"):
+                        if src_up:
+                            source_client().update_obj_ids(src_up)
+                        if tgt_up:
+                            target_client().update_obj_ids(tgt_up)
+                    st.success(f"Aligned {len(tgt_up)} pair(s)."
+                               + (f"  Skipped (no GUID): {', '.join(skipped)}" if skipped else ""))
+                    for _k in ("obj_id_status", "_raw_items", "table_alignment",
+                               "prod_by_name", "dev_table_refs", "match_results"):
+                        st.session_state.pop(_k, None)
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Align failed (account needs DATAMANAGEMENT or ADMINISTRATION): {e}")
+
     all_ok = (
         bool(status) and not [r for r in status if not r["ok"]]
         and not [r for r in table_rows if r["state"] == "mismatch"]
