@@ -208,11 +208,24 @@ if step == 0:
     else:
         import pandas as pd
 
-        df = pd.DataFrame(assets)[["name", "type", "author", "modified", "id"]]
-        flt = st.text_input("Filter by name", "", key="asset_filter",
-                            placeholder="type to narrow the list").strip()
+        df = pd.DataFrame(assets)[["name", "type", "author", "modified",
+                                   "created", "tags", "obj_id", "id"]]
+
+        c1, c2 = st.columns([3, 1])
+        with c1:
+            flt = st.text_input("Search name or tags", "", key="asset_filter",
+                                placeholder="type to narrow the list").strip()
+        with c2:
+            type_opts = ["All"] + sorted(t for t in df["type"].unique() if t)
+            type_sel  = st.selectbox("Type", type_opts, key="asset_type")
+
         if flt:
-            df = df[df["name"].str.contains(flt, case=False, na=False)]
+            df = df[df["name"].str.contains(flt, case=False, na=False)
+                    | df["tags"].str.contains(flt, case=False, na=False)]
+        if type_sel != "All":
+            df = df[df["type"] == type_sel]
+
+        st.caption(f"{len(df)} object(s) — click any column header to sort.")
         df.insert(0, "select", False)
 
         edited = st.data_editor(
@@ -220,12 +233,15 @@ if step == 0:
             column_config={
                 "select":   st.column_config.CheckboxColumn("Promote?", default=False),
                 "name":     st.column_config.TextColumn("Name",     width="large"),
-                "type":     st.column_config.TextColumn("Type",     width="medium"),
+                "type":     st.column_config.TextColumn("Type",     width="small"),
                 "author":   st.column_config.TextColumn("Author",   width="medium"),
-                "modified": st.column_config.TextColumn("Modified", width="medium"),
-                "id":       st.column_config.TextColumn("ID",       width="small"),
+                "modified": st.column_config.TextColumn("Modified", width="small"),
+                "created":  st.column_config.TextColumn("Created",  width="small"),
+                "tags":     st.column_config.TextColumn("Tags",     width="medium"),
+                "obj_id":   st.column_config.TextColumn("obj_id",   width="medium"),
+                "id":       st.column_config.TextColumn("GUID",     width="small"),
             },
-            disabled=["name", "type", "author", "modified", "id"],
+            disabled=["name", "type", "author", "modified", "created", "tags", "obj_id", "id"],
             use_container_width=True,
             hide_index=True,
         )

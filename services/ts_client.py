@@ -80,20 +80,27 @@ class TSClient:
     @staticmethod
     def _row(item: dict, obj_type: str) -> dict:
         header = item.get("metadata_header", {}) or {}
-        mod_ms = item.get("metadata_modified_time") or header.get("modified")
-        try:
-            modified = (datetime.fromtimestamp(mod_ms / 1000).strftime("%Y-%m-%d %H:%M")
-                        if mod_ms else "")
-        except (TypeError, ValueError, OSError):
-            modified = ""
+
+        def _fmt(ms):
+            try:
+                return datetime.fromtimestamp(ms / 1000).strftime("%Y-%m-%d %H:%M") if ms else ""
+            except (TypeError, ValueError, OSError):
+                return ""
+
         author = (header.get("authorDisplayName") or header.get("authorName")
                   or header.get("author_display_name") or header.get("author_name") or "")
+        tags_raw = header.get("tags") or item.get("tags") or []
+        tags = ", ".join((t.get("name", "") if isinstance(t, dict) else str(t)) for t in tags_raw) \
+            if isinstance(tags_raw, list) else ""
         return {
             "id":       item.get("metadata_id", ""),
             "name":     item.get("metadata_name", ""),
             "type":     obj_type,
-            "modified": modified,
             "author":   author,
+            "modified": _fmt(item.get("metadata_modified_time") or header.get("modified")),
+            "created":  _fmt(header.get("created") or item.get("metadata_created_time")),
+            "tags":     tags,
+            "obj_id":   item.get("metadata_obj_id") or "",
         }
 
     def search_by_tags(self, tags: List[str], types: Optional[List[str]] = None) -> List[Dict]:
