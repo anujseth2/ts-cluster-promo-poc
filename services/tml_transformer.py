@@ -80,9 +80,10 @@ def _remap_connection(node: dict, source_connection: str, target_connection: str
     if not isinstance(conn, dict) or not conn.get("name") or _is_var(conn["name"]):
         return
     if not source_connection or conn["name"] == source_connection:
-        # The source connection's GUID is meaningless on the target cluster, so drop
-        # fqn and let the import resolve the connection by name on the target.
+        # The source connection's GUID/obj_id are meaningless on the target cluster, so
+        # drop them and let the import resolve the connection by name on the target.
         conn.pop("fqn", None)
+        conn.pop("obj_id", None)
         if target_connection:
             conn["name"] = target_connection
 
