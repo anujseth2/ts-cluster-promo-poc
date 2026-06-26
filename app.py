@@ -196,8 +196,8 @@ if step == 0:
         with st.spinner("Searching the source cluster…"):
             st.session_state.assets   = source_client().search_by_tags(team_tags)
             st.session_state.leaf_ids = []
-            for key in ("selected_ids", "dep_info", "obj_id_status", "table_alignment",
-                        "transformed_items", "import_results"):
+            for key in ("selected_ids", "dep_info", "_resolved_key", "obj_id_status",
+                        "table_alignment", "transformed_items", "import_results"):
                 st.session_state.pop(key, None)
 
     assets = st.session_state.get("assets", [])
@@ -249,21 +249,29 @@ if step == 0:
         leaf_ids = edited[edited["select"] == True]["id"].tolist()
         st.session_state.leaf_ids = leaf_ids
 
-        # Resolve the dependency chain: leaves -> models -> tables
-        if leaf_ids and st.button("Resolve dependencies"):
-            with st.spinner("Walking dependencies on the source cluster…"):
-                dep = source_client().resolve_dependencies(leaf_ids)
-                st.session_state.selected_ids = list(dict.fromkeys(
-                    dep["table_ids"] + dep["model_ids"] + leaf_ids
-                ))
-                st.session_state.dep_info = dep
+        # Auto-resolve the dependency chain (leaves -> models -> tables) whenever the
+        # selection changes. Cached by the selected-leaf set so it does NOT re-call on
+        # every Streamlit rerun (filtering, sorting) — only when the picks actually change.
+        sel_key = tuple(sorted(leaf_ids))
+        if leaf_ids:
+            if st.session_state.get("_resolved_key") != sel_key:
+                with st.spinner("Resolving dependencies (model + tables)…"):
+                    dep = source_client().resolve_dependencies(leaf_ids)
+                st.session_state.dep_info      = dep
+                st.session_state.selected_ids  = list(dict.fromkeys(
+                    dep["table_ids"] + dep["model_ids"] + leaf_ids))
+                st.session_state._resolved_key = sel_key
+        else:
+            st.session_state.dep_info      = None
+            st.session_state.selected_ids  = []
+            st.session_state._resolved_key = None
 
         dep = st.session_state.get("dep_info")
         if dep:
             promo = st.session_state.get("selected_ids", [])
             st.success(
                 f"Promotion set: {len(promo)} object(s) — "
-                f"{len(st.session_state.get('leaf_ids', []))} leaf, "
+                f"{len(leaf_ids)} leaf, "
                 f"{len(dep['model_ids'])} model(s), {len(dep['table_ids'])} table(s)."
             )
             missing = dep["missing_models"] + dep["missing_tables"]
