@@ -261,6 +261,9 @@ if step == 0:
                 st.session_state.selected_ids  = list(dict.fromkeys(
                     dep["table_ids"] + dep["model_ids"] + leaf_ids))
                 st.session_state._resolved_key = sel_key
+                for _k in ("obj_id_status", "_raw_items", "table_alignment",
+                           "prod_by_name", "dev_table_refs"):
+                    st.session_state.pop(_k, None)
         else:
             st.session_state.dep_info      = None
             st.session_state.selected_ids  = []
@@ -300,7 +303,7 @@ elif step == 1:
     if not selected_ids:
         st.info("Select assets in Step 1 first.")
     else:
-        if st.button("Check obj_id status", type="primary"):
+        if "obj_id_status" not in st.session_state:
             with st.spinner("Exporting TML from the source cluster…"):
                 raw   = source_client().export_tml(selected_ids)
                 items = raw if isinstance(raw, list) else raw.get("object", [])
@@ -362,6 +365,12 @@ elif step == 1:
                 st.session_state.prod_by_name    = prod_by_name
                 st.session_state.dev_table_refs  = dev_table_refs
 
+        if st.button("Re-check obj_id status"):
+            for _k in ("obj_id_status", "_raw_items", "table_alignment",
+                       "prod_by_name", "dev_table_refs"):
+                st.session_state.pop(_k, None)
+            st.rerun()
+
     import pandas as pd
 
     status = st.session_state.get("obj_id_status", [])
@@ -404,8 +413,11 @@ elif step == 1:
                 try:
                     with st.spinner(f"Setting obj_id on {len(mappings)} source object(s)…"):
                         source_client().update_obj_ids(mappings)
-                    st.success(f"obj_id set on {len(mappings)} source object(s). "
-                               "Click **Check obj_id status** again to refresh.")
+                    st.success(f"obj_id set on {len(mappings)} source object(s).")
+                    for _k in ("obj_id_status", "_raw_items", "table_alignment",
+                               "prod_by_name", "dev_table_refs"):
+                        st.session_state.pop(_k, None)
+                    st.rerun()
                 except Exception as e:
                     st.error(f"Failed to set obj_id (account needs DATAMANAGEMENT or ADMINISTRATION): {e}")
 
@@ -462,8 +474,11 @@ elif step == 1:
                         with st.spinner(f"Setting obj_id on {len(to_fix)} target table(s)…"):
                             target_client().update_obj_ids(mappings)
                         st.success("obj_id set on target table(s): "
-                                   + ", ".join(f"`{t['name']}`→`{t['obj_id']}`" for t in to_fix)
-                                   + ". Click **Check obj_id status** again to confirm alignment.")
+                                   + ", ".join(f"`{t['name']}`→`{t['obj_id']}`" for t in to_fix))
+                        for _k in ("obj_id_status", "_raw_items", "table_alignment",
+                                   "prod_by_name", "dev_table_refs"):
+                            st.session_state.pop(_k, None)
+                        st.rerun()
                     except Exception as e:
                         st.error(f"Failed to set obj_id (account needs DATAMANAGEMENT or ADMINISTRATION): {e}")
 
@@ -504,9 +519,30 @@ elif step == 2:
                 st.session_state.issues            = issues
                 st.session_state.warnings          = warnings
 
+                # #3: flag if the configured source_connection matches NO connection in the
+                # exported tables (the remap would silently skip -> Step-4 import failure).
+                src_conn   = teams[team_name].get("source_connection", "")
+                conn_names = set()
+                for it in items:
+                    c = (_parse_edoc(it.get("edoc", "{}")).get("table", {}) or {}).get("connection", {})
+                    if isinstance(c, dict) and c.get("name"):
+                        conn_names.add(c["name"])
+                st.session_state.conn_mismatch = (
+                    {"configured": src_conn, "found": sorted(conn_names)}
+                    if src_conn and conn_names and src_conn not in conn_names else None)
+
         transformed_items = st.session_state.get("transformed_items")
         issues            = st.session_state.get("issues", [])
         warnings          = st.session_state.get("warnings", [])
+
+        cm = st.session_state.get("conn_mismatch")
+        if cm:
+            st.error(
+                f"Source connection `{cm['configured']}` matches **no connection** in the exported "
+                "tables — the remap is skipped, so import will fail on the target. Connections "
+                "actually present: " + ", ".join(f"`{n}`" for n in cm["found"])
+                + ". Set `source_connection` (sidebar) to one of those exactly, or blank it to keep "
+                "the source name as-is.")
 
         if transformed_items is not None:
             st.markdown("**Objects to promote:**")
@@ -683,16 +719,24 @@ elif step == 3:
                     st.markdown(f"- **{f['object']}**: {f['error']}")
 
         elif val_ok or val_ok == []:
-            other_count   = sum(1 for i in filtered_items if i.get("info", {}).get("type") != "model")
+            tbls = mdls = leaves = 0
+            for i in filtered_items:
+                d = _parse_edoc(i.get("edoc", "{}"))
+                if "table" in d:
+                    tbls += 1
+                elif "model" in d or "worksheet" in d:
+                    mdls += 1
+                elif "liveboard" in d or "answer" in d:
+                    leaves += 1
             dropped_count = st.session_state.get("dropped_cols_count", 0)
             dropped_vizs  = st.session_state.get("dropped_vizs_count", 0)
-            msg = f"Model validation passed ({len(val_ok)} model(s) OK)."
+            msg = f"Validation passed — {tbls} table(s) + {mdls} model(s) OK."
             if dropped_count:
                 msg += f" {dropped_count} column(s) dropped."
             if dropped_vizs:
                 msg += f" {dropped_vizs} dependent viz(s) removed from liveboard(s)."
-            if other_count:
-                msg += f" {other_count} liveboard/answer(s) will be imported after models."
+            if leaves:
+                msg += f" {leaves} liveboard/answer(s) will import after."
             st.success(msg)
 
         # ── Stage 3: Merge & Import (only when validation passed) ──────────
