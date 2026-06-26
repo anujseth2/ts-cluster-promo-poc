@@ -357,24 +357,25 @@ elif step == 1:
 
         if st.button("Apply obj_id on the source cluster", type="primary"):
             raw_items = st.session_state._raw_items
-            patched = []
+            # obj_id on an EXISTING object MUST go through the update-obj-id API — a TML
+            # re-import keeps the existing obj_id ("...will be used. Use update API...").
+            mappings = []
             for row, item in zip(edited_status.itertuples(), raw_items):
                 new_id = str(row.obj_id).strip()
-                if new_id:
-                    doc = _parse_edoc(item.get("edoc", "{}"))
-                    doc["obj_id"] = new_id
-                    patched.append(json.dumps(doc))
-            if not patched:
-                st.warning("No obj_id values to apply.")
+                guid   = (item.get("info") or {}).get("id")
+                cur    = _parse_edoc(item.get("edoc", "{}")).get("obj_id", "") or ""
+                if new_id and guid and new_id != cur:
+                    mappings.append({"identifier": guid, "new_obj_id": new_id})
+            if not mappings:
+                st.info("No obj_id changes to apply.")
             else:
-                with st.spinner(f"Writing obj_id to {len(patched)} object(s)…"):
-                    results = source_client().import_tml(patched, policy="PARTIAL")
-                ok  = [r for r in results if r["status"] == "OK"]
-                err = [r for r in results if r["status"] != "OK"]
-                if ok:
-                    st.success(f"obj_id applied to {len(ok)} object(s) on the source cluster.")
-                for e in err:
-                    st.error(f"{e['name']}: {e['error']}")
+                try:
+                    with st.spinner(f"Setting obj_id on {len(mappings)} source object(s)…"):
+                        source_client().update_obj_ids(mappings)
+                    st.success(f"obj_id set on {len(mappings)} source object(s). "
+                               "Click **Check obj_id status** again to refresh.")
+                except Exception as e:
+                    st.error(f"Failed to set obj_id (account needs DATAMANAGEMENT or ADMINISTRATION): {e}")
 
     table_rows = st.session_state.get("table_alignment", [])
     if table_rows:
@@ -423,31 +424,16 @@ elif step == 1:
                     st.error(f"Tables not found on the target cluster — import from its connection first: {', '.join(not_found)}")
 
                 if to_fix:
-                    with st.spinner(f"Setting obj_id on {len(to_fix)} target table(s)…"):
-                        guids       = [t["guid"] for t in to_fix]
-                        guid_to_oid = {t["guid"]: t["obj_id"] for t in to_fix}
-
-                        raw_exp   = target_client().export_tml(guids)
-                        exp_items = raw_exp if isinstance(raw_exp, list) else raw_exp.get("object", [])
-
-                        patched = []
-                        for item in exp_items:
-                            info    = item.get("info", {})
-                            guid    = info.get("id") or info.get("metadata_id")
-                            desired = guid_to_oid.get(guid)
-                            if not desired:
-                                continue
-                            doc = _parse_edoc(item.get("edoc", "{}"))
-                            doc["obj_id"] = desired
-                            patched.append(json.dumps(doc))
-
-                        results = target_client().import_tml(patched, policy="PARTIAL")
-                        ok_res  = [r for r in results if r["status"] == "OK"]
-                        err_res = [r for r in results if r["status"] != "OK"]
-                    if ok_res:
-                        st.success(f"obj_id fixed on {len(ok_res)} target table(s).")
-                    for e in err_res:
-                        st.error(f"{e['name']}: {e['error']}")
+                    # set obj_id via the update-obj-id API (a TML re-import won't change it)
+                    mappings = [{"identifier": t["guid"], "new_obj_id": t["obj_id"]} for t in to_fix]
+                    try:
+                        with st.spinner(f"Setting obj_id on {len(to_fix)} target table(s)…"):
+                            target_client().update_obj_ids(mappings)
+                        st.success("obj_id set on target table(s): "
+                                   + ", ".join(f"`{t['name']}`→`{t['obj_id']}`" for t in to_fix)
+                                   + ". Click **Check obj_id status** again to confirm alignment.")
+                    except Exception as e:
+                        st.error(f"Failed to set obj_id (account needs DATAMANAGEMENT or ADMINISTRATION): {e}")
 
     all_ok = (
         bool(status) and not [r for r in status if not r["ok"]]
