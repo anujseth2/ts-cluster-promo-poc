@@ -21,7 +21,7 @@ from services.tml_transformer import (
     files_to_tml_strings,
 )
 from services.import_diagnostics import (
-    classify_import_errors, drop_columns, silent_drop_findings, column_dependents,
+    classify_import_errors, drop_columns, silent_drop_findings, column_dependents, column_usage,
 )
 from services.table_matcher import column_signature
 
@@ -788,6 +788,34 @@ elif step == 3:
                 out[(f["object"], f["column"].lower())] = sigs.get(f["object"], {}).get(f["column"].lower(), "")
             return out
 
+        def _target_col_usage(mismatches):
+            """Column-PRECISE target impact. Stage 1: table-level dependents (one call).
+            Stage 2: export those objects + scan each for the actual column reference.
+            Returns {(object, column_lower): {"affected":[{name,kind,where}], "total":int, "missing"?}}."""
+            tgt = target_client()
+            by_table = {}
+            for f in mismatches:
+                if f.get("object") and f.get("column"):
+                    by_table.setdefault(f["object"], []).append(f["column"])
+            name_to_id = tgt._resolve_names_to_ids(list(by_table), "LOGICAL_TABLE")
+            out = {}
+            for tbl, cols in by_table.items():
+                tid = name_to_id.get(tbl)
+                if not tid:
+                    for c in cols:
+                        out[(tbl, c.lower())] = {"affected": [], "total": 0, "missing": True}
+                    continue
+                deps    = tgt.list_dependents([tid], "LOGICAL_TABLE").get(tid, [])
+                dep_ids = [d["id"] for d in deps if d.get("id")]
+                items   = []
+                if dep_ids:
+                    raw    = tgt.export_tml(dep_ids)
+                    titems = raw if isinstance(raw, list) else raw.get("object", [])
+                    items  = [{"edoc": it.get("edoc", "{}")} for it in titems]
+                for c in cols:
+                    out[(tbl, c.lower())] = {"affected": column_usage(items, c), "total": len(deps)}
+            return out
+
         # ── Stage 1: Export & validate ─────────────────────────────────────
         if "pr_url" not in st.session_state:
             if st.button("Export & Validate", type="primary", disabled=not filtered_items):
@@ -866,10 +894,12 @@ elif step == 3:
 
                 tm_key = tuple(sorted((f["object"], f["column"]) for f in type_mismatch))
                 if st.session_state.get("_tm_key") != tm_key:
-                    with st.spinner("Reading target warehouse column types…"):
+                    with st.spinner("Reading target types and scanning dependents for this column…"):
                         st.session_state._tm_types = _target_col_types(type_mismatch)
+                        st.session_state._tm_usage = _target_col_usage(type_mismatch)
                         st.session_state._tm_key    = tm_key
                 tgt_types = st.session_state.get("_tm_types", {})
+                tgt_usage = st.session_state.get("_tm_usage", {})
 
                 tm_drop = set()
                 for f in type_mismatch:
@@ -887,7 +917,31 @@ elif step == 3:
                     if deps["formulas"]: bits.append("formulas: " + ", ".join(deps["formulas"]))
                     if deps["vizzes"]:   bits.append("vizzes: "   + ", ".join(str(v) for v in deps["vizzes"]))
                     if bits:
-                        st.caption("Dependents if dropped — " + "  ·  ".join(bits))
+                        st.caption("In-promotion dependents — " + "  ·  ".join(bits))
+
+                    # Target-side blast radius, COLUMN-PRECISE: of all objects on the table,
+                    # which actually reference THIS column (and where).
+                    usage = tgt_usage.get((f["object"], f["column"].lower()))
+                    if usage is not None:
+                        if usage.get("missing"):
+                            st.caption(f"Target-side: `{f['object']}` not found on Test, no dependents to scan.")
+                        else:
+                            aff, total = usage["affected"], usage["total"]
+                            if aff:
+                                kinds = {}
+                                for a in aff:
+                                    kinds[a["kind"]] = kinds.get(a["kind"], 0) + 1
+                                ksum = ", ".join(f"{n} {k}{'' if n == 1 else 's'}" for k, n in kinds.items())
+                                st.caption(
+                                    f"Target-side impact (column-precise): **{len(aff)} of {total}** objects on "
+                                    f"the table actually use this column — {ksum}.")
+                                with st.expander(f"Show the {len(aff)} affected object(s) on Test"):
+                                    for a in aff:
+                                        st.markdown(f"- **{a['kind']}** · {a['name']} · {', '.join(a['where'])}")
+                            else:
+                                st.caption(
+                                    f"Target-side impact: none of the {total} objects on the table use this "
+                                    "column (only the table definition itself).")
 
                     if deps["joins"] or deps["formulas"]:
                         st.warning(

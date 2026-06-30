@@ -122,6 +122,112 @@ def _col_name(model_col):
 _BRACKET_REF = re.compile(r"\[([^\]]+)\]")
 
 
+def _parse_edoc(item):
+    edoc = item.get("edoc", "{}")
+    if not isinstance(edoc, str):
+        return edoc
+    return json.loads(edoc) if edoc.strip().startswith("{") else _yaml_load(edoc)
+
+
+def _yaml_load(s):
+    import yaml
+    return yaml.safe_load(s)
+
+
+def _iter_strings(obj):
+    """Yield every string anywhere in a nested structure. The join condition key `on`
+    parses as the boolean True in YAML 1.1, so we can't rely on key names — scan values."""
+    if isinstance(obj, str):
+        yield obj
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            yield from _iter_strings(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from _iter_strings(v)
+
+
+def _expr_refs(obj, targets, display_targets):
+    """True if any `[table::Col]` / `[Display Name]` reference inside obj hits a target."""
+    for expr in _iter_strings(obj):
+        for inner in _BRACKET_REF.findall(expr):
+            tail = inner.split("::")[-1].strip().lower()
+            if tail in targets or inner.strip().lower() in display_targets:
+                return True
+    return False
+
+
+def _resolve_display_names(docs, targets):
+    """Display names of model/worksheet columns whose physical name is in `targets`, so leaf
+    answers/liveboards (which reference the column by its model display name) can be matched."""
+    disp = set()
+    for doc in docs:
+        for key in ("model", "worksheet"):
+            node = doc.get(key)
+            if not node:
+                continue
+            for c in node.get("columns", []) or []:
+                if _col_name(c) in targets:
+                    nm = (c.get("name") or "").strip().lower()
+                    if nm:
+                        disp.add(nm)
+    return disp
+
+
+def column_usage(items, column):
+    """Column-PRECISE attribution: which objects in `items` actually reference `column`,
+    and where. `items` should include the model(s) so leaf answers/liveboards resolve the
+    column's display name. Returns [{name, kind, where:[...]}], one entry per object that
+    references it (objects that only touch the table via OTHER columns are excluded)."""
+    targets = {column.lower()}
+    docs = [_parse_edoc(it) for it in items]
+    display_targets = _resolve_display_names(docs, targets)
+    match_set = targets | display_targets
+
+    out = []
+    for doc in docs:
+        where = []
+        # model / worksheet: the column itself, joins, formulas
+        for key in ("model", "worksheet"):
+            node = doc.get(key)
+            if not node:
+                continue
+            if any(_col_name(c) in targets for c in node.get("columns", []) or []):
+                where.append("column")
+            for mt in (node.get("model_tables") or node.get("tables") or []):
+                for j in mt.get("joins", []) or []:
+                    if _expr_refs(j, targets, display_targets):
+                        where.append(f"join {mt.get('name','')}->{j.get('with','')}".strip())
+            for fdef in node.get("formulas", []) or []:
+                if _expr_refs(fdef, targets, display_targets):
+                    where.append(f"formula:{fdef.get('name','?')}")
+        # liveboard: which vizzes reference it
+        lb = doc.get("liveboard")
+        if lb:
+            for viz in lb.get("visualizations", []) or []:
+                ac = [(c.get("name", "") or "").strip().lower()
+                      for c in viz.get("answer", {}).get("answer_columns", [])]
+                if any(a in match_set for a in ac) or _expr_refs(viz, targets, display_targets):
+                    where.append(f"viz:{viz.get('id') or viz.get('viz_id') or 'viz'}")
+        # saved answer
+        ans = doc.get("answer")
+        if ans:
+            ac = [(c.get("name", "") or "").strip().lower() for c in ans.get("answer_columns", [])]
+            if any(a in match_set for a in ac) or _expr_refs(ans, targets, display_targets):
+                where.append("uses column")
+
+        if where:
+            typ = next((k for k in ("liveboard", "answer", "model", "worksheet", "table") if k in doc), "object")
+            name = (doc.get(typ) or {}).get("name", "") if isinstance(doc.get(typ), dict) else ""
+            seen, w = set(), []
+            for x in where:
+                if x not in seen:
+                    seen.add(x)
+                    w.append(x)
+            out.append({"name": name or "(unnamed)", "kind": typ, "where": w})
+    return out
+
+
 def column_dependents(items, columns):
     """Read-only preview of what references the given columns across the promotion set,
     so a reviewer sees the blast radius BEFORE choosing to drop. columns are matched on
@@ -132,42 +238,9 @@ def column_dependents(items, columns):
     reference -> the drop path must treat those as manual-cleanup, not auto-removable.
     """
     targets = {c.lower() for c in columns}
-    docs = []
-    display_targets = set()
-    for item in items:
-        edoc = item.get("edoc", "{}")
-        doc = json.loads(edoc) if isinstance(edoc, str) else edoc
-        docs.append(doc)
-        for key in ("model", "worksheet"):
-            node = doc.get(key)
-            if not node:
-                continue
-            for c in node.get("columns", []) or []:
-                if _col_name(c) in targets:
-                    nm = (c.get("name") or "").strip().lower()
-                    if nm:
-                        display_targets.add(nm)
-
-    def _strings(obj):
-        """Yield every string anywhere in a nested join/formula dict. The join condition
-        key is `on`, which YAML 1.1 parses as the boolean True, so we can't rely on the
-        key name — we scan all values for `[table::Col]` references instead."""
-        if isinstance(obj, str):
-            yield obj
-        elif isinstance(obj, dict):
-            for v in obj.values():
-                yield from _strings(v)
-        elif isinstance(obj, list):
-            for v in obj:
-                yield from _strings(v)
-
-    def _refs_target(obj):
-        for expr in _strings(obj):
-            for inner in _BRACKET_REF.findall(expr):
-                tail = inner.split("::")[-1].strip().lower()
-                if tail in targets or inner.strip().lower() in display_targets:
-                    return True
-        return False
+    docs = [_parse_edoc(item) for item in items]
+    display_targets = _resolve_display_names(docs, targets)
+    match_set = targets | display_targets
 
     deps = {"model_columns": [], "joins": [], "formulas": [], "vizzes": []}
     for doc in docs:
@@ -180,22 +253,22 @@ def column_dependents(items, columns):
                     deps["model_columns"].append(c.get("name") or _col_name(c))
             for mt in (node.get("model_tables") or node.get("tables") or []):
                 for j in mt.get("joins", []) or []:
-                    if _refs_target(j):
+                    if _expr_refs(j, targets, display_targets):
                         deps["joins"].append(j.get("name") or f"{mt.get('name','')} -> {j.get('with','')}")
             for f in node.get("formulas", []) or []:
-                if _refs_target(f):
+                if _expr_refs(f, targets, display_targets):
                     deps["formulas"].append(f.get("name") or "(unnamed formula)")
         lb = doc.get("liveboard")
         if lb:
             for viz in lb.get("visualizations", []) or []:
                 acols = [(c.get("name", "") or "").lower()
                          for c in viz.get("answer", {}).get("answer_columns", [])]
-                if any(any(t in ac or ac in t for t in (targets | display_targets)) for ac in acols):
+                if any(any(t in ac or ac in t for t in match_set) for ac in acols):
                     deps["vizzes"].append(viz.get("id") or viz.get("viz_id") or "(viz)")
         ans = doc.get("answer")
         if ans:
             acols = [(c.get("name", "") or "").lower() for c in ans.get("answer_columns", [])]
-            if any(any(t in ac or ac in t for t in (targets | display_targets)) for ac in acols):
+            if any(any(t in ac or ac in t for t in match_set) for ac in acols):
                 deps["vizzes"].append(ans.get("name") or "(answer)")
     for k in deps:
         seen, out = set(), []

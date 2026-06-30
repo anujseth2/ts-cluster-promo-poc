@@ -5,7 +5,7 @@ Handles branch management, file commits, PR creation and merge.
 
 import base64
 from typing import Dict, Optional
-from github import Github, GithubException, InputGitTreeElement
+from github import Github, GithubException, InputGitTreeElement, Auth
 
 
 class GitClient:
@@ -13,36 +13,29 @@ class GitClient:
     MAIN_BRANCH = "main"
 
     def __init__(self, token: str, repo_name: str):
-        self._gh   = Github(token)
+        self._gh   = Github(auth=Auth.Token(token))
         self._repo = self._gh.get_repo(repo_name)
-
-    # ── Branch helpers ────────────────────────────────────────────────────────
-
-    def _reset_dev_to_main(self):
-        """Force-reset dev branch to main tip before each export (clean slate)."""
-        main_sha = self._repo.get_branch(self.MAIN_BRANCH).commit.sha
-        try:
-            self._repo.get_git_ref(f"heads/{self.DEV_BRANCH}").edit(main_sha, force=True)
-        except GithubException:
-            self._repo.create_git_ref(f"refs/heads/{self.DEV_BRANCH}", main_sha)
 
     # ── Commit TML files ──────────────────────────────────────────────────────
 
     def commit_tml(self, team: str, files: Dict[str, str],
                    message: Optional[str] = None) -> str:
         """
-        Commit a dict of {relative_path: yaml_string} under team/ folder
-        on the dev branch. Returns the commit SHA.
+        Commit {relative_path: yaml_string} under the team/ folder on the dev branch and
+        return the commit SHA. dev is a disposable staging branch for the dev->main PR, so
+        each export bases its commit on the CURRENT main tip and force-points dev at it.
+
+        Basing on main (rather than re-reading dev) and forcing the ref update avoids two
+        failure modes that both surface as 422 "Update is not a fast forward": a stale dev
+        read right after a reset, and divergence after a prior PR was squash-merged into main.
 
         files keys look like:  models/vbu_sales_v.model.tml
         Written to git as:     vbu/models/vbu_sales_v.model.tml
         """
-        self._reset_dev_to_main()
-
         commit_message = message or f"chore: export TML for team {team}"
-        parent_commit  = self._repo.get_branch(self.DEV_BRANCH).commit
+        base_commit    = self._repo.get_branch(self.MAIN_BRANCH).commit  # fresh main tip
 
-        # Build tree blobs
+        # Build tree blobs on top of main's tree
         blobs = []
         for rel_path, content in files.items():
             git_path = f"{team.lower()}/{rel_path}"
@@ -54,14 +47,20 @@ class GitClient:
                 sha=blob.sha,
             ))
 
-        base_tree = self._repo.get_git_tree(parent_commit.commit.tree.sha)
-        new_tree  = self._repo.create_git_tree(blobs, base_tree)
+        base_tree  = self._repo.get_git_tree(base_commit.commit.tree.sha)
+        new_tree   = self._repo.create_git_tree(blobs, base_tree)
         new_commit = self._repo.create_git_commit(
             commit_message,
             new_tree,
-            [parent_commit.commit],
+            [base_commit.commit],
         )
-        self._repo.get_git_ref(f"heads/{self.DEV_BRANCH}").edit(new_commit.sha)
+
+        # Point dev at the new commit. force=True because dev is disposable and may have
+        # diverged from main (e.g. after a squash-merge); create it if it does not exist.
+        try:
+            self._repo.get_git_ref(f"heads/{self.DEV_BRANCH}").edit(new_commit.sha, force=True)
+        except GithubException:
+            self._repo.create_git_ref(f"refs/heads/{self.DEV_BRANCH}", new_commit.sha)
 
         return new_commit.sha
 

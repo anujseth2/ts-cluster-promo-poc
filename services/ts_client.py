@@ -226,6 +226,56 @@ class TSClient:
             offset += 200
         return out
 
+    # friendly labels for the dependent-object subtypes the platform returns
+    DEP_TYPE_LABEL = {
+        "PINBOARD_ANSWER_BOOK":  "liveboard",
+        "QUESTION_ANSWER_BOOK":  "answer",
+        "LOGICAL_TABLE":         "model/table",
+    }
+
+    def list_dependents(self, object_ids: List[str],
+                        obj_type: str = "LOGICAL_TABLE",
+                        record_size: int = 500) -> Dict[str, List[Dict]]:
+        """
+        Cluster-wide dependents of each object, in ONE call, via metadata/search with
+        include_dependent_objects. Returns {source_object_id: [{type,label,name,id,author}]}.
+
+        This is TABLE-LEVEL: it returns every object that depends on the table through ANY
+        column, so the caller must note that not all dependents necessarily use a specific
+        column (column-precision needs a per-dependent export + scan).
+        """
+        if not object_ids:
+            return {}
+        payload = {
+            "metadata": [{"type": obj_type, "identifier": oid} for oid in object_ids],
+            "include_dependent_objects":     True,
+            "dependent_objects_record_size": record_size,
+            "record_size":                   len(object_ids),
+        }
+        data  = self._post("/api/rest/2.0/metadata/search", payload)
+        items = data if isinstance(data, list) else data.get("metadata", [])
+        out: Dict[str, List[Dict]] = {}
+        for it in items:
+            dep = it.get("dependent_objects") or {}
+            if not isinstance(dep, dict):
+                continue
+            for src_id, by_type in dep.items():
+                bucket = out.setdefault(src_id, [])
+                if not isinstance(by_type, dict):
+                    continue
+                for typ, objs in by_type.items():
+                    label = self.DEP_TYPE_LABEL.get(typ, typ)
+                    for o in (objs or []):
+                        hdr = o.get("header", {}) or {}
+                        bucket.append({
+                            "type":   typ,
+                            "label":  label,
+                            "name":   o.get("name") or hdr.get("name", ""),
+                            "id":     o.get("id") or o.get("metadata_id") or hdr.get("id", ""),
+                            "author": hdr.get("authorDisplayName") or hdr.get("authorName", ""),
+                        })
+        return out
+
     def update_obj_ids(self, mappings: List[Dict]) -> bool:
         """
         Set obj_id on existing objects. mappings: [{"identifier": <guid>, "new_obj_id": <str>}].
