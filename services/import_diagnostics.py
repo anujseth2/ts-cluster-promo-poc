@@ -46,6 +46,8 @@ _TYPE_MISMATCH = re.compile(
 _DEP_HEADER = re.compile(r"Deleted columns have dependents", re.I)
 _BOLD = re.compile(r"<b>(.*?)</b>", re.I | re.S)
 _LI = re.compile(r"<li>(.*?)</li>", re.I | re.S)
+_VIZ_ERR = re.compile(r"Visualization\s*<b>\s*(.*?)\s*</b>\s*has following errors", re.I | re.S)
+_FORMULA = re.compile(r"Formula:\s*([^,<]+)", re.I)
 
 
 def classify_import_errors(results):
@@ -54,6 +56,7 @@ def classify_import_errors(results):
       missing_in_target_warehouse  -> column, column_fqn, connection
       drop_blocked_by_dependents   -> columns[], dependents[]
       type_mismatch                -> column, column_fqn, source_type, connection
+      viz_error                    -> vizzes[], formulas[], error   (liveboard/answer viz fails to load)
       other                        -> error
     """
     findings = []
@@ -84,6 +87,14 @@ def classify_import_errors(results):
             deps = [d.strip() for d in _LI.findall(msg) if d.strip()]
             findings.append({"kind": "drop_blocked_by_dependents",
                              "object": r.get("name"), "columns": cols, "dependents": deps})
+        viz_ids = _VIZ_ERR.findall(msg)
+        if viz_ids:
+            matched = True
+            findings.append({"kind": "viz_error",
+                             "object": r.get("name"),
+                             "vizzes": [v.strip() for v in viz_ids],
+                             "formulas": [f.strip() for f in _FORMULA.findall(msg)],
+                             "error": msg.strip()})
         if not matched:
             findings.append({"kind": "other", "object": r.get("name"), "error": msg.strip()})
     return findings
@@ -320,3 +331,43 @@ def drop_columns(items, columns):
 
         out.append({**item, "edoc": json.dumps(doc)})
     return out, dropped_cols, dropped_vizs
+
+
+def drop_vizzes(items, viz_ids):
+    """Remove specific visualizations (by id) from any liveboard in `items`, and prune any
+    layout tiles that referenced them (flat layout.tiles or tabbed layout.tabs[].tiles).
+    Used to drop a viz that fails to load (e.g. a formula that won't compile) so the rest of
+    the liveboard imports. Returns (new_items, dropped_count)."""
+    targets = {str(v).strip() for v in viz_ids}
+    dropped = 0
+    out = []
+    for item in items:
+        edoc = item.get("edoc", "{}")
+        doc = json.loads(edoc) if isinstance(edoc, str) and edoc.strip().startswith("{") \
+            else (_yaml_load(edoc) if isinstance(edoc, str) else edoc)
+        lb = doc.get("liveboard")
+        if lb and lb.get("visualizations") is not None:
+            kept, kept_ids = [], set()
+            for viz in lb["visualizations"]:
+                vid = str(viz.get("id") or viz.get("viz_id") or "")
+                if vid in targets:
+                    dropped += 1
+                else:
+                    kept.append(viz)
+                    kept_ids.add(vid)
+            lb["visualizations"] = kept
+
+            layout = lb.get("layout") or {}
+
+            def _prune(tiles):
+                return [t for t in tiles if str(t.get("visualization_id", "")) in kept_ids]
+
+            if isinstance(layout.get("tiles"), list):
+                layout["tiles"] = _prune(layout["tiles"])
+            if isinstance(layout.get("tabs"), list):
+                for tab in layout["tabs"]:
+                    if isinstance(tab.get("tiles"), list):
+                        tab["tiles"] = _prune(tab["tiles"])
+
+        out.append({**item, "edoc": json.dumps(doc)})
+    return out, dropped

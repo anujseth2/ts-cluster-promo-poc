@@ -22,6 +22,7 @@ from services.tml_transformer import (
 )
 from services.import_diagnostics import (
     classify_import_errors, drop_columns, silent_drop_findings, column_dependents, column_usage,
+    drop_vizzes,
 )
 from services.table_matcher import column_signature
 
@@ -723,6 +724,9 @@ elif step == 3:
 
         def _run_validation(items):
             """Commit items to dev, create/update PR, validate models from dev. Returns (pr_url, errors, ok)."""
+            # Any re-export invalidates a partial import in progress — reset the import phase.
+            for _k in ("import_phase", "import_core_results", "import_leaf_files", "import_leaf_errors"):
+                st.session_state.pop(_k, None)
             files  = items_to_files(items)
             gc     = git_client()
             sha    = gc.commit_tml(team_name, files)
@@ -1023,52 +1027,117 @@ elif step == 3:
         validation_passed = "pr_url" in st.session_state and not val_errors
         if validation_passed:
             st.divider()
+            import_phase = st.session_state.get("import_phase")
 
-            # Pre-import safety net: a target column absent from the source is dropped on
-            # import — SILENTLY when it has no dependents (the platform raises no error;
-            # if it has dependents, validation above already blocked it). Diff first.
-            if "silent_drops" not in st.session_state:
-                with st.spinner("Checking the target for columns that would be dropped…"):
-                    st.session_state.silent_drops = _detect_silent_drops(filtered_items)
-            silent = st.session_state.silent_drops
-
-            proceed = True
-            if silent:
-                st.warning("**Silent-drop risk** — these columns exist on the target but not in the "
-                           "source, so import will **remove them from the target table** (no platform "
-                           "error when they have no dependents):")
-                for s in silent:
-                    st.markdown(f"- **{s['table']}**: " + ", ".join(f"`{c}`" for c in s["columns"]))
-                st.caption("To keep one, add it back to the source. Otherwise acknowledge to proceed.")
-                proceed = st.checkbox("I understand these target columns will be removed — proceed.",
-                                      key="ack_silent")
-
-            if st.button("Merge & Import to Target", type="primary", disabled=not proceed):
-                gc = git_client()
-
-                with st.spinner("Merging PR…"):
-                    merged = gc.merge_pr()
-                    if not merged:
-                        # PR was already merged — re-commit and open a fresh PR
-                        pr_url, err, ok = _run_validation(filtered_items)
-                        st.session_state.pr_url = pr_url
-                        if err:
-                            st.session_state.validation_errors = err
-                            st.session_state.validation_ok = ok
-                            st.session_state.pop("silent_drops", None)
-                            st.rerun()
-                        merged = gc.merge_pr()
-                    if not merged:
-                        st.error("Could not find or create a PR to merge.")
-                        st.stop()
-
-                with st.spinner("Pulling TML from main and importing to the target cluster…"):
-                    tml_files   = gc.get_tml_files(team_name)
-                    tml_strings = files_to_tml_strings(tml_files)
-                    all_results = target_client().import_tml(tml_strings)
-                    st.session_state.import_results = all_results
-
+            if import_phase == "complete":
                 st.success("Import complete.")
+
+            elif import_phase == "leaves_pending":
+                # Phase 2: tables + models are imported; liveboards/answers were VALIDATE_ONLY'd
+                # against the now-present model, so viz-level errors surface BEFORE they import.
+                st.markdown("#### Tables and models imported — review liveboards / answers")
+                leaf_errors  = st.session_state.get("import_leaf_errors", [])
+                findings     = classify_import_errors(leaf_errors)
+                viz_findings = [f for f in findings if f["kind"] == "viz_error"]
+                other_leaf   = [f for f in findings if f["kind"] != "viz_error"]
+
+                st.warning(
+                    "These visualizations fail to load on Test. Tick one to **drop it** so the rest of "
+                    "its liveboard imports cleanly, or go Back and fix the source. Leaving them unticked "
+                    "imports them anyway, and the platform skips the broken viz.")
+                drop_ids = set()
+                for f in viz_findings:
+                    for vz in f.get("vizzes", []):
+                        lbl = f"Drop **{vz}** in {f['object']}"
+                        if f.get("formulas"):
+                            lbl += f"  ·  formula: {', '.join(f['formulas'])}"
+                        if st.checkbox(lbl, value=False, key=f"dropviz_{f['object']}_{vz}"):
+                            drop_ids.add(vz)
+                    with st.expander(f"error detail — {f['object']}"):
+                        st.code(f.get("error", ""))
+                for f in other_leaf:
+                    st.markdown(f"- **{f.get('object')}**: {f.get('error','')}")
+
+                if st.button("Import liveboards & answers", type="primary"):
+                    leaves     = st.session_state.get("import_leaf_files", {})
+                    leaf_items = [{"info": {"name": p}, "edoc": c} for p, c in leaves.items()]
+                    dropped_v  = 0
+                    if drop_ids:
+                        leaf_items, dropped_v = drop_vizzes(leaf_items, drop_ids)
+                    leaf_strings = [it["edoc"] for it in leaf_items]
+                    with st.spinner("Importing liveboards / answers to the target cluster…"):
+                        leaf_results = target_client().import_tml(leaf_strings) if leaf_strings else []
+                    st.session_state.import_results = st.session_state.get("import_core_results", []) + leaf_results
+                    if dropped_v:
+                        st.session_state.dropped_vizs_count = st.session_state.get("dropped_vizs_count", 0) + dropped_v
+                    st.session_state.import_phase = "complete"
+                    st.rerun()
+
+            else:
+                # Phase 1: silent-drop safety net, then merge + import tables/models + validate leaves.
+                # A target column absent from the source is dropped on import — SILENTLY when it has no
+                # dependents (the platform raises no error). Diff first.
+                if "silent_drops" not in st.session_state:
+                    with st.spinner("Checking the target for columns that would be dropped…"):
+                        st.session_state.silent_drops = _detect_silent_drops(filtered_items)
+                silent = st.session_state.silent_drops
+
+                proceed = True
+                if silent:
+                    st.warning("**Silent-drop risk** — these columns exist on the target but not in the "
+                               "source, so import will **remove them from the target table** (no platform "
+                               "error when they have no dependents):")
+                    for s in silent:
+                        st.markdown(f"- **{s['table']}**: " + ", ".join(f"`{c}`" for c in s["columns"]))
+                    st.caption("To keep one, add it back to the source. Otherwise acknowledge to proceed.")
+                    proceed = st.checkbox("I understand these target columns will be removed — proceed.",
+                                          key="ack_silent")
+
+                if st.button("Merge & Import to Target", type="primary", disabled=not proceed):
+                    gc = git_client()
+
+                    with st.spinner("Merging PR…"):
+                        merged = gc.merge_pr()
+                        if not merged:
+                            # PR was already merged — re-commit and open a fresh PR
+                            pr_url, err, ok = _run_validation(filtered_items)
+                            st.session_state.pr_url = pr_url
+                            if err:
+                                st.session_state.validation_errors = err
+                                st.session_state.validation_ok = ok
+                                st.session_state.pop("silent_drops", None)
+                                st.rerun()
+                            merged = gc.merge_pr()
+                        if not merged:
+                            st.error("Could not find or create a PR to merge.")
+                            st.stop()
+
+                    # Import tables + models first, THEN validate the leaves against the live model so
+                    # viz/formula errors are caught here instead of surfacing silently at leaf import.
+                    with st.spinner("Importing tables & models, then validating liveboards/answers…"):
+                        tml_files = gc.get_tml_files(team_name)
+                        core   = {p: c for p, c in tml_files.items()
+                                  if p.startswith("tables/") or p.startswith("models/")}
+                        leaves = {p: c for p, c in tml_files.items()
+                                  if not (p.startswith("tables/") or p.startswith("models/"))}
+                        core_results = target_client().import_tml(files_to_tml_strings(core)) if core else []
+                        st.session_state.import_core_results = core_results
+                        st.session_state.import_leaf_files   = leaves
+                        leaf_errors = []
+                        if leaves:
+                            leaf_val   = target_client().import_tml(list(leaves.values()), policy="VALIDATE_ONLY")
+                            leaf_errors = [r for r in leaf_val if r["status"] != "OK"]
+
+                    if leaf_errors:
+                        st.session_state.import_leaf_errors = leaf_errors
+                        st.session_state.import_phase = "leaves_pending"
+                        st.rerun()
+                    else:
+                        with st.spinner("Importing liveboards / answers…"):
+                            leaf_results = target_client().import_tml(list(leaves.values())) if leaves else []
+                        st.session_state.import_results = core_results + leaf_results
+                        st.session_state.import_phase = "complete"
+                        st.rerun()
 
     _nav(3, can_next="import_results" in st.session_state)
 
