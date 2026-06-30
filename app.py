@@ -816,6 +816,24 @@ elif step == 3:
                     out[(tbl, c.lower())] = {"affected": column_usage(items, c), "total": len(deps)}
             return out
 
+        def _resolve_finding_table(f):
+            """A table that fails the CDW type check comes back with header name 'unknown',
+            but the error's FQN (db.schema.db_table.col) names the physical table. Map that
+            db_table to the LOGICAL table name from the promotion bundle so we can resolve it
+            on the target (cross-cluster names are preserved). Falls back to the db_table."""
+            parts    = (f.get("column_fqn") or "").split(".")
+            db_table = parts[-2].lower() if len(parts) >= 2 else ""
+            for it in st.session_state.get("transformed_items", []):
+                d = _parse_edoc(it.get("edoc", "{}"))
+                t = d.get("table")
+                if not t:
+                    continue
+                if (t.get("db_table", "") or "").lower() == db_table or \
+                   (t.get("name", "") or "").lower() == db_table:
+                    return t.get("name") or db_table
+            obj = f.get("object")
+            return obj if obj and obj != "unknown" else (db_table or obj)
+
         # ── Stage 1: Export & validate ─────────────────────────────────────
         if "pr_url" not in st.session_state:
             if st.button("Export & Validate", type="primary", disabled=not filtered_items):
@@ -839,6 +857,11 @@ elif step == 3:
             dep_blocked  = [f for f in findings if f["kind"] == "drop_blocked_by_dependents"]
             type_mismatch = [f for f in findings if f["kind"] == "type_mismatch"]
             other        = [f for f in findings if f["kind"] == "other"]
+
+            # The failed table's header name is often "unknown"; recover the real table name
+            # from the error FQN + the promotion bundle so target lookups resolve.
+            for f in type_mismatch:
+                f["object"] = _resolve_finding_table(f)
 
             st.error(f"Validation found {len(findings)} issue(s) to resolve before import.")
 
