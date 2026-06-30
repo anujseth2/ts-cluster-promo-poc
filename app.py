@@ -35,9 +35,8 @@ TEAMS_FILE = Path(__file__).parent / "config" / "teams.json"
 STEPS = [
     "1 · Select Assets",
     "2 · obj_id Setup",
-    "3 · Review",
-    "4 · Git Operations",
-    "5 · Import Results",
+    "3 · Git Operations",
+    "4 · Import Results",
 ]
 
 
@@ -189,26 +188,29 @@ if step == 0:
     st.subheader(f"Source-cluster assets — team: {team_name}")
 
     if team_tags:
-        st.caption("Fetching liveboards/answers tagged: " + ", ".join(f"`{t}`" for t in team_tags))
+        st.caption("Fetching content tagged: " + ", ".join(f"`{t}`" for t in team_tags))
         fetch_label = "Fetch tagged content"
     else:
-        st.info("No tag set for this team — fetching **all** liveboards & answers you can access "
-                "(use this when the assets can't be tagged). Tick the ones to promote.")
-        fetch_label = "Fetch all liveboards & answers"
+        st.info("No tag set for this team — fetching **all** liveboards, answers, models & tables "
+                "you can access. Tick anything to promote: a liveboard pulls its model + tables, a "
+                "model pulls its tables, a table promotes on its own.")
+        fetch_label = "Fetch assets"
 
     if st.button(fetch_label, type="primary"):
         with st.spinner("Searching the source cluster…"):
-            st.session_state.assets   = source_client().search_by_tags(team_tags)
-            st.session_state.leaf_ids = []
-            for key in ("selected_ids", "dep_info", "_resolved_key", "obj_id_status",
+            st.session_state.assets = source_client().search_by_tags(
+                team_tags, types=["LIVEBOARD", "ANSWER", "LOGICAL_TABLE"])
+            for key in ("picks", "selected_ids", "dep_info", "_resolved_key", "excluded",
+                        "_promo_id2name", "_promo_present", "obj_id_status",
                         "table_alignment", "transformed_items", "import_results"):
                 st.session_state.pop(key, None)
 
     assets = st.session_state.get("assets", [])
+    unsafe = []   # local: models/tables excluded but absent on target (blocks Next)
 
     if not assets:
         if "assets" in st.session_state:
-            st.info("No liveboards or answers found.")
+            st.info("No assets found.")
     else:
         import pandas as pd
 
@@ -250,43 +252,93 @@ if step == 0:
             hide_index=True,
         )
 
-        leaf_ids = edited[edited["select"] == True]["id"].tolist()
-        st.session_state.leaf_ids = leaf_ids
+        picks       = edited[edited["select"] == True]["id"].tolist()
+        type_by_id  = {a["id"]: a["type"] for a in assets}
+        name_by_id  = {a["id"]: a["name"] for a in assets}
+        leaf_picks  = [i for i in picks if type_by_id.get(i) in ("LIVEBOARD", "ANSWER")]
+        model_picks = [i for i in picks if type_by_id.get(i) == "MODEL"]
+        table_picks = [i for i in picks if type_by_id.get(i) == "TABLE"]
 
-        # Auto-resolve the dependency chain (leaves -> models -> tables) whenever the
-        # selection changes. Cached by the selected-leaf set so it does NOT re-call on
-        # every Streamlit rerun (filtering, sorting) — only when the picks actually change.
-        sel_key = tuple(sorted(leaf_ids))
-        if leaf_ids:
-            if st.session_state.get("_resolved_key") != sel_key:
-                with st.spinner("Resolving dependencies (model + tables)…"):
-                    dep = source_client().resolve_dependencies(leaf_ids)
-                st.session_state.dep_info      = dep
-                st.session_state.selected_ids  = list(dict.fromkeys(
-                    dep["table_ids"] + dep["model_ids"] + leaf_ids))
-                st.session_state._resolved_key = sel_key
-                for _k in ("obj_id_status", "_raw_items", "table_alignment",
-                           "prod_by_name", "dev_table_refs"):
-                    st.session_state.pop(_k, None)
-        else:
-            st.session_state.dep_info      = None
-            st.session_state.selected_ids  = []
+        # Resolve the full stack from the mixed roots, cached by the pick set so it only
+        # re-calls when the picks actually change (not on every filter/sort rerun).
+        sel_key = tuple(sorted(picks))
+        if picks and st.session_state.get("_resolved_key") != sel_key:
+            with st.spinner("Resolving dependencies (models + tables)…"):
+                dep = source_client().resolve_promotion(leaf_picks, model_picks, table_picks)
+            id2name = dict(name_by_id)
+            for nm, i in dep["model_map"].items():
+                id2name[i] = nm
+            for nm, i in dep["table_map"].items():
+                id2name[i] = nm
+            # Target presence by name (cross-cluster names are preserved) — guards exclusion.
+            mt_names = sorted({id2name.get(i, "") for i in dep["model_ids"] + dep["table_ids"]
+                               if id2name.get(i)})
+            present = set()
+            if mt_names:
+                try:
+                    present = set(target_client()._resolve_names_to_ids(mt_names, "LOGICAL_TABLE").keys())
+                except Exception:
+                    present = set()
+            st.session_state.dep_info        = dep
+            st.session_state._promo_id2name  = id2name
+            st.session_state._promo_present  = present
+            st.session_state._resolved_key   = sel_key
+            st.session_state.pop("excluded", None)
+            for _k in ("obj_id_status", "_raw_items", "table_alignment",
+                       "prod_by_name", "dev_table_refs", "transformed_items"):
+                st.session_state.pop(_k, None)
+        elif not picks:
+            for _k in ("dep_info", "selected_ids"):
+                st.session_state.pop(_k, None)
             st.session_state._resolved_key = None
 
         dep = st.session_state.get("dep_info")
         if dep:
-            promo = st.session_state.get("selected_ids", [])
-            st.success(
-                f"Promotion set: {len(promo)} object(s) — "
-                f"{len(leaf_ids)} leaf, "
-                f"{len(dep['model_ids'])} model(s), {len(dep['table_ids'])} table(s)."
-            )
+            id2name  = st.session_state.get("_promo_id2name", {})
+            present  = st.session_state.get("_promo_present", set())
+            excluded = st.session_state.setdefault("excluded", set())
+
+            st.divider()
+            st.markdown("**Promotion set** — leaves always promote; untick a model or table to "
+                        "leave it out (safe only when it already exists on the target).")
+            for i in dep["leaf_ids"]:
+                st.markdown(f"-  `{id2name.get(i, i)}`  ·  leaf  ·  _always promoted_")
+
+            for kind, ids in (("model", dep["model_ids"]), ("table", dep["table_ids"])):
+                for i in ids:
+                    nm     = id2name.get(i, i)
+                    on_tgt = nm in present
+                    mark   = "on target ✓" if on_tgt else "not on target ✗"
+                    inc = st.checkbox(f"`{nm}`  ·  {kind}  ·  {mark}",
+                                      value=(i not in excluded), key=f"inc_{i}")
+                    if inc:
+                        excluded.discard(i)
+                    else:
+                        excluded.add(i)
+                        if not on_tgt:
+                            unsafe.append(nm)
+            st.session_state.excluded = excluded
+
+            order = dep["leaf_ids"] + dep["model_ids"] + dep["table_ids"]
+            included = [i for i in order if i not in excluded]
+            st.session_state.selected_ids = included
+
             missing = dep["missing_models"] + dep["missing_tables"]
             if missing:
                 st.warning("Unresolved on the source cluster: "
                            + ", ".join(f"`{n}`" for n in missing))
+            if unsafe:
+                st.error("Cannot exclude (not on the target, the import would break the binding): "
+                         + ", ".join(f"`{n}`" for n in unsafe)
+                         + ". Re-include them, or add them to the target first.")
+            n_mod = len([i for i in dep["model_ids"] if i not in excluded])
+            n_tbl = len([i for i in dep["table_ids"] if i not in excluded])
+            st.success(f"Promoting {len(included)} object(s): {len(dep['leaf_ids'])} leaf, "
+                       f"{n_mod} model(s), {n_tbl} table(s).")
+        else:
+            st.session_state.selected_ids = []
 
-    can_next = bool(st.session_state.get("selected_ids"))
+    can_next = bool(st.session_state.get("selected_ids")) and not unsafe
     _nav(0, can_next=can_next)
 
 
@@ -296,6 +348,10 @@ if step == 0:
 
 elif step == 1:
     st.subheader("obj_id Health Check")
+    # Any obj_id work here invalidates an earlier export, so Git Operations re-exports fresh
+    # (the exported TML must carry the aligned obj_ids).
+    for _k in ("transformed_items", "conn_mismatch", "warnings"):
+        st.session_state.pop(_k, None)
     st.markdown(
         "Every object being promoted needs `obj_id` set on the **source**. Tables that already "
         "exist on the **target** must share the same `obj_id` (otherwise import duplicates them); "
@@ -611,111 +667,63 @@ elif step == 1:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STEP 2 — Review
+# STEP 2 — Git Operations
 # ══════════════════════════════════════════════════════════════════════════════
 
 elif step == 2:
-    st.subheader("Review — data-layer remap preview")
+    st.subheader("Git Operations")
 
     selected_ids = st.session_state.get("selected_ids", [])
 
-    if not selected_ids:
-        st.info("Select assets in Step 1 first.")
-    else:
-        if st.button("Load & preview transformation", type="primary"):
-            with st.spinner("Exporting TML from the source cluster…"):
-                raw   = source_client().export_tml(selected_ids)
-                items = raw if isinstance(raw, list) else raw.get("object", [])
-
-                issues = detect_issues(items)
-                transformed_items, warnings = transform_items(
-                    items,
-                    source_connection=teams[team_name].get("source_connection", ""),
-                    target_connection=teams[team_name].get("target_connection", ""),
-                    db_map=teams[team_name].get("db_map", {}),
-                    schema_map=teams[team_name].get("schema_map", {}),
-                )
-
-                st.session_state.transformed_items = transformed_items
-                st.session_state.issues            = issues
-                st.session_state.warnings          = warnings
-
-                # #3: flag if the configured source_connection matches NO connection in the
-                # exported tables (the remap would silently skip -> Step-4 import failure).
-                src_conn   = teams[team_name].get("source_connection", "")
-                conn_names = set()
-                for it in items:
-                    c = (_parse_edoc(it.get("edoc", "{}")).get("table", {}) or {}).get("connection", {})
-                    if isinstance(c, dict) and c.get("name"):
-                        conn_names.add(c["name"])
-                st.session_state.conn_mismatch = (
-                    {"configured": src_conn, "found": sorted(conn_names)}
-                    if src_conn and conn_names and src_conn not in conn_names else None)
-
-        transformed_items = st.session_state.get("transformed_items")
-        issues            = st.session_state.get("issues", [])
-        warnings          = st.session_state.get("warnings", [])
-
-        cm = st.session_state.get("conn_mismatch")
-        if cm:
-            st.error(
-                f"Source connection `{cm['configured']}` matches **no connection** in the exported "
-                "tables — the remap is skipped, so import will fail on the target. Connections "
-                "actually present: " + ", ".join(f"`{n}`" for n in cm["found"])
-                + ". Set `source_connection` (sidebar) to one of those exactly, or blank it to keep "
-                "the source name as-is.")
-
-        if transformed_items is not None:
-            st.markdown("**Objects to promote:**")
-            for item in transformed_items:
-                info = item.get("info", {})
-                name = info.get("name", "unknown")
-                typ  = info.get("type", "")
-                doc  = _parse_edoc(item.get("edoc", "{}"))
-                oid  = doc.get("obj_id", "")
-                badge = "✅" if oid else "⚠️"
-                st.markdown(
-                    f"- {badge} `{name}` ({typ})"
-                    + (f" — obj_id: `{oid}`" if oid else " — **no obj_id**")
-                )
-
-            if issues:
-                st.divider()
-                st.warning(f"{len(issues)} object(s) flagged for review:")
-                for issue in issues:
-                    with st.expander(f"⚠️  {issue['object']} ({issue['type']})"):
-                        st.write(issue["issue"])
-                        action = st.radio(
-                            "Action",
-                            ["Include anyway", "Skip this object"],
-                            key=f"action_{issue['object']}",
-                        )
-                        if action == "Skip this object":
-                            st.session_state.setdefault("skip_objects", set()).add(issue["object"])
-                        else:
-                            st.session_state.get("skip_objects", set()).discard(issue["object"])
-
-            if warnings:
-                st.divider()
-                st.error(f"{len(warnings)} transformation warning(s):")
-                for w in warnings:
-                    st.markdown(f"- **{w['object']}**: {w['issue']}")
-
-    _nav(2, can_next=bool(st.session_state.get("transformed_items") is not None))
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# STEP 3 — Git Operations
-# ══════════════════════════════════════════════════════════════════════════════
-
-elif step == 3:
-    st.subheader("Git Operations")
+    # Export + transform on entry. This runs AFTER obj_id Setup, so the exported TML carries
+    # the aligned obj_ids. (This replaced the standalone Review page.)
+    if selected_ids and "transformed_items" not in st.session_state:
+        with st.spinner("Exporting TML (post-alignment) and applying the data-layer transform…"):
+            raw   = source_client().export_tml(selected_ids)
+            items = raw if isinstance(raw, list) else raw.get("object", [])
+            transformed_items, warnings = transform_items(
+                items,
+                source_connection=teams[team_name].get("source_connection", ""),
+                target_connection=teams[team_name].get("target_connection", ""),
+                db_map=teams[team_name].get("db_map", {}),
+                schema_map=teams[team_name].get("schema_map", {}),
+            )
+            st.session_state.transformed_items = transformed_items
+            st.session_state.warnings          = warnings
+            # Flag if a configured source_connection matches NO connection in the exported
+            # tables (the remap would silently skip -> import failure on the target).
+            src_conn   = teams[team_name].get("source_connection", "")
+            conn_names = set()
+            for it in items:
+                c = (_parse_edoc(it.get("edoc", "{}")).get("table", {}) or {}).get("connection", {})
+                if isinstance(c, dict) and c.get("name"):
+                    conn_names.add(c["name"])
+            st.session_state.conn_mismatch = (
+                {"configured": src_conn, "found": sorted(conn_names)}
+                if src_conn and conn_names and src_conn not in conn_names else None)
 
     transformed_items = st.session_state.get("transformed_items")
+    cm = st.session_state.get("conn_mismatch")
 
-    if transformed_items is None:
-        st.info("Complete Step 3 (Review) first.")
+    if not selected_ids:
+        st.info("Select assets in Step 1 first.")
+    elif cm:
+        st.error(
+            f"Source connection `{cm['configured']}` matches no connection in the exported tables, "
+            "so the remap is skipped and import will fail on the target. Connections present: "
+            + ", ".join(f"`{n}`" for n in cm["found"])
+            + ". Set the source connection in the sidebar to one of those exactly, or blank it.")
+        if st.button("Re-export after fixing the connection"):
+            for _k in ("transformed_items", "conn_mismatch", "warnings"):
+                st.session_state.pop(_k, None)
+            st.rerun()
+    elif transformed_items is None:
+        st.info("Nothing to promote.")
     else:
+        warnings = st.session_state.get("warnings", [])
+        if warnings:
+            st.warning(f"{len(warnings)} transform warning(s): "
+                       + "; ".join(f"{w['object']}: {w['issue']}" for w in warnings))
         skip_objects  = st.session_state.get("skip_objects", set())
         filtered_items = [
             i for i in transformed_items
@@ -1139,14 +1147,14 @@ elif step == 3:
                         st.session_state.import_phase = "complete"
                         st.rerun()
 
-    _nav(3, can_next="import_results" in st.session_state)
+    _nav(2, can_next="import_results" in st.session_state)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STEP 4 — Import Results
+# STEP 3 — Import Results
 # ══════════════════════════════════════════════════════════════════════════════
 
-elif step == 4:
+elif step == 3:
     st.subheader("Import Results")
 
     results = st.session_state.get("import_results")
@@ -1208,4 +1216,4 @@ elif step == 4:
             st.dataframe(failed[["name", "type", "status", "error"]],
                          use_container_width=True, hide_index=True)
 
-    _nav(4)
+    _nav(3)

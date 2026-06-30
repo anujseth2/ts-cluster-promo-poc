@@ -92,10 +92,16 @@ class TSClient:
         tags_raw = header.get("tags") or item.get("tags") or []
         tags = ", ".join((t.get("name", "") if isinstance(t, dict) else str(t)) for t in tags_raw) \
             if isinstance(tags_raw, list) else ""
+        # LOGICAL_TABLE covers both models (WORKSHEET subtype) and tables — distinguish them
+        # so the picker can show MODEL vs TABLE and the dependency walk can treat them right.
+        disp_type = obj_type
+        if obj_type == "LOGICAL_TABLE":
+            sub = (header.get("type") or item.get("metadata_sub_type") or "").upper()
+            disp_type = "MODEL" if ("WORKSHEET" in sub or sub == "MODEL") else "TABLE"
         return {
             "id":       item.get("metadata_id", ""),
             "name":     item.get("metadata_name", ""),
-            "type":     obj_type,
+            "type":     disp_type,
             "author":   author,
             "modified": _fmt(item.get("metadata_modified_time") or header.get("modified")),
             "created":  _fmt(header.get("created") or item.get("metadata_created_time")),
@@ -146,45 +152,59 @@ class TSClient:
                     break
         return out
 
-    # ── Dependency walk: leaves -> models -> tables ─────────────────────────────
+    # ── Dependency walk: mixed roots (leaves / models / tables) -> full stack ────
 
-    def resolve_dependencies(self, leaf_ids: List[str]) -> Dict:
+    def resolve_promotion(self, leaf_ids: Optional[List[str]] = None,
+                          model_ids: Optional[List[str]] = None,
+                          table_ids: Optional[List[str]] = None) -> Dict:
         """
-        Given liveboard/answer GUIDs, walk down the chain and return the model and
-        table GUIDs they sit on, so a promotion ships the whole stack. Names that
-        cannot be resolved on this cluster are returned in missing_* for warning.
+        Resolve the full promotion set from mixed roots. Walks leaves -> models -> tables,
+        AND directly-selected models -> their tables; directly-selected tables are included
+        as-is. So you can promote a liveboard (whole stack), a bare model (+ its tables), or
+        bare tables. Returns deduped model_ids/table_ids, the derived name->id maps (so the
+        caller can label/target-check by name), and missing_* for warnings.
         """
+        leaf_ids   = leaf_ids or []
+        sel_models = model_ids or []
+        sel_tables = table_ids or []
+
         def _parse(it):
             e = it.get("edoc", "{}")
             return json.loads(e) if e.strip().startswith("{") else yaml.safe_load(e)
 
         # 1. leaves -> referenced model names
-        raw   = self.export_tml(leaf_ids)
-        items = raw if isinstance(raw, list) else raw.get("object", [])
         model_names = set()
-        for it in items:
-            model_names |= set(extract_model_refs(_parse(it)))
-
+        if leaf_ids:
+            raw   = self.export_tml(leaf_ids)
+            items = raw if isinstance(raw, list) else raw.get("object", [])
+            for it in items:
+                model_names |= set(extract_model_refs(_parse(it)))
         model_map = self._resolve_names_to_ids(model_names) if model_names else {}
-        model_ids = list(model_map.values())
+        all_model_ids = list(dict.fromkeys(sel_models + list(model_map.values())))
 
-        # 2. models -> referenced table names
+        # 2. all models (selected + leaf-derived) -> referenced table names
         table_names = set()
-        if model_ids:
-            raw_m   = self.export_tml(model_ids)
+        if all_model_ids:
+            raw_m   = self.export_tml(all_model_ids)
             items_m = raw_m if isinstance(raw_m, list) else raw_m.get("object", [])
             for it in items_m:
                 table_names |= set(extract_table_refs(_parse(it)))
-
         table_map = self._resolve_names_to_ids(table_names) if table_names else {}
-        table_ids = list(table_map.values())
+        all_table_ids = list(dict.fromkeys(sel_tables + list(table_map.values())))
 
         return {
-            "model_ids":      model_ids,
-            "table_ids":      table_ids,
+            "leaf_ids":       leaf_ids,
+            "model_ids":      all_model_ids,
+            "table_ids":      all_table_ids,
+            "model_map":      model_map,   # derived model name -> id
+            "table_map":      table_map,   # derived table name -> id
             "missing_models": sorted(model_names - set(model_map)),
             "missing_tables": sorted(table_names - set(table_map)),
         }
+
+    def resolve_dependencies(self, leaf_ids: List[str]) -> Dict:
+        """Backward-compat wrapper: resolve the stack from liveboard/answer leaves only."""
+        return self.resolve_promotion(leaf_ids=leaf_ids)
 
     # ── obj_id alignment ────────────────────────────────────────────────────────
 
