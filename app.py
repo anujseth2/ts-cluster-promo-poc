@@ -1156,9 +1156,41 @@ elif step == 4:
     else:
         import pandas as pd
 
-        df      = pd.DataFrame(results)[["name", "type", "status", "error", "new_id"]]
-        success = df[df["status"] == "OK"]
-        failed  = df[df["status"] != "OK"]
+        # The API reports models AND tables as LOGICAL_TABLE, so relabel each row with the
+        # type we know from the promotion bundle (Table / Model / Liveboard / Answer).
+        def _friendly(d):
+            if "table" in d:                       return "Table"
+            if "model" in d or "worksheet" in d:   return "Model"
+            if "liveboard" in d:                   return "Liveboard"
+            if "answer" in d:                      return "Answer"
+            return ""
+        type_by_name = {}
+        for it in st.session_state.get("transformed_items", []):
+            d = _parse_edoc(it.get("edoc", "{}"))
+            ft = _friendly(d)
+            for k in ("table", "model", "worksheet", "liveboard", "answer"):
+                node = d.get(k)
+                if isinstance(node, dict) and node.get("name"):
+                    type_by_name[node["name"]] = ft
+                    break
+
+        _RAW = {"LOGICAL_TABLE": "Table", "PINBOARD_ANSWER_BOOK": "Liveboard",
+                "QUESTION_ANSWER_BOOK": "Answer", "ANSWER": "Answer", "LIVEBOARD": "Liveboard"}
+
+        def _row_type(row):
+            nm = row.get("name", "")
+            if nm in type_by_name:
+                return type_by_name[nm]
+            err = str(row.get("error", "") or "")
+            if "Visualization" in err or "pinboard" in err.lower():
+                return "Liveboard"
+            raw = row.get("type", "") or ""
+            return _RAW.get(raw, raw)
+
+        df         = pd.DataFrame(results)[["name", "type", "status", "error", "new_id"]]
+        df["type"] = df.apply(_row_type, axis=1)
+        success    = df[df["status"] == "OK"]
+        failed     = df[df["status"] != "OK"]
 
         col1, col2 = st.columns(2)
         col1.metric("Succeeded", len(success))
