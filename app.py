@@ -20,7 +20,10 @@ from services.tml_transformer import (
     items_to_files,
     files_to_tml_strings,
 )
-from services.import_diagnostics import classify_import_errors, drop_columns, silent_drop_findings
+from services.import_diagnostics import (
+    classify_import_errors, drop_columns, silent_drop_findings, column_dependents,
+)
+from services.table_matcher import column_signature
 
 load_dotenv(Path(__file__).parent / ".env")
 
@@ -763,6 +766,28 @@ elif step == 3:
                         target_docs[td["table"]["name"]] = td
             return silent_drop_findings(src_docs, target_docs)
 
+        def _target_col_types(mismatches):
+            """For each type_mismatch finding, read the target table's ACTUAL type for that
+            column (dev's type is in the error). Returns {(object, column_lower): type}.
+            The target logical table normally mirrors the warehouse; view access suffices."""
+            tgt   = target_client()
+            names = sorted({f["object"] for f in mismatches if f.get("object")})
+            out   = {}
+            if not names:
+                return out
+            name_to_id = tgt._resolve_names_to_ids(names, "LOGICAL_TABLE")
+            sigs = {}
+            if name_to_id:
+                raw    = tgt.export_tml(list(name_to_id.values()))
+                titems = raw if isinstance(raw, list) else raw.get("object", [])
+                for it in titems:
+                    td = _parse_edoc(it.get("edoc", "{}"))
+                    if "table" in td and td["table"].get("name"):
+                        sigs[td["table"]["name"]] = column_signature(td)
+            for f in mismatches:
+                out[(f["object"], f["column"].lower())] = sigs.get(f["object"], {}).get(f["column"].lower(), "")
+            return out
+
         # ── Stage 1: Export & validate ─────────────────────────────────────
         if "pr_url" not in st.session_state:
             if st.button("Export & Validate", type="primary", disabled=not filtered_items):
@@ -784,6 +809,7 @@ elif step == 3:
             findings     = classify_import_errors(val_errors)
             wh_missing   = [f for f in findings if f["kind"] == "missing_in_target_warehouse"]
             dep_blocked  = [f for f in findings if f["kind"] == "drop_blocked_by_dependents"]
+            type_mismatch = [f for f in findings if f["kind"] == "type_mismatch"]
             other        = [f for f in findings if f["kind"] == "other"]
 
             st.error(f"Validation found {len(findings)} issue(s) to resolve before import.")
@@ -828,6 +854,66 @@ elif step == 3:
                         + ", ".join(f"**{d}**" for d in f["dependents"]) + ".\n\n"
                         "Resolve by **preserving** the column (add it back to the source) or by "
                         "**removing those dependents** on the target, then re-run.")
+
+            # ── type drift: column exists on both sides, types differ ──
+            if type_mismatch:
+                st.markdown("#### Column type mismatches (warehouse drift)")
+                st.caption(
+                    "These columns exist on both clusters but the **target warehouse**'s physical "
+                    "type differs from dev's. **Dev is the source of truth**, so the fix is to align "
+                    "the target warehouse to dev — not to alter the promoted content. Dropping is a "
+                    "last resort and is blocked here when a join or formula depends on the column.")
+
+                tm_key = tuple(sorted((f["object"], f["column"]) for f in type_mismatch))
+                if st.session_state.get("_tm_key") != tm_key:
+                    with st.spinner("Reading target warehouse column types…"):
+                        st.session_state._tm_types = _target_col_types(type_mismatch)
+                        st.session_state._tm_key    = tm_key
+                tgt_types = st.session_state.get("_tm_types", {})
+
+                tm_drop = set()
+                for f in type_mismatch:
+                    tgt_t = tgt_types.get((f["object"], f["column"].lower()), "")
+                    test_str = f"`{tgt_t.upper()}`" if tgt_t else "`(differs — see warehouse)`"
+                    st.markdown(
+                        f"**`{f['column']}`**  ·  {f['object']}  —  dev: `{f['source_type']}`,  test: {test_str}")
+                    st.caption(
+                        f"Align the target warehouse: set `{f['column_fqn']}` to `{f['source_type']}` "
+                        f"on connection **{f['connection']}** to match dev.")
+
+                    deps = column_dependents(st.session_state.transformed_items, [f["column"]])
+                    bits = []
+                    if deps["joins"]:    bits.append("joins: "    + ", ".join(deps["joins"]))
+                    if deps["formulas"]: bits.append("formulas: " + ", ".join(deps["formulas"]))
+                    if deps["vizzes"]:   bits.append("vizzes: "   + ", ".join(str(v) for v in deps["vizzes"]))
+                    if bits:
+                        st.caption("Dependents if dropped — " + "  ·  ".join(bits))
+
+                    if deps["joins"] or deps["formulas"]:
+                        st.warning(
+                            f"`{f['column']}` feeds a join/formula — dropping it would break the model. "
+                            "Align the target warehouse, or remove those joins/formulas first.")
+                    elif st.checkbox(
+                            f"Drop `{f['column']}` from this promotion (fallback — loses any viz above)",
+                            value=False, key=f"droptm_{f['object']}_{f['column']}"):
+                        tm_drop.add(f["column"])
+
+                if st.button("Apply drops, re-export & re-validate", key="tm_apply"):
+                    if tm_drop:
+                        fixed, dc, dv = drop_columns(st.session_state.transformed_items, tm_drop)
+                        st.session_state.transformed_items  = fixed
+                        st.session_state.dropped_cols_count = st.session_state.get("dropped_cols_count", 0) + dc
+                        st.session_state.dropped_vizs_count = st.session_state.get("dropped_vizs_count", 0) + dv
+                    filtered_fixed = [i for i in st.session_state.transformed_items
+                                      if i.get("info", {}).get("name") not in skip_objects]
+                    with st.spinner("Re-committing and re-validating…"):
+                        pr_url, err, ok = _run_validation(filtered_fixed)
+                        st.session_state.pr_url            = pr_url
+                        st.session_state.validation_errors = err
+                        st.session_state.validation_ok     = ok
+                        st.session_state.pop("silent_drops", None)
+                        st.session_state.pop("_tm_key", None)
+                    st.rerun()
 
             # ── anything unrecognised ──
             if other:
