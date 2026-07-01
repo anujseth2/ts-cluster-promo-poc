@@ -307,6 +307,22 @@ if step == 0:
                         "leave it out. If it already exists on the target the model just binds to "
                         "that copy; if it does not, you can prune it out of the model, and you will "
                         "see exactly what gets dropped first.")
+
+            OPT_CREATE   = "Promote tables (create / update on target)"
+            OPT_EXISTING = "Use existing target tables only (don't create)"
+            tmode = st.radio(
+                "Table handling", [OPT_CREATE, OPT_EXISTING], key="tables_mode", horizontal=True,
+                help="Existing-only ships no table TML — the model binds to tables already on the "
+                     "target. Any referenced table missing from the target must then be pruned out "
+                     "of the model (you'll be shown what that drops).")
+            # Mode change flips the default include state of every table, so reset their widgets.
+            if st.session_state.get("_tables_mode_prev") != tmode:
+                for _i in dep["table_ids"]:
+                    st.session_state.pop(f"inc_{_i}", None)
+                    st.session_state.pop(f"ackprune_{_i}", None)
+                st.session_state._tables_mode_prev = tmode
+            tables_default_include = (tmode == OPT_CREATE)
+
             for i in dep["leaf_ids"]:
                 st.markdown(f"-  `{id2name.get(i, i)}`  ·  leaf  ·  _always promoted_")
 
@@ -332,7 +348,7 @@ if step == 0:
                 on_tgt = nm in present
                 mark   = "on target ✓" if on_tgt else "not on target ✗"
                 inc = st.checkbox(f"`{nm}`  ·  table  ·  {mark}",
-                                  value=(i not in excluded), key=f"inc_{i}")
+                                  value=tables_default_include, key=f"inc_{i}")
                 if inc:
                     excluded.discard(i)
                     prune.discard(nm)
