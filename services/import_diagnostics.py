@@ -402,12 +402,63 @@ def _model_table_columns(docs, table_targets):
     return keys, display
 
 
-def table_drop_preview(items, table_name):
-    """Read-only preview of what pruning `table_name` out of the model(s) would remove: the
-    table's columns, the joins that attach it, formulas that use it, and dependent leaf vizzes."""
-    tn   = table_name.strip().lower()
+def _refs_formula(obj, formula_ids):
+    """True if any `[formula_x]` reference inside obj points at a formula id in formula_ids."""
+    for expr in _iter_strings(obj):
+        for inner in _BRACKET_REF.findall(expr):
+            if inner.strip().lower() in formula_ids:
+                return True
+    return False
+
+
+def _formula_id(f):
+    return (f.get("id") or ("formula_" + (f.get("name", "") or ""))).strip().lower()
+
+
+def _table_drop_plan(items, table_names):
+    """Full transitive closure of what pruning `table_names` removes from the model(s): the
+    tables + attaching joins + their physical columns, then by FIXPOINT every formula that
+    references those columns (or another dropped formula), the formula-backed columns those
+    formulas back, and dependent leaf vizzes. Returns removal sets (targets, dropped_fids,
+    dropped_col_names) plus human-readable lists (columns, joins, formulas, vizzes)."""
+    targets = {t.strip().lower() for t in table_names}
     docs = [_parse_edoc(it) for it in items]
-    col_keys, col_display = _model_table_columns(docs, {tn})
+    phys_keys, phys_display = _model_table_columns(docs, targets)
+
+    all_formulas = []
+    for doc in docs:
+        for key in ("model", "worksheet"):
+            node = doc.get(key)
+            if node:
+                all_formulas += (node.get("formulas") or [])
+
+    dropped_fids = set()
+    changed = True
+    while changed:
+        changed = False
+        for f in all_formulas:
+            fid = _formula_id(f)
+            if fid in dropped_fids:
+                continue
+            if _refs_table_prefix(f, targets) or _refs_formula(f, dropped_fids):
+                dropped_fids.add(fid)
+                changed = True
+
+    dropped_formula_names = [f.get("name") or f.get("id") for f in all_formulas
+                             if _formula_id(f) in dropped_fids]
+
+    formula_col_names = []
+    for doc in docs:
+        for key in ("model", "worksheet"):
+            node = doc.get(key)
+            if not node:
+                continue
+            for c in node.get("columns", []) or []:
+                if (c.get("formula_id", "") or "").strip().lower() in dropped_fids:
+                    formula_col_names.append(c.get("name") or c.get("formula_id"))
+
+    dropped_col_names = set(phys_keys) | {(n or "").strip().lower() for n in formula_col_names if n}
+
     joins = []
     for doc in docs:
         for key in ("model", "worksheet"):
@@ -416,32 +467,59 @@ def table_drop_preview(items, table_name):
                 continue
             for mt in (node.get("model_tables") or []):
                 for j in mt.get("joins", []) or []:
-                    if ((mt.get("name", "") or "").strip().lower() == tn
-                            or (j.get("with", "") or "").strip().lower() == tn
-                            or _refs_table_prefix(j, {tn})):
+                    if ((mt.get("name", "") or "").strip().lower() in targets
+                            or (j.get("with", "") or "").strip().lower() in targets
+                            or _refs_table_prefix(j, targets)):
                         joins.append(j.get("name") or f"{mt.get('name','')} -> {j.get('with','')}")
-    deps = column_dependents(items, list(col_keys)) if col_keys else {"joins": [], "formulas": [], "vizzes": []}
+
+    vizzes = []
+    for doc in docs:
+        lb = doc.get("liveboard")
+        if lb:
+            for viz in lb.get("visualizations", []) or []:
+                ac = [(c.get("name", "") or "").strip().lower()
+                      for c in viz.get("answer", {}).get("answer_columns", [])]
+                if any(a in dropped_col_names for a in ac) or _expr_refs(viz, dropped_col_names, dropped_col_names):
+                    vizzes.append(viz.get("id") or viz.get("viz_id") or "(viz)")
+        ans = doc.get("answer")
+        if ans:
+            ac = [(c.get("name", "") or "").strip().lower() for c in ans.get("answer_columns", [])]
+            if any(a in dropped_col_names for a in ac) or _expr_refs(ans, dropped_col_names, dropped_col_names):
+                vizzes.append(ans.get("name") or "(answer)")
+
     return {
-        "columns":  sorted(set(col_display)),
-        "joins":    sorted(set(joins) | set(deps["joins"])),
-        "formulas": deps["formulas"],
-        "vizzes":   deps["vizzes"],
+        "targets":           targets,
+        "dropped_fids":      dropped_fids,
+        "dropped_col_names": dropped_col_names,
+        "columns":  sorted(set(phys_display) | {n for n in formula_col_names if n}),
+        "joins":    sorted(set(joins)),
+        "formulas": sorted(set(dropped_formula_names)),
+        "vizzes":   list(dict.fromkeys(vizzes)),
     }
 
 
+def table_drop_preview(items, table_name):
+    """Read-only preview of what pruning `table_name` out of the model(s) would remove — the
+    table's columns, attaching joins, formulas that use it (transitively), the formula-backed
+    columns those formulas back, and dependent leaf vizzes."""
+    plan = _table_drop_plan(items, [table_name])
+    return {k: plan[k] for k in ("columns", "joins", "formulas", "vizzes")}
+
+
 def drop_tables(items, table_names):
-    """Prune whole tables out of the model(s): remove their model_tables entry + the joins
-    that attach them + their columns + formulas that use them, and drop dependent leaf vizzes
-    (and their layout tiles). Use when a table is EXCLUDED but is NOT on the target, so the
-    model must stop referencing it. Returns (new_items, summary counts)."""
-    targets = {t.strip().lower() for t in table_names}
+    """Prune whole tables out of the model(s): remove their model_tables entry + attaching
+    joins + physical columns + (transitively) formulas that use them + the formula-backed
+    columns those formulas back, and drop dependent leaf vizzes (and layout tiles). Use when a
+    table is EXCLUDED but NOT on the target, so the model must stop referencing it. Returns
+    (new_items, summary counts)."""
+    plan = _table_drop_plan(items, table_names)
+    targets, dropped_fids, dcn = plan["targets"], plan["dropped_fids"], plan["dropped_col_names"]
     summary = {"tables": 0, "columns": 0, "joins": 0, "formulas": 0, "vizzes": 0}
     if not targets:
         return items, summary
-    docs = [_parse_edoc(it) for it in items]
-    col_keys, _ = _model_table_columns(docs, targets)
     out = []
-    for item, doc in zip(items, docs):
+    for item in items:
+        doc = _parse_edoc(item)
         for key in ("model", "worksheet"):
             node = doc.get(key)
             if not node:
@@ -463,25 +541,26 @@ def drop_tables(items, table_names):
                         mt["joins"] = kj
                     kept_mt.append(mt)
                 node["model_tables"] = kept_mt
+            if isinstance(node.get("formulas"), list):
+                before = len(node["formulas"])
+                node["formulas"] = [f for f in node["formulas"] if _formula_id(f) not in dropped_fids]
+                summary["formulas"] += before - len(node["formulas"])
             if isinstance(node.get("columns"), list):
                 before = len(node["columns"])
                 node["columns"] = [
                     c for c in node["columns"]
-                    if not ("::" in (c.get("column_id", "") or "")
-                            and (c.get("column_id", "")).split("::")[0].strip().lower() in targets)
+                    if not (("::" in (c.get("column_id", "") or "")
+                             and (c.get("column_id", "")).split("::")[0].strip().lower() in targets)
+                            or (c.get("formula_id", "") or "").strip().lower() in dropped_fids)
                 ]
                 summary["columns"] += before - len(node["columns"])
-            if isinstance(node.get("formulas"), list):
-                before = len(node["formulas"])
-                node["formulas"] = [f for f in node["formulas"] if not _expr_refs(f, col_keys, col_keys)]
-                summary["formulas"] += before - len(node["formulas"])
         lb = doc.get("liveboard")
         if lb and isinstance(lb.get("visualizations"), list):
             kept, kept_ids = [], set()
             for viz in lb["visualizations"]:
                 ac = [(c.get("name", "") or "").strip().lower()
                       for c in viz.get("answer", {}).get("answer_columns", [])]
-                if any(a in col_keys for a in ac) or _expr_refs(viz, col_keys, col_keys):
+                if any(a in dcn for a in ac) or _expr_refs(viz, dcn, dcn):
                     summary["vizzes"] += 1
                 else:
                     kept.append(viz)
