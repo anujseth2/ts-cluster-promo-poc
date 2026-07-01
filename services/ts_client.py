@@ -173,11 +173,13 @@ class TSClient:
             return json.loads(e) if e.strip().startswith("{") else yaml.safe_load(e)
 
         # 1. leaves -> referenced model names
+        leaf_items  = []
+        model_items = []
         model_names = set()
         if leaf_ids:
             raw   = self.export_tml(leaf_ids)
-            items = raw if isinstance(raw, list) else raw.get("object", [])
-            for it in items:
+            leaf_items = raw if isinstance(raw, list) else raw.get("object", [])
+            for it in leaf_items:
                 model_names |= set(extract_model_refs(_parse(it)))
         model_map = self._resolve_names_to_ids(model_names) if model_names else {}
         all_model_ids = list(dict.fromkeys(sel_models + list(model_map.values())))
@@ -186,8 +188,8 @@ class TSClient:
         table_names = set()
         if all_model_ids:
             raw_m   = self.export_tml(all_model_ids)
-            items_m = raw_m if isinstance(raw_m, list) else raw_m.get("object", [])
-            for it in items_m:
+            model_items = raw_m if isinstance(raw_m, list) else raw_m.get("object", [])
+            for it in model_items:
                 table_names |= set(extract_table_refs(_parse(it)))
         table_map = self._resolve_names_to_ids(table_names) if table_names else {}
         all_table_ids = list(dict.fromkeys(sel_tables + list(table_map.values())))
@@ -198,6 +200,8 @@ class TSClient:
             "table_ids":      all_table_ids,
             "model_map":      model_map,   # derived model name -> id
             "table_map":      table_map,   # derived table name -> id
+            "leaf_items":     leaf_items,  # exported leaf TML items (for drop previews)
+            "model_items":    model_items, # exported model TML items (for drop previews)
             "missing_models": sorted(model_names - set(model_map)),
             "missing_tables": sorted(table_names - set(table_map)),
         }

@@ -371,3 +371,132 @@ def drop_vizzes(items, viz_ids):
 
         out.append({**item, "edoc": json.dumps(doc)})
     return out, dropped
+
+
+def _refs_table_prefix(obj, table_targets):
+    """True if any `[table::col]` reference inside obj names a table in table_targets
+    (matched on the part BEFORE `::`, i.e. the table, not the column)."""
+    for expr in _iter_strings(obj):
+        for inner in _BRACKET_REF.findall(expr):
+            if "::" in inner and inner.split("::")[0].strip().lower() in table_targets:
+                return True
+    return False
+
+
+def _model_table_columns(docs, table_targets):
+    """Column keys (db-name + display, lowercased) for every model column belonging to a
+    target table (matched by column_id prefix), plus the display names for reporting."""
+    keys, display = set(), []
+    for doc in docs:
+        for key in ("model", "worksheet"):
+            node = doc.get(key)
+            if not node:
+                continue
+            for c in node.get("columns", []) or []:
+                cid = c.get("column_id", "") or ""
+                if "::" in cid and cid.split("::")[0].strip().lower() in table_targets:
+                    keys.add(cid.split("::")[-1].strip().lower())
+                    nm = (c.get("name") or "").strip()
+                    keys.add(nm.lower() if nm else cid.split("::")[-1].strip().lower())
+                    display.append(nm or cid.split("::")[-1])
+    return keys, display
+
+
+def table_drop_preview(items, table_name):
+    """Read-only preview of what pruning `table_name` out of the model(s) would remove: the
+    table's columns, the joins that attach it, formulas that use it, and dependent leaf vizzes."""
+    tn   = table_name.strip().lower()
+    docs = [_parse_edoc(it) for it in items]
+    col_keys, col_display = _model_table_columns(docs, {tn})
+    joins = []
+    for doc in docs:
+        for key in ("model", "worksheet"):
+            node = doc.get(key)
+            if not node:
+                continue
+            for mt in (node.get("model_tables") or []):
+                for j in mt.get("joins", []) or []:
+                    if ((mt.get("name", "") or "").strip().lower() == tn
+                            or (j.get("with", "") or "").strip().lower() == tn
+                            or _refs_table_prefix(j, {tn})):
+                        joins.append(j.get("name") or f"{mt.get('name','')} -> {j.get('with','')}")
+    deps = column_dependents(items, list(col_keys)) if col_keys else {"joins": [], "formulas": [], "vizzes": []}
+    return {
+        "columns":  sorted(set(col_display)),
+        "joins":    sorted(set(joins) | set(deps["joins"])),
+        "formulas": deps["formulas"],
+        "vizzes":   deps["vizzes"],
+    }
+
+
+def drop_tables(items, table_names):
+    """Prune whole tables out of the model(s): remove their model_tables entry + the joins
+    that attach them + their columns + formulas that use them, and drop dependent leaf vizzes
+    (and their layout tiles). Use when a table is EXCLUDED but is NOT on the target, so the
+    model must stop referencing it. Returns (new_items, summary counts)."""
+    targets = {t.strip().lower() for t in table_names}
+    summary = {"tables": 0, "columns": 0, "joins": 0, "formulas": 0, "vizzes": 0}
+    if not targets:
+        return items, summary
+    docs = [_parse_edoc(it) for it in items]
+    col_keys, _ = _model_table_columns(docs, targets)
+    out = []
+    for item, doc in zip(items, docs):
+        for key in ("model", "worksheet"):
+            node = doc.get(key)
+            if not node:
+                continue
+            mts = node.get("model_tables")
+            if isinstance(mts, list):
+                kept_mt = []
+                for mt in mts:
+                    if (mt.get("name", "") or "").strip().lower() in targets:
+                        summary["tables"] += 1
+                        continue   # drop the whole table entry (its joins go with it)
+                    if isinstance(mt.get("joins"), list):
+                        kj = []
+                        for j in mt["joins"]:
+                            if (j.get("with", "") or "").strip().lower() in targets or _refs_table_prefix(j, targets):
+                                summary["joins"] += 1
+                            else:
+                                kj.append(j)
+                        mt["joins"] = kj
+                    kept_mt.append(mt)
+                node["model_tables"] = kept_mt
+            if isinstance(node.get("columns"), list):
+                before = len(node["columns"])
+                node["columns"] = [
+                    c for c in node["columns"]
+                    if not ("::" in (c.get("column_id", "") or "")
+                            and (c.get("column_id", "")).split("::")[0].strip().lower() in targets)
+                ]
+                summary["columns"] += before - len(node["columns"])
+            if isinstance(node.get("formulas"), list):
+                before = len(node["formulas"])
+                node["formulas"] = [f for f in node["formulas"] if not _expr_refs(f, col_keys, col_keys)]
+                summary["formulas"] += before - len(node["formulas"])
+        lb = doc.get("liveboard")
+        if lb and isinstance(lb.get("visualizations"), list):
+            kept, kept_ids = [], set()
+            for viz in lb["visualizations"]:
+                ac = [(c.get("name", "") or "").strip().lower()
+                      for c in viz.get("answer", {}).get("answer_columns", [])]
+                if any(a in col_keys for a in ac) or _expr_refs(viz, col_keys, col_keys):
+                    summary["vizzes"] += 1
+                else:
+                    kept.append(viz)
+                    kept_ids.add(str(viz.get("id") or viz.get("viz_id") or ""))
+            lb["visualizations"] = kept
+            layout = lb.get("layout") or {}
+
+            def _prune(tiles):
+                return [t for t in tiles if str(t.get("visualization_id", "")) in kept_ids]
+
+            if isinstance(layout.get("tiles"), list):
+                layout["tiles"] = _prune(layout["tiles"])
+            if isinstance(layout.get("tabs"), list):
+                for tab in layout["tabs"]:
+                    if isinstance(tab.get("tiles"), list):
+                        tab["tiles"] = _prune(tab["tiles"])
+        out.append({**item, "edoc": json.dumps(doc)})
+    return out, summary

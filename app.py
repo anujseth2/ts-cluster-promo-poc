@@ -22,7 +22,7 @@ from services.tml_transformer import (
 )
 from services.import_diagnostics import (
     classify_import_errors, drop_columns, silent_drop_findings, column_dependents, column_usage,
-    drop_vizzes,
+    drop_vizzes, table_drop_preview, drop_tables,
 )
 from services.table_matcher import column_signature
 
@@ -282,8 +282,10 @@ if step == 0:
             st.session_state.dep_info        = dep
             st.session_state._promo_id2name  = id2name
             st.session_state._promo_present  = present
+            st.session_state._promo_items    = (dep.get("model_items") or []) + (dep.get("leaf_items") or [])
             st.session_state._resolved_key   = sel_key
             st.session_state.pop("excluded", None)
+            st.session_state.pop("prune_tables", None)
             for _k in ("obj_id_status", "_raw_items", "table_alignment",
                        "prod_by_name", "dev_table_refs", "transformed_items"):
                 st.session_state.pop(_k, None)
@@ -294,30 +296,73 @@ if step == 0:
 
         dep = st.session_state.get("dep_info")
         if dep:
-            id2name  = st.session_state.get("_promo_id2name", {})
-            present  = st.session_state.get("_promo_present", set())
-            excluded = st.session_state.setdefault("excluded", set())
+            id2name     = st.session_state.get("_promo_id2name", {})
+            present     = st.session_state.get("_promo_present", set())
+            promo_items = st.session_state.get("_promo_items", [])
+            excluded    = st.session_state.setdefault("excluded", set())
+            prune       = st.session_state.setdefault("prune_tables", set())
 
             st.divider()
-            st.markdown("**Promotion set** — leaves always promote; untick a model or table to "
-                        "leave it out (safe only when it already exists on the target).")
+            st.markdown("**Promotion set** — leaves always promote. Untick a model or table to "
+                        "leave it out. If it already exists on the target the model just binds to "
+                        "that copy; if it does not, you can prune it out of the model, and you will "
+                        "see exactly what gets dropped first.")
             for i in dep["leaf_ids"]:
                 st.markdown(f"-  `{id2name.get(i, i)}`  ·  leaf  ·  _always promoted_")
 
-            for kind, ids in (("model", dep["model_ids"]), ("table", dep["table_ids"])):
-                for i in ids:
-                    nm     = id2name.get(i, i)
-                    on_tgt = nm in present
-                    mark   = "on target ✓" if on_tgt else "not on target ✗"
-                    inc = st.checkbox(f"`{nm}`  ·  {kind}  ·  {mark}",
-                                      value=(i not in excluded), key=f"inc_{i}")
-                    if inc:
-                        excluded.discard(i)
+            # Models: you can only leave one out if it already exists on the target (there is
+            # nothing sensible to prune when you are promoting the model itself).
+            for i in dep["model_ids"]:
+                nm     = id2name.get(i, i)
+                on_tgt = nm in present
+                mark   = "on target ✓" if on_tgt else "not on target ✗"
+                inc = st.checkbox(f"`{nm}`  ·  model  ·  {mark}",
+                                  value=(i not in excluded), key=f"inc_{i}")
+                if inc:
+                    excluded.discard(i)
+                else:
+                    excluded.add(i)
+                    if not on_tgt:
+                        unsafe.append(nm)
+
+            # Tables: untick = skip (bind to the target copy) when on target; when NOT on target
+            # it must be pruned out of the model — show the blast radius and require an ack.
+            for i in dep["table_ids"]:
+                nm     = id2name.get(i, i)
+                on_tgt = nm in present
+                mark   = "on target ✓" if on_tgt else "not on target ✗"
+                inc = st.checkbox(f"`{nm}`  ·  table  ·  {mark}",
+                                  value=(i not in excluded), key=f"inc_{i}")
+                if inc:
+                    excluded.discard(i)
+                    prune.discard(nm)
+                elif on_tgt:
+                    excluded.add(i)
+                    prune.discard(nm)   # safe skip: the model binds to the target's copy
+                else:
+                    excluded.add(i)
+                    pv = table_drop_preview(promo_items, nm)
+                    with st.expander(f"Dropping `{nm}` from the model will remove:", expanded=True):
+                        shown = False
+                        if pv["columns"]:
+                            st.markdown("**Columns:** " + ", ".join(f"`{c}`" for c in pv["columns"])); shown = True
+                        if pv["joins"]:
+                            st.markdown("**Joins:** " + ", ".join(pv["joins"])); shown = True
+                        if pv["formulas"]:
+                            st.markdown("**Formulas:** " + ", ".join(pv["formulas"])); shown = True
+                        if pv["vizzes"]:
+                            st.markdown("**Visualizations:** " + ", ".join(str(v) for v in pv["vizzes"])); shown = True
+                        if not shown:
+                            st.caption("Nothing else in the promotion depends on it — clean removal.")
+                    if st.checkbox(f"I'm OK dropping `{nm}` and the above from the model",
+                                   key=f"ackprune_{i}"):
+                        prune.add(nm)
                     else:
-                        excluded.add(i)
-                        if not on_tgt:
-                            unsafe.append(nm)
-            st.session_state.excluded = excluded
+                        prune.discard(nm)
+                        unsafe.append(nm)
+
+            st.session_state.excluded     = excluded
+            st.session_state.prune_tables = prune
 
             order = dep["leaf_ids"] + dep["model_ids"] + dep["table_ids"]
             included = [i for i in order if i not in excluded]
@@ -328,13 +373,16 @@ if step == 0:
                 st.warning("Unresolved on the source cluster: "
                            + ", ".join(f"`{n}`" for n in missing))
             if unsafe:
-                st.error("Cannot exclude (not on the target, the import would break the binding): "
+                st.error("Left out but not on the target: "
                          + ", ".join(f"`{n}`" for n in unsafe)
-                         + ". Re-include them, or add them to the target first.")
+                         + ". Re-include each, acknowledge the drop above (tables), or add it to the target first.")
             n_mod = len([i for i in dep["model_ids"] if i not in excluded])
             n_tbl = len([i for i in dep["table_ids"] if i not in excluded])
-            st.success(f"Promoting {len(included)} object(s): {len(dep['leaf_ids'])} leaf, "
-                       f"{n_mod} model(s), {n_tbl} table(s).")
+            msg = (f"Promoting {len(included)} object(s): {len(dep['leaf_ids'])} leaf, "
+                   f"{n_mod} model(s), {n_tbl} table(s).")
+            if prune:
+                msg += f" Pruning {len(prune)} table(s) out of the model."
+            st.success(msg)
         else:
             st.session_state.selected_ids = []
 
@@ -688,6 +736,11 @@ elif step == 2:
                 db_map=teams[team_name].get("db_map", {}),
                 schema_map=teams[team_name].get("schema_map", {}),
             )
+            # Prune any tables the user chose to drop out of the model (not-on-target excludes).
+            prune = st.session_state.get("prune_tables", set())
+            if prune:
+                transformed_items, prune_summary = drop_tables(transformed_items, prune)
+                st.session_state.prune_summary = prune_summary
             st.session_state.transformed_items = transformed_items
             st.session_state.warnings          = warnings
             # Flag if a configured source_connection matches NO connection in the exported
@@ -724,6 +777,11 @@ elif step == 2:
         if warnings:
             st.warning(f"{len(warnings)} transform warning(s): "
                        + "; ".join(f"{w['object']}: {w['issue']}" for w in warnings))
+        ps = st.session_state.get("prune_summary")
+        if ps and ps.get("tables"):
+            st.info(f"Pruned {ps['tables']} table(s) out of the model — dropped "
+                    f"{ps['columns']} column(s), {ps['joins']} join(s), {ps['formulas']} formula(s), "
+                    f"{ps['vizzes']} viz(s).")
         skip_objects  = st.session_state.get("skip_objects", set())
         filtered_items = [
             i for i in transformed_items
