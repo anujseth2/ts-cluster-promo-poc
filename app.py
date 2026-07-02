@@ -986,8 +986,11 @@ elif step == 2:
                     "(along with any visualization that uses it).")
                 drop_set = set()
                 for f in wh_missing:
-                    if st.checkbox(f"Drop  `{f['column']}`   ·   {f['object']}   ·   {f['connection']}",
-                                   value=False, key=f"dropwh_{f['object']}_{f['column']}"):
+                    parts = (f.get("column_fqn") or "").split(".")
+                    tbl   = parts[-2] if len(parts) >= 2 else f.get("object", "")
+                    if st.checkbox(
+                            f"Drop  `{f['column']}`   ·   table `{tbl}`   ·   {f['connection']}",
+                            value=False, key=f"dropwh_{f['object']}_{f['column']}"):
                         drop_set.add(f["column"])
                 if st.button("Apply choices, re-export & re-validate", type="primary"):
                     if drop_set:
@@ -1271,7 +1274,8 @@ elif step == 3:
             if "liveboard" in d:                   return "Liveboard"
             if "answer" in d:                      return "Answer"
             return ""
-        type_by_name = {}
+        type_by_name   = {}
+        detail_by_name = {}   # name -> {obj_id, detail (col/viz count)}
         for it in st.session_state.get("transformed_items", []):
             d = _parse_edoc(it.get("edoc", "{}"))
             ft = _friendly(d)
@@ -1279,6 +1283,13 @@ elif step == 3:
                 node = d.get(k)
                 if isinstance(node, dict) and node.get("name"):
                     type_by_name[node["name"]] = ft
+                    if k in ("table", "model", "worksheet"):
+                        extra = f"{len(node.get('columns', []) or [])} cols"
+                    elif k == "liveboard":
+                        extra = f"{len(node.get('visualizations', []) or [])} viz"
+                    else:
+                        extra = ""
+                    detail_by_name[node["name"]] = {"obj_id": d.get("obj_id", ""), "detail": extra}
                     break
 
         _RAW = {"LOGICAL_TABLE": "Table", "PINBOARD_ANSWER_BOOK": "Liveboard",
@@ -1295,7 +1306,9 @@ elif step == 3:
             return _RAW.get(raw, raw)
 
         df         = pd.DataFrame(results)[["name", "type", "status", "error", "new_id"]]
-        df["type"] = df.apply(_row_type, axis=1)
+        df["type"]   = df.apply(_row_type, axis=1)
+        df["obj_id"] = df["name"].map(lambda n: detail_by_name.get(n, {}).get("obj_id", ""))
+        df["detail"] = df["name"].map(lambda n: detail_by_name.get(n, {}).get("detail", ""))
         success    = df[df["status"] == "OK"]
         failed     = df[df["status"] != "OK"]
 
@@ -1303,16 +1316,28 @@ elif step == 3:
         col1.metric("Succeeded", len(success))
         col2.metric("Failed",    len(failed))
 
+        # What kinds of assets shifted, and what the promotion changed/pruned along the way.
+        if not success.empty:
+            by_type = success["type"].value_counts().to_dict()
+            st.caption("Shifted: " + ", ".join(f"{v} {k.lower()}(s)" for k, v in by_type.items() if k))
+        ps  = st.session_state.get("prune_summary") or {}
+        chg = []
+        if ps.get("tables"):                             chg.append(f"{ps['tables']} table(s) pruned from the model")
+        if st.session_state.get("dropped_cols_count"):   chg.append(f"{st.session_state['dropped_cols_count']} column(s) dropped")
+        if st.session_state.get("dropped_vizs_count"):   chg.append(f"{st.session_state['dropped_vizs_count']} viz(s) dropped")
+        if chg:
+            st.caption("Promotion changes: " + "; ".join(chg) + ".")
+
         st.divider()
 
         if not success.empty:
             st.markdown("**Succeeded**")
-            st.dataframe(success[["name", "type", "new_id"]],
+            st.dataframe(success[["name", "type", "detail", "obj_id", "new_id"]],
                          use_container_width=True, hide_index=True)
 
         if not failed.empty:
             st.markdown("**Failed**")
-            st.dataframe(failed[["name", "type", "status", "error"]],
+            st.dataframe(failed[["name", "type", "detail", "status", "error"]],
                          use_container_width=True, hide_index=True)
 
     _nav(3)
