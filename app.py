@@ -286,8 +286,8 @@ if step == 0:
             st.session_state._resolved_key   = sel_key
             st.session_state.pop("excluded", None)
             st.session_state.pop("prune_tables", None)
-            for _k in ("obj_id_status", "_raw_items", "table_alignment",
-                       "prod_by_name", "dev_table_refs", "transformed_items"):
+            for _k in ("obj_id_status", "_raw_items", "table_alignment", "prod_by_name",
+                       "dev_table_refs", "transformed_items", "match_results", "table_remap"):
                 st.session_state.pop(_k, None)
         elif not picks:
             for _k in ("dep_info", "selected_ids"):
@@ -653,6 +653,17 @@ elif step == 1:
                 st.session_state.src_name_to_guid = src_g
                 st.session_state.tgt_name_to_guid = tgt_g
                 st.session_state.tgt_truncated    = truncated
+                # Per-table physical remap for MATCH pairs: repoint the promoted table to the
+                # TARGET's actual db/schema/db_table so a renamed physical table still binds.
+                tr_map = {}
+                for r in st.session_state.match_results:
+                    if r["decision"] == "MATCH" and r.get("best"):
+                        s, t = r["source"], r["best"]["target"]
+                        nm = (s.get("name") or "").strip().lower()
+                        if nm and t.get("db_table"):
+                            tr_map[nm] = {"db": t.get("db", ""), "schema": t.get("schema", ""),
+                                          "db_table": t.get("db_table", "")}
+                st.session_state.table_remap = tr_map
             st.rerun()
 
         mr = st.session_state.get("match_results")
@@ -690,6 +701,19 @@ elif step == 1:
                            "candidates. Align/rename those manually before promoting.")
             if no_match:
                 st.info(f"{len(no_match)} source table(s) have no target counterpart — created on import.")
+
+            repoint = []
+            for r in mr:
+                if r["decision"] == "MATCH" and r.get("best"):
+                    s, t = r["source"], r["best"]["target"]
+                    if ((s.get("db_table", "") or "").lower() != (t.get("db_table", "") or "").lower()
+                            or (s.get("db", "") or "").lower() != (t.get("db", "") or "").lower()
+                            or (s.get("schema", "") or "").lower() != (t.get("schema", "") or "").lower()):
+                        repoint.append(f"`{s['name']}` → {t.get('db')}.{t.get('schema')}.{t.get('db_table')}")
+            if repoint:
+                st.success("Matched tables whose physical binding differs will be **repointed to the "
+                           "target's table** on promotion (no need to match names by hand):\n"
+                           + "\n".join(f"- {x}" for x in repoint))
 
             needing = [r for r in mr if r["decision"] == "MATCH" and r["best"]
                        and not (r["source"].get("obj_id")
@@ -751,6 +775,7 @@ elif step == 2:
                 target_connection=teams[team_name].get("target_connection", ""),
                 db_map=teams[team_name].get("db_map", {}),
                 schema_map=teams[team_name].get("schema_map", {}),
+                table_remap=st.session_state.get("table_remap", {}),
             )
             # Prune any tables the user chose to drop out of the model (not-on-target excludes).
             prune = st.session_state.get("prune_tables", set())

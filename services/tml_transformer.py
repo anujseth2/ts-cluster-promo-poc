@@ -104,14 +104,21 @@ def transform_doc(
     target_connection: str = "",
     db_map: Optional[dict] = None,
     schema_map: Optional[dict] = None,
+    table_remap: Optional[dict] = None,
 ) -> Tuple[dict, List[str]]:
     """
     Apply the data-layer transforms to a single TML document dict.
     Names are preserved. Returns (transformed_doc, warnings).
+
+    table_remap: {source_table_name_lower -> {"db","schema","db_table"}} captured from the
+    table matcher. When a physical table is a matched pair, its binding is repointed to the
+    TARGET table's actual db/schema/db_table (so a renamed physical table still binds). This
+    wins over the static db_map/schema_map; unmatched tables fall back to those.
     """
     warnings = []
     db_map    = db_map or {}
     schema_map = schema_map or {}
+    table_remap = table_remap or {}
 
     typ = _tml_type(doc)
     if not typ:
@@ -120,10 +127,18 @@ def transform_doc(
     obj = doc[typ]
 
     if typ == "table":
-        # Physical table: this is where db / schema / connection actually live.
+        # Physical table: this is where db / schema / db_table / connection actually live.
         obj.pop("fqn", None)
         _remap_connection(obj, source_connection, target_connection)
-        _remap_location(obj, db_map, schema_map)
+        tr = table_remap.get((obj.get("name", "") or "").strip().lower())
+        if tr:
+            # Matched pair: repoint to the target's physical table (disclosed on the matcher
+            # screen, so not re-surfaced as a transform warning here).
+            for k in ("db", "schema", "db_table"):
+                if tr.get(k):
+                    obj[k] = tr[k]
+        else:
+            _remap_location(obj, db_map, schema_map)
 
     elif typ in ("model", "worksheet"):
         # Model references tables by name + fqn; strip fqn so import resolves by obj_id.
@@ -146,6 +161,7 @@ def transform_items(
     target_connection: str = "",
     db_map: Optional[dict] = None,
     schema_map: Optional[dict] = None,
+    table_remap: Optional[dict] = None,
 ) -> Tuple[List[dict], List[dict]]:
     """
     Transform a list of raw API items (each with 'edoc' string + 'info' dict).
@@ -160,7 +176,8 @@ def transform_items(
         edoc = item.get("edoc", "{}")
         doc  = json.loads(edoc) if edoc.strip().startswith("{") else yaml.safe_load(edoc)
 
-        doc, warns = transform_doc(doc, source_connection, target_connection, db_map, schema_map)
+        doc, warns = transform_doc(doc, source_connection, target_connection,
+                                   db_map, schema_map, table_remap)
         for w in warns:
             all_warnings.append({"object": name, "issue": w})
 
