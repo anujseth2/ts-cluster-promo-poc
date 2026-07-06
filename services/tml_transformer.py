@@ -269,3 +269,70 @@ def files_to_tml_strings(files: Dict[str, str]) -> List[str]:
         else:
             others.append(content)
     return tables + models + feedback + others
+
+
+# ── Feedback (Spotter reference questions + business terms) granular selection ────
+
+def _feedback_phrase(entry: dict) -> str:
+    """Human-readable label for one feedback entry (robust to field naming)."""
+    return (entry.get("feedback_phrase")
+            or entry.get("parent_question")
+            or entry.get("search_tokens")
+            or "").strip()
+
+
+def feedback_key(model: str, type_: str, phrase: str) -> Tuple[str, str, str]:
+    """Stable identity for one feedback entry across re-exports."""
+    return (model, type_, phrase)
+
+
+def parse_feedback_items(items: List[dict]) -> List[dict]:
+    """
+    Flatten raw FEEDBACK API items into selectable picker entries. One dict per
+    nls_feedback.feedback[] entry: {model, type, phrase, tokens}. Non-feedback items
+    are ignored. The stable selection key is feedback_key(model, type, phrase).
+    """
+    out = []
+    for item in items:
+        edoc = item.get("edoc", "") or ""
+        if not edoc.strip():
+            continue
+        doc = json.loads(edoc) if edoc.strip().startswith("{") else yaml.safe_load(edoc)
+        if not isinstance(doc, dict) or "nls_feedback" not in doc:
+            continue
+        model = item.get("info", {}).get("name", "unknown")
+        for e in (doc.get("nls_feedback", {}) or {}).get("feedback", []) or []:
+            out.append({
+                "model":  model,
+                "type":   e.get("type", ""),
+                "phrase": _feedback_phrase(e),
+                "tokens": (e.get("search_tokens") or "").strip(),
+            })
+    return out
+
+
+def filter_feedback(items: List[dict], selected_keys) -> List[dict]:
+    """
+    Keep only feedback entries whose feedback_key is in selected_keys. Feedback docs
+    left with no selected entries are dropped entirely; non-feedback items pass through
+    untouched. selected_keys=None -> no filtering (promote all feedback, back-compat).
+    """
+    if selected_keys is None:
+        return items
+    result = []
+    for item in items:
+        edoc = item.get("edoc", "") or ""
+        doc = (json.loads(edoc) if edoc.strip().startswith("{")
+               else yaml.safe_load(edoc)) if edoc.strip() else {}
+        if not isinstance(doc, dict) or "nls_feedback" not in doc:
+            result.append(item)
+            continue
+        model   = item.get("info", {}).get("name", "unknown")
+        entries = (doc.get("nls_feedback", {}) or {}).get("feedback", []) or []
+        kept = [e for e in entries
+                if feedback_key(model, e.get("type", ""), _feedback_phrase(e)) in selected_keys]
+        if not kept:
+            continue
+        doc["nls_feedback"]["feedback"] = kept
+        result.append({**item, "edoc": json.dumps(doc)})
+    return result

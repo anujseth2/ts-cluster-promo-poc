@@ -19,6 +19,9 @@ from services.tml_transformer import (
     extract_model_refs,
     items_to_files,
     files_to_tml_strings,
+    parse_feedback_items,
+    feedback_key,
+    filter_feedback,
 )
 from services.import_diagnostics import (
     classify_import_errors, drop_columns, silent_drop_findings, column_dependents, column_usage,
@@ -309,11 +312,65 @@ if step == 0:
                         "see exactly what gets dropped first.")
 
             if dep["model_ids"]:
-                st.checkbox(
+                inc_fb = st.checkbox(
                     "Include Spotter feedback (reference questions + business terms) for the model(s)",
-                    value=False, key="include_feedback",
+                    value=st.session_state.get("include_feedback", False), key="include_feedback",
                     help="Also promote each model's Spotter feedback — its reference questions and "
                          "business terms — exported as FEEDBACK TML and imported after the model.")
+                if inc_fb:
+                    # Load the models' feedback once per model set so the operator can pick
+                    # individual reference questions / business terms to promote.
+                    fb_set_key = tuple(dep["model_ids"])
+                    if st.session_state.get("_fb_loaded_key") != fb_set_key:
+                        # New model set: drop stale per-item checkbox widget state so the
+                        # picker rebuilds against the current feedback list.
+                        for _wk in [k for k in list(st.session_state.keys())
+                                    if k.startswith("fbchk_")]:
+                            del st.session_state[_wk]
+                        with st.spinner("Loading Spotter feedback…"):
+                            st.session_state._fb_items = \
+                                source_client().export_feedback(list(dep["model_ids"]))
+                        st.session_state._fb_loaded_key = fb_set_key
+                        st.session_state.feedback_selected = {
+                            feedback_key(e["model"], e["type"], e["phrase"])
+                            for e in parse_feedback_items(st.session_state._fb_items)}
+
+                    fb_entries = parse_feedback_items(st.session_state.get("_fb_items", []))
+                    if not fb_entries:
+                        st.caption("No Spotter feedback found on the selected model(s).")
+                        st.session_state.feedback_selected = set()
+                    else:
+                        prev_sel = st.session_state.get("feedback_selected", set())
+                        groups = [
+                            ("Reference questions",
+                             [e for e in fb_entries if e["type"] == "REFERENCE_QUESTION"]),
+                            ("Business terms",
+                             [e for e in fb_entries if e["type"] == "BUSINESS_TERM"]),
+                            ("Other",
+                             [e for e in fb_entries if e["type"]
+                              not in ("REFERENCE_QUESTION", "BUSINESS_TERM")]),
+                        ]
+                        multi_model = len({e["model"] for e in fb_entries}) > 1
+                        sel = set()
+                        with st.expander(
+                                f"Choose feedback to promote "
+                                f"({len(prev_sel)} of {len(fb_entries)} selected)", expanded=True):
+                            for gi, (glabel, grp) in enumerate(groups):
+                                if not grp:
+                                    continue
+                                st.markdown(f"**{glabel}**")
+                                for ei, e in enumerate(grp):
+                                    k = feedback_key(e["model"], e["type"], e["phrase"])
+                                    label = e["phrase"] or "(unnamed)"
+                                    if multi_model:
+                                        label = f"{label}  ·  _{e['model']}_"
+                                    checked = st.checkbox(
+                                        label, value=(k in prev_sel), key=f"fbchk_{gi}_{ei}",
+                                        help=(f"maps to columns: {e['tokens']}"
+                                              if e["tokens"] else None))
+                                    if checked:
+                                        sel.add(k)
+                        st.session_state.feedback_selected = sel
 
             OPT_CREATE   = "Promote tables (create / update on target)"
             OPT_EXISTING = "Use existing target tables only (don't create)"
@@ -786,7 +843,12 @@ elif step == 2:
                         if d.get("guid"):
                             model_guids.append(d["guid"])
                 if model_guids:
-                    items = items + source_client().export_feedback(model_guids)
+                    fb_items = source_client().export_feedback(model_guids)
+                    # Keep only the reference questions / business terms the operator ticked
+                    # on the Select page (None -> promote all, back-compat).
+                    fb_items = filter_feedback(
+                        fb_items, st.session_state.get("feedback_selected"))
+                    items = items + fb_items
             transformed_items, warnings = transform_items(
                 items,
                 source_connection=teams[team_name].get("source_connection", ""),
