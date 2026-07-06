@@ -68,6 +68,25 @@ def _parse_edoc(edoc: str) -> dict:
     return json.loads(edoc) if edoc.strip().startswith("{") else yaml.safe_load(edoc)
 
 
+def _target_name_index(client, types) -> dict:
+    """{object_name: [guid, ...]} for the given metadata types on the target, captured
+    BEFORE import so the results page can distinguish Created vs Updated-in-place vs
+    DUPLICATE (a new guid appearing for a name that already existed)."""
+    idx = {}
+    for t in types:
+        try:
+            resp = client._post("/api/rest/2.0/metadata/search",
+                                 {"metadata": [{"type": t}], "record_size": 5000})
+        except Exception:
+            continue
+        rows = resp if isinstance(resp, list) else resp.get("metadata", [])
+        for o in rows:
+            nm = o.get("metadata_name")
+            if nm:
+                idx.setdefault(nm, []).append(o.get("metadata_id"))
+    return idx
+
+
 # ── Clients (cached per session) ──────────────────────────────────────────────
 
 def _make_client(prefix: str) -> TSClient:
@@ -205,7 +224,9 @@ if step == 0:
                 team_tags, types=["LIVEBOARD", "ANSWER", "LOGICAL_TABLE"])
             for key in ("picks", "selected_ids", "dep_info", "_resolved_key", "excluded",
                         "_promo_id2name", "_promo_present", "obj_id_status",
-                        "table_alignment", "transformed_items", "import_results"):
+                        "table_alignment", "transformed_items", "import_results",
+                        "pre_import_index", "dropped_col_names", "dropped_cols_count",
+                        "dropped_vizs_count", "prune_summary"):
                 st.session_state.pop(key, None)
 
     assets = st.session_state.get("assets", [])
@@ -1097,6 +1118,7 @@ elif step == 2:
                         st.session_state.transformed_items = fixed
                         st.session_state.dropped_cols_count = st.session_state.get("dropped_cols_count", 0) + dc
                         st.session_state.dropped_vizs_count = st.session_state.get("dropped_vizs_count", 0) + dv
+                        st.session_state.setdefault("dropped_col_names", set()).update(drop_set)
                     filtered_fixed = [i for i in st.session_state.transformed_items
                                       if i.get("info", {}).get("name") not in skip_objects]
                     with st.spinner("Re-committing and re-validating…"):
@@ -1194,6 +1216,7 @@ elif step == 2:
                         st.session_state.transformed_items  = fixed
                         st.session_state.dropped_cols_count = st.session_state.get("dropped_cols_count", 0) + dc
                         st.session_state.dropped_vizs_count = st.session_state.get("dropped_vizs_count", 0) + dv
+                        st.session_state.setdefault("dropped_col_names", set()).update(tm_drop)
                     filtered_fixed = [i for i in st.session_state.transformed_items
                                       if i.get("info", {}).get("name") not in skip_objects]
                     with st.spinner("Re-committing and re-validating…"):
@@ -1323,6 +1346,19 @@ elif step == 2:
 
                     # Import tables + models first, THEN validate the leaves against the live model so
                     # viz/formula errors are caught here instead of surfacing silently at leaf import.
+                    # Snapshot the target's object names BEFORE any import so the results page can
+                    # tell Created vs Updated-in-place vs DUPLICATE for each promoted object.
+                    promo_types = set()
+                    for _it in filtered_items:
+                        _d = _parse_edoc(_it.get("edoc", "{}"))
+                        if "table" in _d or "model" in _d or "worksheet" in _d:
+                            promo_types.add("LOGICAL_TABLE")
+                        if "liveboard" in _d:
+                            promo_types.add("LIVEBOARD")
+                        if "answer" in _d:
+                            promo_types.add("ANSWER")
+                    st.session_state.pre_import_index = _target_name_index(target_client(), promo_types)
+
                     with st.spinner("Importing tables & models, then validating liveboards/answers…"):
                         # Import ONLY this run's files. The team folder accumulates TML across
                         # promotions; without this filter the import would re-import unrelated
@@ -1395,6 +1431,17 @@ elif step == 3:
                     detail_by_name[node["name"]] = {"obj_id": d.get("obj_id", ""), "detail": extra}
                     break
 
+        # Feedback that actually landed: reference-question / business-term counts per model.
+        fb_counts = {}
+        for it in st.session_state.get("transformed_items", []):
+            d = _parse_edoc(it.get("edoc", "{}"))
+            if "nls_feedback" in d:
+                fb = (d.get("nls_feedback", {}) or {}).get("feedback", []) or []
+                fb_counts[it.get("info", {}).get("name", "")] = {
+                    "rq": sum(1 for e in fb if e.get("type") == "REFERENCE_QUESTION"),
+                    "bt": sum(1 for e in fb if e.get("type") == "BUSINESS_TERM"),
+                }
+
         _RAW = {"LOGICAL_TABLE": "Table", "PINBOARD_ANSWER_BOOK": "Liveboard",
                 "QUESTION_ANSWER_BOOK": "Answer", "ANSWER": "Answer", "LIVEBOARD": "Liveboard",
                 "FEEDBACK": "Feedback"}
@@ -1411,34 +1458,89 @@ elif step == 3:
                 return "Liveboard"
             return _RAW.get(raw, raw)
 
+        pre_index = st.session_state.get("pre_import_index", {})
+
+        def _change(row):
+            # Created vs updated-in-place vs DUPLICATE, from the pre-import target snapshot.
+            if row["status"] != "OK":
+                return ""
+            if row["type"] == "Feedback":
+                return "synced"
+            if not pre_index:
+                return ""                      # no snapshot -> can't tell (resumed session)
+            pre = pre_index.get(row["name"])
+            if not pre:
+                return "created"
+            return "updated in place" if row.get("new_id") in pre else "⚠ DUPLICATE"
+
+        def _detail(row):
+            if row["type"] == "Feedback":
+                c = fb_counts.get(row["name"])
+                if c:
+                    bits = []
+                    if c["rq"]: bits.append(f"{c['rq']} ref Q")
+                    if c["bt"]: bits.append(f"{c['bt']} biz term(s)")
+                    return " · ".join(bits) or "feedback"
+                return "feedback"
+            return detail_by_name.get(row["name"], {}).get("detail", "")
+
         df         = pd.DataFrame(results)[["name", "type", "status", "error", "new_id"]]
         df["type"]   = df.apply(_row_type, axis=1)
+        df["change"] = df.apply(_change, axis=1)
+        df["detail"] = df.apply(_detail, axis=1)
         df["obj_id"] = df["name"].map(lambda n: detail_by_name.get(n, {}).get("obj_id", ""))
-        df["detail"] = df["name"].map(lambda n: detail_by_name.get(n, {}).get("detail", ""))
         success    = df[df["status"] == "OK"]
         failed     = df[df["status"] != "OK"]
 
-        col1, col2 = st.columns(2)
-        col1.metric("Succeeded", len(success))
-        col2.metric("Failed",    len(failed))
+        dup_ct = int((success["change"] == "⚠ DUPLICATE").sum()) if not success.empty else 0
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Succeeded",  len(success))
+        col2.metric("Failed",     len(failed))
+        col3.metric("Duplicates", dup_ct)
 
-        # What kinds of assets shifted, and what the promotion changed/pruned along the way.
+        # Loud banner for duplicates — in-place update is the whole point of obj_id.
+        if dup_ct:
+            dup_names = list(success[success["change"] == "⚠ DUPLICATE"]["name"])
+            st.error(
+                "**Duplicate(s) created on the target** — these imported as NEW objects while a "
+                "same-named object already existed, so the obj_id did not match: "
+                + ", ".join(f"`{n}`" for n in dup_names)
+                + ".  Fix in Step 2 → **Fix target obj_ids** (align each to the source obj_id), delete "
+                "the stale copy on the target, then re-promote — it will then update in place.")
+        elif not pre_index and not success.empty:
+            st.caption("Created / updated-in-place status is unavailable for this run "
+                       "(no pre-import snapshot — e.g. a resumed session).")
+
+        # What kinds of assets shifted.
         if not success.empty:
             by_type = success["type"].value_counts().to_dict()
             st.caption("Shifted: " + ", ".join(f"{v} {k.lower()}(s)" for k, v in by_type.items() if k))
-        ps  = st.session_state.get("prune_summary") or {}
-        chg = []
-        if ps.get("tables"):                             chg.append(f"{ps['tables']} table(s) pruned from the model")
-        if st.session_state.get("dropped_cols_count"):   chg.append(f"{st.session_state['dropped_cols_count']} column(s) dropped")
-        if st.session_state.get("dropped_vizs_count"):   chg.append(f"{st.session_state['dropped_vizs_count']} viz(s) dropped")
-        if chg:
-            st.caption("Promotion changes: " + "; ".join(chg) + ".")
+
+        # What the promotion dropped / pruned, by name.
+        ps           = st.session_state.get("prune_summary") or {}
+        prune_names  = sorted(st.session_state.get("prune_tables", set()))
+        dropped_cols = sorted(st.session_state.get("dropped_col_names", set()))
+        dropped_vizs = st.session_state.get("dropped_vizs_count", 0)
+        if prune_names or dropped_cols or dropped_vizs:
+            with st.expander("What was dropped / pruned from this promotion",
+                             expanded=bool(prune_names or dropped_cols)):
+                if prune_names:
+                    st.markdown("**Tables pruned from the model:** "
+                                + ", ".join(f"`{n}`" for n in prune_names))
+                    casc = ", ".join(f"{ps.get(k, 0)} {k}"
+                                     for k in ("columns", "joins", "formulas", "vizzes") if ps.get(k))
+                    if casc:
+                        st.caption("cascade removed: " + casc)
+                if dropped_cols:
+                    st.markdown("**Columns dropped:** " + ", ".join(f"`{c}`" for c in dropped_cols))
+                if dropped_vizs:
+                    st.markdown(f"**Visualizations dropped:** {dropped_vizs}")
 
         st.divider()
 
         if not success.empty:
             st.markdown("**Succeeded**")
-            st.dataframe(success[["name", "type", "detail", "obj_id", "new_id"]],
+            st.dataframe(success[["name", "type", "change", "detail", "obj_id", "new_id"]],
                          use_container_width=True, hide_index=True)
 
         if not failed.empty:
