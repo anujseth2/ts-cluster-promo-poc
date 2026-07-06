@@ -156,8 +156,29 @@ def transform_doc(
                 _remap_connection(t, source_connection, target_connection)
                 _remap_location(t, db_map, schema_map)
 
-    # liveboard / answer: names are preserved cross-cluster, nothing to rewrite.
+    elif typ == "answer":
+        # An answer references its MODEL via tables[] carrying a source-cluster fqn. That fqn
+        # is invalid on the target, so strip it to force obj_id resolution (same rule as the
+        # model->table refs above). Names/columns are preserved cross-cluster.
+        _strip_model_ref_fqns(obj)
+
+    elif typ == "liveboard":
+        # A liveboard embeds a full answer per visualization; strip the model-ref fqn in each.
+        for viz in obj.get("visualizations", []):
+            ans = viz.get("answer")
+            if isinstance(ans, dict):
+                _strip_model_ref_fqns(ans)
+
     return doc, warnings
+
+
+def _strip_model_ref_fqns(answer: dict):
+    """Strip the source-cluster fqn from an answer's model references (answer.tables[]) so the
+    import resolves the model by obj_id on the target. Mirrors the model->table fqn strip; the
+    leaf->model link carries obj_id, and a source fqn does not exist on the target cluster."""
+    for t in answer.get("tables", []) or []:
+        if isinstance(t, dict):
+            t.pop("fqn", None)
 
 
 # ── Batch transform ─────────────────────────────────────────────────────────────

@@ -35,8 +35,8 @@ Legend: ✓ handled · ✗ gap · ⚠ handled but unverified live · — n/a
 |------------|---------|----------------------|---------------------|-------------------|-----------------------------------|---------------|--------------|--------------------------|
 | Table      | ✓ dep   | ✓                    | ✓ create/update/dup | ✓ export_tml      | conn/db/schema remap · matcher repoint | `tables/`     | 1st          | ✓ created/updated/DUP    |
 | Model      | ✓       | ✓                    | ✓ create/update/dup | ✓ export_tml      | strip fqn · conn/db/schema remap  | `models/`     | 2nd          | ✓ created/updated/DUP    |
-| Liveboard  | ✓ leaf  | ✓                    | ⚠ create/update/dup | ✓ export_tml      | none (name preserved)             | `liveboards/` | last         | ✓ created/updated/DUP    |
-| Answer     | ✓ leaf  | ✓                    | ⚠ create/update/dup | ✓ export_tml      | none (name preserved)             | `answers/`    | last         | ✓ created/updated/DUP    |
+| Liveboard  | ✓ leaf  | ✓                    | ⚠ create/update/dup | ✓ export_tml      | strip model-ref fqn (obj_id resolve) | `liveboards/` | last      | ✓ created/updated/DUP    |
+| Answer     | ✓ leaf  | ✓                    | ⚠ create/update/dup | ✓ export_tml      | strip model-ref fqn (obj_id resolve) | `answers/`    | last      | ✓ created/updated/DUP    |
 | Feedback   | via model toggle (granular pick) | — auto, preserved | ✗ **not searchable → target obj_id can't be aligned** | ✓ export_feedback(model guid) | keep obj_id · strip guid · no data remap | `feedback/`   | after model  | "synced" only (**no dup detection**) |
 | Connection | — (referenced, not promoted) | — | — | — | remap by name; warn if target lacks it | — | — | — |
 
