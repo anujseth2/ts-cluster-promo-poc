@@ -332,6 +332,23 @@ class TSClient:
         }
         return self._post("/api/rest/2.0/metadata/tml/export", payload)
 
+    def export_feedback(self, model_ids: List[str]) -> List[Dict]:
+        """
+        Export the FEEDBACK TML (Spotter reference questions + business terms) for each model.
+        FEEDBACK is not independently searchable; it is exported by the model's GUID via
+        type=FEEDBACK. Returns the raw item list (feedback objects); empty for models that
+        have no feedback.
+        """
+        if not model_ids:
+            return []
+        payload = {
+            "metadata": [{"type": "FEEDBACK", "identifier": mid} for mid in model_ids],
+            "export_options": {"include_obj_id": True},
+        }
+        raw = self._post("/api/rest/2.0/metadata/tml/export", payload)
+        items = raw if isinstance(raw, list) else raw.get("object", [])
+        return [it for it in items if it.get("edoc")]
+
     # ── TML import ────────────────────────────────────────────────────────────
 
     def import_tml(self, tml_strings: List[str],

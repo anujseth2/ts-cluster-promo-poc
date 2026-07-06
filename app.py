@@ -308,6 +308,13 @@ if step == 0:
                         "that copy; if it does not, you can prune it out of the model, and you will "
                         "see exactly what gets dropped first.")
 
+            if dep["model_ids"]:
+                st.checkbox(
+                    "Include Spotter feedback (reference questions + business terms) for the model(s)",
+                    value=False, key="include_feedback",
+                    help="Also promote each model's Spotter feedback — its reference questions and "
+                         "business terms — exported as FEEDBACK TML and imported after the model.")
+
             OPT_CREATE   = "Promote tables (create / update on target)"
             OPT_EXISTING = "Use existing target tables only (don't create)"
             tmode = st.radio(
@@ -769,6 +776,17 @@ elif step == 2:
         with st.spinner("Exporting TML (post-alignment) and applying the data-layer transform…"):
             raw   = source_client().export_tml(selected_ids)
             items = raw if isinstance(raw, list) else raw.get("object", [])
+            # Opt-in: also pull each model's Spotter feedback (reference questions + business
+            # terms) and promote it alongside the model.
+            if st.session_state.get("include_feedback"):
+                model_guids = []
+                for it in items:
+                    d = _parse_edoc(it.get("edoc", "{}"))
+                    if "model" in d or "worksheet" in d:
+                        if d.get("guid"):
+                            model_guids.append(d["guid"])
+                if model_guids:
+                    items = items + source_client().export_feedback(model_guids)
             transformed_items, warnings = transform_items(
                 items,
                 source_connection=teams[team_name].get("source_connection", ""),
@@ -1231,9 +1249,9 @@ elif step == 2:
                         cur_paths = set(items_to_files(filtered_items).keys())
                         tml_files = {p: c for p, c in gc.get_tml_files(team_name).items() if p in cur_paths}
                         core   = {p: c for p, c in tml_files.items()
-                                  if p.startswith("tables/") or p.startswith("models/")}
+                                  if p.startswith(("tables/", "models/", "feedback/"))}
                         leaves = {p: c for p, c in tml_files.items()
-                                  if not (p.startswith("tables/") or p.startswith("models/"))}
+                                  if not p.startswith(("tables/", "models/", "feedback/"))}
                         core_results = target_client().import_tml(files_to_tml_strings(core)) if core else []
                         st.session_state.import_core_results = core_results
                         st.session_state.import_leaf_files   = leaves
@@ -1297,16 +1315,19 @@ elif step == 3:
                     break
 
         _RAW = {"LOGICAL_TABLE": "Table", "PINBOARD_ANSWER_BOOK": "Liveboard",
-                "QUESTION_ANSWER_BOOK": "Answer", "ANSWER": "Answer", "LIVEBOARD": "Liveboard"}
+                "QUESTION_ANSWER_BOOK": "Answer", "ANSWER": "Answer", "LIVEBOARD": "Liveboard",
+                "FEEDBACK": "Feedback"}
 
         def _row_type(row):
+            raw = row.get("type", "") or ""
+            if raw == "FEEDBACK":     # feedback shares its model's name, so key off the raw type
+                return "Feedback"
             nm = row.get("name", "")
             if nm in type_by_name:
                 return type_by_name[nm]
             err = str(row.get("error", "") or "")
             if "Visualization" in err or "pinboard" in err.lower():
                 return "Liveboard"
-            raw = row.get("type", "") or ""
             return _RAW.get(raw, raw)
 
         df         = pd.DataFrame(results)[["name", "type", "status", "error", "new_id"]]

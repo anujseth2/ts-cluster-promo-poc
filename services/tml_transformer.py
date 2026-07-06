@@ -120,6 +120,13 @@ def transform_doc(
     schema_map = schema_map or {}
     table_remap = table_remap or {}
 
+    # Feedback (Spotter reference questions + business terms) has no data layer. Keep obj_id
+    # for cross-cluster identity, drop the cluster-local guid, and remap nothing — its column
+    # references (search_tokens like [Job Id]) are by name, which is preserved across clusters.
+    if "nls_feedback" in doc:
+        doc.pop("guid", None)
+        return doc, warnings
+
     typ = _tml_type(doc)
     if not typ:
         return doc, ["Unknown TML type — skipped"]
@@ -229,6 +236,11 @@ def items_to_files(items: List[dict]) -> Dict[str, str]:
         name     = info.get("name", "unknown")
         edoc     = item.get("edoc", "{}")
         doc      = json.loads(edoc) if edoc.strip().startswith("{") else yaml.safe_load(edoc)
+        if "nls_feedback" in doc:
+            # Feedback carries no name in the doc; use the associated model's name (info.name).
+            safe_fb = name.replace(" ", "_").replace("/", "-")
+            files[f"feedback/{safe_fb}.feedback.tml"] = json.dumps(doc, indent=2)
+            continue
         typ      = _tml_type(doc)
         if not typ:
             continue
@@ -243,14 +255,17 @@ def items_to_files(items: List[dict]) -> Dict[str, str]:
 def files_to_tml_strings(files: Dict[str, str]) -> List[str]:
     """
     Convert {path: content} from git back to a list of TML strings for import,
-    ordered so dependencies import first: tables -> models -> liveboards/answers.
+    ordered so dependencies import first: tables -> models -> feedback -> liveboards/answers.
+    Feedback imports after its model (it references the model's columns by name).
     """
-    tables, models, others = [], [], []
+    tables, models, feedback, others = [], [], [], []
     for path, content in files.items():
         if path.startswith("tables/"):
             tables.append(content)
         elif path.startswith("models/"):
             models.append(content)
+        elif path.startswith("feedback/"):
+            feedback.append(content)
         else:
             others.append(content)
-    return tables + models + others
+    return tables + models + feedback + others
