@@ -311,8 +311,8 @@ if step == 0:
             st.session_state.pop("excluded", None)
             st.session_state.pop("prune_tables", None)
             for _k in ("obj_id_status", "_raw_items", "table_alignment", "prod_by_name",
-                       "dev_table_refs", "dev_model_refs", "transformed_items",
-                       "match_results", "table_remap"):
+                       "prod_leaf", "dev_table_refs", "dev_model_refs", "dev_leaf_refs",
+                       "transformed_items", "match_results", "table_remap"):
                 st.session_state.pop(_k, None)
         elif not picks:
             for _k in ("dep_info", "selected_ids"):
@@ -533,14 +533,15 @@ elif step == 1:
                         "ok":     bool(oid),
                     })
 
-                # Part B: table AND model obj_id — source value vs target. A logical object
-                # (physical table OR model/worksheet) that already exists on the target under a
+                # Part B: obj_id of every logical object (table, model, liveboard, answer) —
+                # source value vs target. ANY object that already exists on the target under a
                 # DIFFERENT obj_id is DUPLICATED on import (match order obj_id->guid->create), so
                 # it must be aligned first. Read obj_id from the object's OWN TML (a model's
-                # table-reference does not carry one). Models with an auto obj_id (Name-<guid>)
-                # never match cross-cluster, so this catches auto-vs-auto too, not just missing.
+                # table-reference does not carry one). Auto obj_ids (Name-<guid>) never match
+                # cross-cluster, so this catches auto-vs-auto too, not just missing.
                 dev_table_refs = {}   # {table_name: obj_id}
                 dev_model_refs = {}   # {model_name: obj_id}
+                dev_leaf_refs  = {}   # {leaf_name: (kind, obj_id)}  kind in liveboard|answer
                 for item in items:
                     doc = _parse_edoc(item.get("edoc", "{}"))
                     if "table" in doc:
@@ -552,14 +553,27 @@ elif step == 1:
                             mname = doc[mk].get("name")
                             if mname:
                                 dev_model_refs[mname] = doc.get("obj_id", "")
+                    for lk in ("liveboard", "answer"):
+                        if lk in doc:
+                            lname = doc[lk].get("name")
+                            if lname:
+                                dev_leaf_refs[lname] = (lk, doc.get("obj_id", ""))
 
-                # metadata/search on LOGICAL_TABLE returns physical tables AND models/worksheets.
-                prod_resp  = target_client()._post(
-                    "/api/rest/2.0/metadata/search",
-                    {"metadata": [{"type": "LOGICAL_TABLE"}], "record_size": 500},
-                )
-                prod_items = prod_resp if isinstance(prod_resp, list) else prod_resp.get("metadata", [])
-                prod_by_name = {o.get("metadata_name"): o for o in prod_items}
+                def _search_target(mtype):
+                    r = target_client()._post(
+                        "/api/rest/2.0/metadata/search",
+                        {"metadata": [{"type": mtype}], "record_size": 5000})
+                    return r if isinstance(r, list) else r.get("metadata", [])
+
+                # metadata/search on LOGICAL_TABLE returns physical tables AND models/worksheets;
+                # leaves live under LIVEBOARD / ANSWER. Keep leaf snapshot separate so a table and
+                # a liveboard that happen to share a name don't collide.
+                prod_by_name = {o.get("metadata_name"): o for o in _search_target("LOGICAL_TABLE")}
+                prod_leaf    = {}
+                if any(k == "liveboard" for k, _ in dev_leaf_refs.values()):
+                    prod_leaf.update({o.get("metadata_name"): o for o in _search_target("LIVEBOARD")})
+                if any(k == "answer" for k, _ in dev_leaf_refs.values()):
+                    prod_leaf.update({o.get("metadata_name"): o for o in _search_target("ANSWER")})
 
                 # state: aligned | mismatch (exists on target with a different obj_id ->
                 # import would duplicate) | create (absent on target -> created on import).
@@ -570,29 +584,35 @@ elif step == 1:
                         return "aligned"
                     return "mismatch"
 
+                def _row(oname, kind, dev_oid, prod_obj):
+                    prod_oid = prod_obj.get("metadata_obj_id", "") if prod_obj else None
+                    return {
+                        "object":        oname,
+                        "kind":          kind,
+                        "source_obj_id": dev_oid or "NOT SET",
+                        "target_obj_id": (prod_oid or "NOT SET") if prod_obj else "WILL CREATE",
+                        "state":         _align_state(dev_oid, prod_obj),
+                    }
+
                 table_rows = []
                 for kind, refs in (("table", dev_table_refs), ("model", dev_model_refs)):
                     for oname, dev_oid in refs.items():
-                        prod_obj = prod_by_name.get(oname)
-                        prod_oid = prod_obj.get("metadata_obj_id", "") if prod_obj else None
-                        table_rows.append({
-                            "object":        oname,
-                            "kind":          kind,
-                            "source_obj_id": dev_oid or "NOT SET",
-                            "target_obj_id": (prod_oid or "NOT SET") if prod_obj else "WILL CREATE",
-                            "state":         _align_state(dev_oid, prod_obj),
-                        })
+                        table_rows.append(_row(oname, kind, dev_oid, prod_by_name.get(oname)))
+                for lname, (lk, dev_oid) in dev_leaf_refs.items():
+                    table_rows.append(_row(lname, lk, dev_oid, prod_leaf.get(lname)))
 
                 st.session_state.obj_id_status   = status_rows
                 st.session_state._raw_items      = items
                 st.session_state.table_alignment = table_rows
                 st.session_state.prod_by_name    = prod_by_name
+                st.session_state.prod_leaf       = prod_leaf
                 st.session_state.dev_table_refs  = dev_table_refs
                 st.session_state.dev_model_refs  = dev_model_refs
+                st.session_state.dev_leaf_refs   = dev_leaf_refs
 
         if st.button("Re-check obj_id status"):
-            for _k in ("obj_id_status", "_raw_items", "table_alignment",
-                       "prod_by_name", "dev_table_refs", "dev_model_refs"):
+            for _k in ("obj_id_status", "_raw_items", "table_alignment", "prod_by_name",
+                       "prod_leaf", "dev_table_refs", "dev_model_refs", "dev_leaf_refs"):
                 st.session_state.pop(_k, None)
             st.rerun()
 
@@ -639,8 +659,8 @@ elif step == 1:
                     with st.spinner(f"Setting obj_id on {len(mappings)} source object(s)…"):
                         source_client().update_obj_ids(mappings)
                     st.success(f"obj_id set on {len(mappings)} source object(s).")
-                    for _k in ("obj_id_status", "_raw_items", "table_alignment",
-                               "prod_by_name", "dev_table_refs", "dev_model_refs"):
+                    for _k in ("obj_id_status", "_raw_items", "table_alignment", "prod_by_name",
+                               "prod_leaf", "dev_table_refs", "dev_model_refs", "dev_leaf_refs"):
                         st.session_state.pop(_k, None)
                     st.rerun()
                 except Exception as e:
@@ -649,7 +669,7 @@ elif step == 1:
     table_rows = st.session_state.get("table_alignment", [])
     if table_rows:
         st.divider()
-        st.markdown("#### Table & model obj_id (source → target)")
+        st.markdown("#### obj_id alignment — tables, models, liveboards & answers (source → target)")
         misaligned  = [r for r in table_rows if r["state"] == "mismatch"]
         will_create = [r for r in table_rows if r["state"] == "create"]
         if misaligned:
@@ -659,7 +679,7 @@ elif step == 1:
             st.info(f"{len(will_create)} object(s) are absent on the target and will be created on "
                     "import with the source `obj_id` (ensure the source `obj_id` is set above).")
         else:
-            st.success("All target tables/models exist and are aligned on `obj_id`.")
+            st.success("All target objects exist and are aligned on `obj_id`.")
 
         df_tables = pd.DataFrame(table_rows)[["object", "kind", "source_obj_id", "target_obj_id", "state"]]
         st.dataframe(
@@ -672,16 +692,22 @@ elif step == 1:
         if misaligned:
             if st.button("Fix target obj_ids", type="primary"):
                 prod_by_name   = st.session_state.get("prod_by_name", {})
+                prod_leaf      = st.session_state.get("prod_leaf", {})
                 dev_table_refs = st.session_state.get("dev_table_refs", {})
                 dev_model_refs = st.session_state.get("dev_model_refs", {})
+                dev_leaf_refs  = st.session_state.get("dev_leaf_refs", {})
                 to_fix, not_found = [], []
                 for r in misaligned:
-                    oname   = r["object"]
-                    dev_oid = (dev_table_refs if r["kind"] == "table"
-                               else dev_model_refs).get(oname, "")
+                    oname, kind = r["object"], r["kind"]
+                    if kind == "table":
+                        dev_oid, prod_obj = dev_table_refs.get(oname, ""), prod_by_name.get(oname)
+                    elif kind == "model":
+                        dev_oid, prod_obj = dev_model_refs.get(oname, ""), prod_by_name.get(oname)
+                    else:   # liveboard | answer
+                        dev_oid  = (dev_leaf_refs.get(oname) or ("", ""))[1]
+                        prod_obj = prod_leaf.get(oname)
                     if not dev_oid:
                         continue
-                    prod_obj = prod_by_name.get(oname)
                     if not prod_obj:
                         not_found.append(oname)
                         continue
@@ -703,7 +729,8 @@ elif step == 1:
                         st.success("obj_id set on target: "
                                    + ", ".join(f"`{t['name']}`→`{t['obj_id']}`" for t in to_fix))
                         for _k in ("obj_id_status", "_raw_items", "table_alignment",
-                                   "prod_by_name", "dev_table_refs", "dev_model_refs"):
+                                   "prod_by_name", "prod_leaf", "dev_table_refs",
+                                   "dev_model_refs", "dev_leaf_refs"):
                             st.session_state.pop(_k, None)
                         st.rerun()
                     except Exception as e:
@@ -843,8 +870,8 @@ elif step == 1:
                             target_client().update_obj_ids(tgt_up)
                     st.success(f"Aligned {len(tgt_up)} pair(s)."
                                + (f"  Skipped (no GUID): {', '.join(skipped)}" if skipped else ""))
-                    for _k in ("obj_id_status", "_raw_items", "table_alignment",
-                               "prod_by_name", "dev_table_refs", "dev_model_refs",
+                    for _k in ("obj_id_status", "_raw_items", "table_alignment", "prod_by_name",
+                               "prod_leaf", "dev_table_refs", "dev_model_refs", "dev_leaf_refs",
                                "match_results"):
                         st.session_state.pop(_k, None)
                     st.rerun()
