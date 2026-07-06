@@ -903,12 +903,16 @@ elif step == 2:
             # Opt-in: also pull each model's Spotter feedback (reference questions + business
             # terms) and promote it alongside the model.
             if st.session_state.get("include_feedback"):
+                # The model GUID lives in the export wrapper's info.id — the edoc itself does NOT
+                # carry a top-level `guid` under include_obj_id export (Step 1 reads info.id too).
+                # Reading d.get("guid") returned nothing, so no feedback was ever exported.
                 model_guids = []
                 for it in items:
                     d = _parse_edoc(it.get("edoc", "{}"))
                     if "model" in d or "worksheet" in d:
-                        if d.get("guid"):
-                            model_guids.append(d["guid"])
+                        gid = (it.get("info") or {}).get("id") or d.get("guid")
+                        if gid:
+                            model_guids.append(gid)
                 if model_guids:
                     fb_items = source_client().export_feedback(model_guids)
                     # Keep only the reference questions / business terms the operator ticked
