@@ -290,7 +290,8 @@ if step == 0:
             st.session_state.pop("excluded", None)
             st.session_state.pop("prune_tables", None)
             for _k in ("obj_id_status", "_raw_items", "table_alignment", "prod_by_name",
-                       "dev_table_refs", "transformed_items", "match_results", "table_remap"):
+                       "dev_table_refs", "dev_model_refs", "transformed_items",
+                       "match_results", "table_remap"):
                 st.session_state.pop(_k, None)
         elif not picks:
             for _k in ("dep_info", "selected_ids"):
@@ -511,51 +512,66 @@ elif step == 1:
                         "ok":     bool(oid),
                     })
 
-                # Part B: table obj_id — source value vs target. Read the table obj_id
-                # from the TABLE TML (the model's table-reference does not carry one).
-                dev_table_refs = {}
+                # Part B: table AND model obj_id — source value vs target. A logical object
+                # (physical table OR model/worksheet) that already exists on the target under a
+                # DIFFERENT obj_id is DUPLICATED on import (match order obj_id->guid->create), so
+                # it must be aligned first. Read obj_id from the object's OWN TML (a model's
+                # table-reference does not carry one). Models with an auto obj_id (Name-<guid>)
+                # never match cross-cluster, so this catches auto-vs-auto too, not just missing.
+                dev_table_refs = {}   # {table_name: obj_id}
+                dev_model_refs = {}   # {model_name: obj_id}
                 for item in items:
                     doc = _parse_edoc(item.get("edoc", "{}"))
                     if "table" in doc:
                         tname = doc["table"].get("name")
                         if tname:
                             dev_table_refs[tname] = doc.get("obj_id", "")
+                    for mk in ("model", "worksheet"):
+                        if mk in doc:
+                            mname = doc[mk].get("name")
+                            if mname:
+                                dev_model_refs[mname] = doc.get("obj_id", "")
 
+                # metadata/search on LOGICAL_TABLE returns physical tables AND models/worksheets.
                 prod_resp  = target_client()._post(
                     "/api/rest/2.0/metadata/search",
-                    {"metadata": [{"type": "LOGICAL_TABLE"}], "record_size": 200},
+                    {"metadata": [{"type": "LOGICAL_TABLE"}], "record_size": 500},
                 )
                 prod_items = prod_resp if isinstance(prod_resp, list) else prod_resp.get("metadata", [])
                 prod_by_name = {o.get("metadata_name"): o for o in prod_items}
 
                 # state: aligned | mismatch (exists on target with a different obj_id ->
                 # import would duplicate) | create (absent on target -> created on import).
-                table_rows = []
-                for tname, dev_oid in dev_table_refs.items():
-                    prod_obj = prod_by_name.get(tname)
-                    prod_oid = prod_obj.get("metadata_obj_id", "") if prod_obj else None
+                def _align_state(dev_oid, prod_obj):
                     if prod_obj is None:
-                        state = "create"
-                    elif dev_oid and prod_oid == dev_oid:
-                        state = "aligned"
-                    else:
-                        state = "mismatch"
-                    table_rows.append({
-                        "table":         tname,
-                        "source_obj_id": dev_oid or "NOT SET",
-                        "target_obj_id": (prod_oid or "NOT SET") if prod_obj else "WILL CREATE",
-                        "state":         state,
-                    })
+                        return "create"
+                    if dev_oid and prod_obj.get("metadata_obj_id", "") == dev_oid:
+                        return "aligned"
+                    return "mismatch"
+
+                table_rows = []
+                for kind, refs in (("table", dev_table_refs), ("model", dev_model_refs)):
+                    for oname, dev_oid in refs.items():
+                        prod_obj = prod_by_name.get(oname)
+                        prod_oid = prod_obj.get("metadata_obj_id", "") if prod_obj else None
+                        table_rows.append({
+                            "object":        oname,
+                            "kind":          kind,
+                            "source_obj_id": dev_oid or "NOT SET",
+                            "target_obj_id": (prod_oid or "NOT SET") if prod_obj else "WILL CREATE",
+                            "state":         _align_state(dev_oid, prod_obj),
+                        })
 
                 st.session_state.obj_id_status   = status_rows
                 st.session_state._raw_items      = items
                 st.session_state.table_alignment = table_rows
                 st.session_state.prod_by_name    = prod_by_name
                 st.session_state.dev_table_refs  = dev_table_refs
+                st.session_state.dev_model_refs  = dev_model_refs
 
         if st.button("Re-check obj_id status"):
             for _k in ("obj_id_status", "_raw_items", "table_alignment",
-                       "prod_by_name", "dev_table_refs"):
+                       "prod_by_name", "dev_table_refs", "dev_model_refs"):
                 st.session_state.pop(_k, None)
             st.rerun()
 
@@ -603,7 +619,7 @@ elif step == 1:
                         source_client().update_obj_ids(mappings)
                     st.success(f"obj_id set on {len(mappings)} source object(s).")
                     for _k in ("obj_id_status", "_raw_items", "table_alignment",
-                               "prod_by_name", "dev_table_refs"):
+                               "prod_by_name", "dev_table_refs", "dev_model_refs"):
                         st.session_state.pop(_k, None)
                     st.rerun()
                 except Exception as e:
@@ -612,19 +628,19 @@ elif step == 1:
     table_rows = st.session_state.get("table_alignment", [])
     if table_rows:
         st.divider()
-        st.markdown("#### Table obj_id (source → target)")
+        st.markdown("#### Table & model obj_id (source → target)")
         misaligned  = [r for r in table_rows if r["state"] == "mismatch"]
         will_create = [r for r in table_rows if r["state"] == "create"]
         if misaligned:
-            st.warning(f"{len(misaligned)} table(s) already exist on the target with a different "
-                       "`obj_id` — importing would create duplicates. Fix below before continuing.")
+            st.warning(f"{len(misaligned)} object(s) already exist on the target with a different "
+                       "`obj_id` — importing would create DUPLICATES. Fix below before continuing.")
         elif will_create:
-            st.info(f"{len(will_create)} table(s) are absent on the target and will be created on "
+            st.info(f"{len(will_create)} object(s) are absent on the target and will be created on "
                     "import with the source `obj_id` (ensure the source `obj_id` is set above).")
         else:
-            st.success("All target tables exist and are aligned on `obj_id`.")
+            st.success("All target tables/models exist and are aligned on `obj_id`.")
 
-        df_tables = pd.DataFrame(table_rows)[["table", "source_obj_id", "target_obj_id", "state"]]
+        df_tables = pd.DataFrame(table_rows)[["object", "kind", "source_obj_id", "target_obj_id", "state"]]
         st.dataframe(
             df_tables,
             column_config={"state": st.column_config.TextColumn("State")},
@@ -633,38 +649,40 @@ elif step == 1:
         )
 
         if misaligned:
-            if st.button("Fix target table obj_ids", type="primary"):
+            if st.button("Fix target obj_ids", type="primary"):
                 prod_by_name   = st.session_state.get("prod_by_name", {})
                 dev_table_refs = st.session_state.get("dev_table_refs", {})
+                dev_model_refs = st.session_state.get("dev_model_refs", {})
                 to_fix, not_found = [], []
                 for r in misaligned:
-                    tname   = r["table"]
-                    dev_oid = dev_table_refs.get(tname, "")
+                    oname   = r["object"]
+                    dev_oid = (dev_table_refs if r["kind"] == "table"
+                               else dev_model_refs).get(oname, "")
                     if not dev_oid:
                         continue
-                    prod_obj = prod_by_name.get(tname)
+                    prod_obj = prod_by_name.get(oname)
                     if not prod_obj:
-                        not_found.append(tname)
+                        not_found.append(oname)
                         continue
                     to_fix.append({
                         "guid":   prod_obj.get("metadata_id"),
-                        "name":   tname,
+                        "name":   oname,
                         "obj_id": dev_oid,
                     })
 
                 if not_found:
-                    st.error(f"Tables not found on the target cluster — import from its connection first: {', '.join(not_found)}")
+                    st.error(f"Objects not found on the target cluster — import from its connection first: {', '.join(not_found)}")
 
                 if to_fix:
                     # set obj_id via the update-obj-id API (a TML re-import won't change it)
                     mappings = [{"identifier": t["guid"], "new_obj_id": t["obj_id"]} for t in to_fix]
                     try:
-                        with st.spinner(f"Setting obj_id on {len(to_fix)} target table(s)…"):
+                        with st.spinner(f"Setting obj_id on {len(to_fix)} target object(s)…"):
                             target_client().update_obj_ids(mappings)
-                        st.success("obj_id set on target table(s): "
+                        st.success("obj_id set on target: "
                                    + ", ".join(f"`{t['name']}`→`{t['obj_id']}`" for t in to_fix))
                         for _k in ("obj_id_status", "_raw_items", "table_alignment",
-                                   "prod_by_name", "dev_table_refs"):
+                                   "prod_by_name", "dev_table_refs", "dev_model_refs"):
                             st.session_state.pop(_k, None)
                         st.rerun()
                     except Exception as e:
@@ -805,7 +823,8 @@ elif step == 1:
                     st.success(f"Aligned {len(tgt_up)} pair(s)."
                                + (f"  Skipped (no GUID): {', '.join(skipped)}" if skipped else ""))
                     for _k in ("obj_id_status", "_raw_items", "table_alignment",
-                               "prod_by_name", "dev_table_refs", "match_results"):
+                               "prod_by_name", "dev_table_refs", "dev_model_refs",
+                               "match_results"):
                         st.session_state.pop(_k, None)
                     st.rerun()
                 except Exception as e:
