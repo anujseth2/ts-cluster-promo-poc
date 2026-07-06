@@ -839,13 +839,13 @@ elif step == 2:
             sha    = gc.commit_tml(team_name, files)
             pr_url = gc.create_pr(team_name, sha)
 
-            # Read from dev branch — not main — so we validate what we just committed.
-            # Validate tables AND models (tables first): table validation is what surfaces
-            # a source column missing from the target warehouse (err 14536) and a drop
-            # blocked by target dependents; models catch the rest.
-            tml_files   = gc.get_tml_files(team_name, branch=gc.DEV_BRANCH)
-            val_strings = ([c for p, c in tml_files.items() if p.startswith("tables/")]
-                           + [c for p, c in tml_files.items() if p.startswith("models/")])
+            # Validate ONLY this run's files (what we just committed), not the whole team
+            # folder — the repo accumulates TML across promotions, and reading the folder
+            # would re-validate/re-import unrelated tables from earlier runs. Tables first:
+            # table validation surfaces a missing column (err 14536) / drop-blocked deps;
+            # models catch the rest.
+            val_strings = ([c for p, c in files.items() if p.startswith("tables/")]
+                           + [c for p, c in files.items() if p.startswith("models/")])
             if not val_strings:
                 return pr_url, [], []
             results = target_client().import_tml(val_strings, policy="VALIDATE_ONLY")
@@ -1225,7 +1225,11 @@ elif step == 2:
                     # Import tables + models first, THEN validate the leaves against the live model so
                     # viz/formula errors are caught here instead of surfacing silently at leaf import.
                     with st.spinner("Importing tables & models, then validating liveboards/answers…"):
-                        tml_files = gc.get_tml_files(team_name)
+                        # Import ONLY this run's files. The team folder accumulates TML across
+                        # promotions; without this filter the import would re-import unrelated
+                        # tables/models from earlier runs (the "10 tables for a 3-table model" bug).
+                        cur_paths = set(items_to_files(filtered_items).keys())
+                        tml_files = {p: c for p, c in gc.get_tml_files(team_name).items() if p in cur_paths}
                         core   = {p: c for p, c in tml_files.items()
                                   if p.startswith("tables/") or p.startswith("models/")}
                         leaves = {p: c for p, c in tml_files.items()
