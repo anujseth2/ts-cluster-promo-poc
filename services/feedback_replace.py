@@ -30,15 +30,39 @@ def feedback_preview(target_client, model_name: str, model_obj_id: str,
     keep = target-only entries (preserved on Merge, dropped on Replace)."""
     guid = target_client.find_by_obj_id(model_obj_id)
     tgt_entries = target_client.export_feedback_entries(guid) if guid else []
-    src = {_key(e) for e in source_entries}
-    tgt = {_key(e) for e in tgt_entries}
+
+    def _tok(e):
+        return (e.get("search_tokens") or "").strip()
+    src_tok = {_key(e): _tok(e) for e in source_entries}   # (type,phrase) -> columns it maps to
+    tgt_tok = {_key(e): _tok(e) for e in tgt_entries}
+    src, tgt = set(src_tok), set(tgt_tok)
+
+    def _label(t, p):
+        kind = "biz term" if t == "BUSINESS_TERM" else ("ref Q" if t == "REFERENCE_QUESTION" else t.lower())
+        return f"{p} ({kind})"
+
+    def _grouped(pairs, tokmap):
+        # {label: [{phrase, tokens}]} — tokens drives the "?" tooltip in the picker/preview.
+        out = {"Reference questions": [], "Business terms": [], "Other": []}
+        for (t, p) in sorted(pairs):
+            item = {"phrase": p if t in ("REFERENCE_QUESTION", "BUSINESS_TERM") else f"{p} ({t})",
+                    "tokens": tokmap.get((t, p), "")}
+            key = ("Reference questions" if t == "REFERENCE_QUESTION"
+                   else "Business terms" if t == "BUSINESS_TERM" else "Other")
+            out[key].append(item)
+        return out
+
     return {
         "model":          model_name,
         "target_present": bool(guid),
         "target_guid":    guid,
-        "add":     sorted(p for (t, p) in src if (t, p) not in tgt),
-        "replace": sorted(p for (t, p) in src if (t, p) in tgt),
-        "keep":    sorted(p for (t, p) in tgt if (t, p) not in src),
+        "source":  sorted(_label(t, p) for (t, p) in src),   # everything on the source
+        "target":  sorted(_label(t, p) for (t, p) in tgt),   # everything on the target now
+        "source_grouped": _grouped(src, src_tok),   # source entries grouped by kind (for the dropdown)
+        "target_grouped": _grouped(tgt, tgt_tok),   # target entries grouped by kind
+        "add":     sorted(_label(t, p) for (t, p) in src if (t, p) not in tgt),
+        "replace": sorted(_label(t, p) for (t, p) in src if (t, p) in tgt),
+        "keep":    sorted(_label(t, p) for (t, p) in tgt if (t, p) not in src),
     }
 
 

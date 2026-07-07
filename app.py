@@ -29,6 +29,8 @@ from services.import_diagnostics import (
 )
 from services.table_matcher import column_signature
 from services.feedback_replace import feedback_preview, replace_prep, replace_finalize
+from services.reconcile import reconcile
+from ui_feedback import render_feedback_panel
 
 load_dotenv(Path(__file__).parent / ".env")
 
@@ -237,10 +239,11 @@ if step == 0:
                 team_tags, types=["LIVEBOARD", "ANSWER", "LOGICAL_TABLE"])
             for key in ("picks", "selected_ids", "dep_info", "_resolved_key", "excluded",
                         "_promo_id2name", "_promo_present", "obj_id_status",
-                        "table_alignment", "transformed_items", "import_results",
+                        "table_alignment", "transformed_items", "import_results", "recon_report",
                         "pre_import_index", "dropped_col_names", "dropped_cols_count",
                         "dropped_vizs_count", "prune_summary",
-                        "_fb_previews", "feedback_mode", "ack_replace", "fb_replace_report"):
+                        "_fb_previews", "feedback_mode", "ack_replace", "fb_replace_report",
+                        "_include_feedback", "_export_fb_state"):
                 st.session_state.pop(key, None)
 
     assets = st.session_state.get("assets", [])
@@ -348,11 +351,18 @@ if step == 0:
                         "see exactly what gets dropped first.")
 
             if dep["model_ids"]:
+                # Persist the toggle across steps. Streamlit drops a widget's state once the widget
+                # stops rendering (this checkbox lives only on the Select page), so navigating to
+                # Step 2/3 wiped `include_feedback` and the export silently skipped feedback. Mirror
+                # it into a normal key `_include_feedback` that the later steps read.
+                if "include_feedback" not in st.session_state:
+                    st.session_state["include_feedback"] = st.session_state.get("_include_feedback", False)
                 inc_fb = st.checkbox(
                     "Include Spotter feedback (reference questions + business terms) for the model(s)",
-                    value=st.session_state.get("include_feedback", False), key="include_feedback",
+                    key="include_feedback",
                     help="Also promote each model's Spotter feedback — its reference questions and "
                          "business terms — exported as FEEDBACK TML and imported after the model.")
+                st.session_state["_include_feedback"] = inc_fb
                 if inc_fb:
                     # Load the models' feedback once per model set so the operator can pick
                     # individual reference questions / business terms to promote.
@@ -910,16 +920,27 @@ elif step == 2:
 
     # Export + transform on entry. This runs AFTER obj_id Setup, so the exported TML carries
     # the aligned obj_ids. (This replaced the standalone Review page.)
-    if selected_ids and "transformed_items" not in st.session_state:
+    # Re-export when the FEEDBACK choice changed since the last export — otherwise a bundle
+    # cached before "Include feedback" was ticked would silently omit feedback (and the commit
+    # would too). Changing the choice also invalidates the already-committed PR/validation.
+    _fb_state = (bool(st.session_state.get("_include_feedback")),
+                 frozenset(st.session_state.get("feedback_selected") or []))
+    _need_export = ("transformed_items" not in st.session_state
+                    or st.session_state.get("_export_fb_state") != _fb_state)
+    if selected_ids and _need_export:
+        if "transformed_items" in st.session_state:
+            for _k in ("pr_url", "validation_errors", "validation_ok", "import_phase",
+                       "import_core_results", "import_leaf_files", "import_leaf_errors",
+                       "silent_drops", "_fb_previews"):
+                st.session_state.pop(_k, None)
         with st.spinner("Exporting TML (post-alignment) and applying the data-layer transform…"):
             raw   = source_client().export_tml(selected_ids)
             items = raw if isinstance(raw, list) else raw.get("object", [])
             # Opt-in: also pull each model's Spotter feedback (reference questions + business
             # terms) and promote it alongside the model.
-            if st.session_state.get("include_feedback"):
+            if st.session_state.get("_include_feedback"):
                 # The model GUID lives in the export wrapper's info.id — the edoc itself does NOT
                 # carry a top-level `guid` under include_obj_id export (Step 1 reads info.id too).
-                # Reading d.get("guid") returned nothing, so no feedback was ever exported.
                 model_guids = []
                 for it in items:
                     d = _parse_edoc(it.get("edoc", "{}"))
@@ -949,6 +970,7 @@ elif step == 2:
                 st.session_state.prune_summary = prune_summary
             st.session_state.transformed_items = transformed_items
             st.session_state.warnings          = warnings
+            st.session_state._export_fb_state  = _fb_state   # what feedback choice this export reflects
             st.session_state.pop("_fb_previews", None)   # recompute feedback preview vs the fresh export
             # Flag if a configured source_connection matches NO connection in the exported
             # tables (the remap would silently skip -> import failure on the target).
@@ -1348,6 +1370,7 @@ elif step == 2:
                     st.session_state.import_results = st.session_state.get("import_core_results", []) + leaf_results
                     if dropped_v:
                         st.session_state.dropped_vizs_count = st.session_state.get("dropped_vizs_count", 0) + dropped_v
+                    st.session_state.pop("recon_report", None)   # re-verify against target for this run
                     st.session_state.import_phase = "complete"
                     st.rerun()
 
@@ -1372,44 +1395,15 @@ elif step == 2:
                                           key="ack_silent")
 
                 # ── Spotter feedback: merge preview + optional Replace ──
-                fb_specs = _feedback_specs(filtered_items) if st.session_state.get("include_feedback") else []
+                fb_specs = _feedback_specs(filtered_items) if st.session_state.get("_include_feedback") else []
                 replace_ack = True
                 if fb_specs:
-                    st.markdown("#### Spotter feedback")
                     if "_fb_previews" not in st.session_state:
                         with st.spinner("Comparing feedback with the target…"):
                             st.session_state._fb_previews = [
                                 feedback_preview(target_client(), m["name"], m["obj_id"], m["entries"])
                                 for m in fb_specs]
-                    for pv in st.session_state._fb_previews:
-                        bits = []
-                        if pv["add"]:     bits.append(f"add {len(pv['add'])}")
-                        if pv["replace"]: bits.append(f"replace {len(pv['replace'])} (same phrase)")
-                        if pv["keep"]:    bits.append(f"keep {len(pv['keep'])} target-only")
-                        summary = ", ".join(bits) if bits else (
-                            "no existing target feedback" if pv["target_present"]
-                            else "target model not present yet — will be created")
-                        st.caption(f"**{pv['model']}** — {summary}"
-                                   + (f"  ·  target-only: "
-                                      + ", ".join(f"`{k}`" for k in pv["keep"]) if pv["keep"] else ""))
-                    any_target_only = any(pv["keep"] for pv in st.session_state._fb_previews)
-                    mode = st.radio(
-                        "Feedback handling",
-                        ["Merge — keep the target's own feedback (default, safe)",
-                         "Replace — target ends with ONLY the source's feedback"],
-                        key="feedback_mode")
-                    if mode.startswith("Replace"):
-                        st.warning(
-                            "**Replace rebuilds each model**: it moves the obj_id onto a fresh copy "
-                            "(clean feedback), re-points that model's dependents (answers/liveboards) "
-                            "onto it, then deletes the old model — only if it ends with no non-feedback "
-                            "dependents (otherwise it is kept and flagged). Target-only feedback is dropped."
-                            + ("" if any_target_only else
-                               "  Note: there is no target-only feedback here, so Replace and Merge give "
-                               "the same result."))
-                        replace_ack = st.checkbox(
-                            "I understand Replace rebuilds the model(s) and drops target-only feedback.",
-                            key="ack_replace")
+                    replace_ack = render_feedback_panel(st.session_state._fb_previews)
 
                 if st.button("Merge & Import to Target", type="primary",
                              disabled=not (proceed and replace_ack)):
@@ -1435,7 +1429,7 @@ elif step == 2:
                     # so the import creates a fresh model (clean feedback). Deps are re-pointed and the
                     # old model deleted AFTER import (replace_finalize below). Verified inter-org.
                     replace_mode = (st.session_state.get("feedback_mode", "").startswith("Replace")
-                                    and st.session_state.get("include_feedback"))
+                                    and st.session_state.get("_include_feedback"))
                     fb_prepped = []
                     if replace_mode:
                         with st.spinner("Preparing feedback Replace (freeing target model obj_ids)…"):
@@ -1498,6 +1492,7 @@ elif step == 2:
                         with st.spinner("Importing liveboards / answers…"):
                             leaf_results = target_client().import_tml(list(leaves.values())) if leaves else []
                         st.session_state.import_results = core_results + leaf_results
+                        st.session_state.pop("recon_report", None)   # re-verify against target for this run
                         st.session_state.import_phase = "complete"
                         st.rerun()
 
@@ -1555,6 +1550,32 @@ elif step == 3:
                     "bt": sum(1 for e in fb if e.get("type") == "BUSINESS_TERM"),
                 }
 
+        # Post-import reconciliation: re-query the target and VERIFY the claims against reality,
+        # rather than inferring duplicate/updated purely from the pre-import snapshot.
+        promoted_objs, expected_fb = [], {}
+        for it in st.session_state.get("transformed_items", []):
+            d = _parse_edoc(it.get("edoc", "{}"))
+            if "nls_feedback" in d:
+                expected_fb[it.get("info", {}).get("name", "")] = [
+                    e.get("feedback_phrase") for e in (d.get("nls_feedback", {}) or {}).get("feedback", []) or []]
+                continue
+            for k in ("table", "model", "worksheet", "liveboard", "answer"):
+                node = d.get(k)
+                if isinstance(node, dict) and node.get("name"):
+                    promoted_objs.append({"name": node["name"], "obj_id": d.get("obj_id", ""),
+                                          "type": _friendly(d)})
+                    break
+        if "recon_report" not in st.session_state:
+            try:
+                with st.spinner("Verifying the promotion against the target…"):
+                    st.session_state.recon_report = reconcile(target_client(), promoted_objs, expected_fb)
+            except Exception as e:
+                st.session_state.recon_report = [{"object": "(reconcile failed)", "type": "",
+                                                  "verified": str(e)[:150], "ok": False}]
+        recon = st.session_state.recon_report
+        real_dupes = {r["object"] for r in recon
+                      if r["type"] != "Feedback" and r["verified"].startswith("DUPLICATE")}
+
         _RAW = {"LOGICAL_TABLE": "Table", "PINBOARD_ANSWER_BOOK": "Liveboard",
                 "QUESTION_ANSWER_BOOK": "Answer", "ANSWER": "Answer", "LIVEBOARD": "Liveboard",
                 "FEEDBACK": "Feedback"}
@@ -1572,19 +1593,30 @@ elif step == 3:
             return _RAW.get(raw, raw)
 
         pre_index = st.session_state.get("pre_import_index", {})
+        # Models rebuilt by feedback Replace get a NEW guid on purpose (old one deleted), so the
+        # snapshot-based duplicate check would false-flag them — treat them as rebuilt, not dupes.
+        _replaced = {r["model"] for r in (st.session_state.get("fb_replace_report") or [])
+                     if r.get("old_model_deleted")}
 
         def _change(row):
-            # Created vs updated-in-place vs DUPLICATE, from the pre-import target snapshot.
+            # DUPLICATE is now RECONCILE-authoritative (verified against the live target), not
+            # inferred from the snapshot — so a rebuilt/relabeled object that is actually a single
+            # object on the target is no longer false-flagged. Created vs updated still uses the
+            # pre-import snapshot (reconcile can't distinguish those two on its own).
             if row["status"] != "OK":
                 return ""
             if row["type"] == "Feedback":
                 return "synced"
+            if row["name"] in real_dupes:
+                return "⚠ DUPLICATE"           # reality-confirmed (2+ same-named objects)
+            if row["name"] in _replaced and row["type"] == "Model":
+                return "rebuilt (Replace)"
             if not pre_index:
-                return ""                      # no snapshot -> can't tell (resumed session)
+                return "present"               # verified present by reconcile; no snapshot to date it
             pre = pre_index.get(row["name"])
             if not pre:
                 return "created"
-            return "updated in place" if row.get("new_id") in pre else "⚠ DUPLICATE"
+            return "updated in place"
 
         def _detail(row):
             if row["type"] == "Feedback":
@@ -1615,14 +1647,22 @@ elif step == 3:
         if dup_ct:
             dup_names = list(success[success["change"] == "⚠ DUPLICATE"]["name"])
             st.error(
-                "**Duplicate(s) created on the target** — these imported as NEW objects while a "
-                "same-named object already existed, so the obj_id did not match: "
+                "**Duplicate(s) on the target (verified)** — the target has 2+ objects sharing a name: "
                 + ", ".join(f"`{n}`" for n in dup_names)
                 + ".  Fix in Step 2 → **Fix target obj_ids** (align each to the source obj_id), delete "
                 "the stale copy on the target, then re-promote — it will then update in place.")
-        elif not pre_index and not success.empty:
-            st.caption("Created / updated-in-place status is unavailable for this run "
-                       "(no pre-import snapshot — e.g. a resumed session).")
+
+        # Reconciliation: what was VERIFIED against the live target (not inferred).
+        recon_bad = [r for r in recon if not r["ok"]]
+        if recon_bad:
+            st.error("**Verification found issues on the target:**\n"
+                     + "\n".join(f"- `{r['object']}` ({r['type']}): {r['verified']}" for r in recon_bad))
+        elif recon:
+            st.success(f"Verified against the target: {len(recon)} object(s) present as expected "
+                       "(no duplicates, feedback confirmed).")
+        with st.expander("Verification detail (re-queried from the target)"):
+            for r in recon:
+                st.markdown(f"- {'✅' if r['ok'] else '⚠️'} `{r['object']}` · {r['type']} — {r['verified']}")
 
         # What kinds of assets shifted.
         if not success.empty:

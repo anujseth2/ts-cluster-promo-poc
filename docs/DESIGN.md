@@ -74,6 +74,14 @@ Legend: ✓ handled · ✗ gap · ⚠ handled but unverified live · — n/a
   model iff no real deps remain (else keep + flag). Verified inter-org; behind an explicit ack.
   `services/feedback_replace.py` + `ts_client` primitives (`find_by_obj_id`, `real_dependents`,
   `repoint_dependent`, `delete_metadata`, `export_feedback_entries`).
+- **Post-import reconciliation** ✓ — Import Results re-queries the target and VERIFIES the
+  claims against reality instead of inferring from the pre-import snapshot: real duplicates only
+  (2+ same-named objects), objects present-in-place, MISSING (import said OK but absent), and
+  feedback entries actually present. This self-corrects the "says DUPLICATE but updated in place"
+  class (proven live) and surfaces claim-vs-reality mismatches. `services/reconcile.py`; the
+  duplicate flag/banner are now reconcile-authoritative. Runtime-only bugs in the FLOW (widget
+  state GC across steps, stale export cache) are NOT caught here — those need the T1-T6 smoke
+  suite run against the inter-org env before each merge.
 - **obj_id mechanics** ✓ — dependencies are **GUID-bound**; obj_id is a portable label.
   Changing a model's OWN obj_id in place is safe: dependents auto-resolve to the new obj_id, no
   edits (verified). MOVING an obj_id to a different model does NOT move dependents — re-import
