@@ -1396,11 +1396,20 @@ elif step == 2:
                         # tables/models from earlier runs (the "10 tables for a 3-table model" bug).
                         cur_paths = set(items_to_files(filtered_items).keys())
                         tml_files = {p: c for p, c in gc.get_tml_files(team_name).items() if p in cur_paths}
-                        core   = {p: c for p, c in tml_files.items()
-                                  if p.startswith(("tables/", "models/", "feedback/"))}
-                        leaves = {p: c for p, c in tml_files.items()
-                                  if not p.startswith(("tables/", "models/", "feedback/"))}
+                        core     = {p: c for p, c in tml_files.items()
+                                    if p.startswith(("tables/", "models/"))}
+                        feedback = {p: c for p, c in tml_files.items()
+                                    if p.startswith("feedback/")}
+                        leaves   = {p: c for p, c in tml_files.items()
+                                    if not p.startswith(("tables/", "models/", "feedback/"))}
                         core_results = target_client().import_tml(files_to_tml_strings(core)) if core else []
+                        # Feedback imports in a SEPARATE call AFTER tables+models commit. A first-time
+                        # model+feedback in ONE batch fails (error 14500: feedback can't resolve the
+                        # not-yet-committed model by obj_id) — and under ALL_OR_NONE that rolls the
+                        # model back too. Verified live on ps-internal 2026-07-07 (inter-org run).
+                        feedback_results = (target_client().import_tml(files_to_tml_strings(feedback))
+                                            if feedback else [])
+                        core_results = core_results + feedback_results
                         st.session_state.import_core_results = core_results
                         st.session_state.import_leaf_files   = leaves
                         leaf_errors = []

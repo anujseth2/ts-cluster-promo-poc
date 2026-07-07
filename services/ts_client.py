@@ -338,16 +338,31 @@ class TSClient:
         FEEDBACK is not independently searchable; it is exported by the model's GUID via
         type=FEEDBACK. Returns the raw item list (feedback objects); empty for models that
         have no feedback.
+
+        Exported PER MODEL and tolerant of non-200: on current clusters a `type=FEEDBACK`
+        export for a model that has NO feedback returns HTTP 400 (code 10002), so a single
+        batched call would raise and abort the whole promotion (and the Select-page picker).
+        Per-model + skip-on-error means a model without feedback is simply skipped while the
+        others still export (verified live on ps-internal 2026-07-07).
         """
-        if not model_ids:
-            return []
-        payload = {
-            "metadata": [{"type": "FEEDBACK", "identifier": mid} for mid in model_ids],
-            "export_options": {"include_obj_id": True},
-        }
-        raw = self._post("/api/rest/2.0/metadata/tml/export", payload)
-        items = raw if isinstance(raw, list) else raw.get("object", [])
-        return [it for it in items if it.get("edoc")]
+        out: List[Dict] = []
+        url = f"{self.host}/api/rest/2.0/metadata/tml/export"
+        for mid in model_ids or []:
+            payload = {"metadata": [{"type": "FEEDBACK", "identifier": mid}],
+                       "export_options": {"include_obj_id": True}}
+            resp = self._session.post(url, json=payload, timeout=60)
+            if resp.status_code == 401 and self._username and self._password:
+                self._session_login()
+                resp = self._session.post(url, json=payload, timeout=60)
+            if resp.status_code != 200:
+                continue   # model has no feedback (400) or is not exportable — skip it
+            try:
+                raw = resp.json()
+            except ValueError:
+                continue
+            items = raw if isinstance(raw, list) else raw.get("object", [])
+            out.extend(it for it in items if it.get("edoc"))
+        return out
 
     # ── TML import ────────────────────────────────────────────────────────────
 

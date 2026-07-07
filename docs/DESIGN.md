@@ -35,21 +35,48 @@ Legend: ✓ handled · ✗ gap · ⚠ handled but unverified live · — n/a
 |------------|---------|----------------------|---------------------|-------------------|-----------------------------------|---------------|--------------|--------------------------|
 | Table      | ✓ dep   | ✓                    | ✓ create/update/dup | ✓ export_tml      | conn/db/schema remap · matcher repoint | `tables/`     | 1st          | ✓ created/updated/DUP    |
 | Model      | ✓       | ✓                    | ✓ create/update/dup | ✓ export_tml      | strip fqn · conn/db/schema remap  | `models/`     | 2nd          | ✓ created/updated/DUP    |
-| Liveboard  | ✓ leaf  | ✓                    | ⚠ create/update/dup | ✓ export_tml      | strip model-ref fqn (obj_id resolve) | `liveboards/` | last      | ✓ created/updated/DUP    |
-| Answer     | ✓ leaf  | ✓                    | ⚠ create/update/dup | ✓ export_tml      | strip model-ref fqn (obj_id resolve) | `answers/`    | last      | ✓ created/updated/DUP    |
-| Feedback   | via model toggle (granular pick) | — auto, preserved | ✗ **not searchable → target obj_id can't be aligned** | ✓ export_feedback(model guid) | keep obj_id · strip guid · no data remap | `feedback/`   | after model  | "synced" only (**no dup detection**) |
+| Liveboard  | ✓ leaf  | ✓                    | ✓ create/update/dup | ✓ export_tml      | strip model-ref fqn (obj_id resolve) | `liveboards/` | last      | ✓ created/updated/DUP    |
+| Answer     | ✓ leaf  | ✓                    | ✓ create/update/dup | ✓ export_tml      | strip model-ref fqn (obj_id resolve) | `answers/`    | last      | ✓ created/updated/DUP    |
+| Feedback (ref Q + biz terms) | via model toggle (granular pick) | — obj_id = model obj_id, preserved | ✓ matches target model by obj_id (needs Spotter-enabled model, committed first) | ✓ export_feedback per-model, 400-tolerant | keep obj_id · strip guid · no data remap | `feedback/` | **SEPARATE call AFTER model commits** | N ref Q / M biz terms · "synced" |
+| NL instructions (Spotter coaching) | (not yet wired) | — | — | ✗ **not in TML — `ai/instructions/get`** | n/a (plain text) | not in git bundle | `ai/instructions/set` (full replace) | — | ✗ **not built** |
 | Connection | — (referenced, not promoted) | — | — | — | remap by name; warn if target lacks it | — | — | — |
 
-### Open cells (the current "missing pointers")
+### Verified live on ps-internal (2026-07-07)
 
-- **Feedback duplicate on re-promotion — UNVERIFIED.** Because FEEDBACK isn't searchable,
-  Step 2B can't align its target obj_id like the other types. It relies on the shared
-  model guid + preserved obj_id to match in place. Whether a second promotion updates it
-  in place or creates a duplicate is **not yet confirmed on-cluster**. The report also
-  can't flag a feedback duplicate (nothing to search). → verify on the VM (smoke test T6).
-- **`update-obj-id` on liveboards/answers — UNVERIFIED.** Proven for tables/models; leaves
-  carry a top-level obj_id so it should work, but a live run hasn't confirmed it. Failure
-  surfaces as the red "Failed to set obj_id…" error, not silently.
+- **Leaf → model reference carries `obj_id`** ✓ — exported liveboards show `obj_id` on every
+  viz's model ref (and NO `fqn` on this cluster version). So the fqn-strip is safe: obj_id is
+  always there to resolve by; the strip is defensive for clusters that do emit an fqn.
+- **`update-obj-id` on a leaf WORKS** ✓ — set/read-back/restore on an anuj-owned liveboard
+  returned HTTP 204. Caveat: it needs **edit access** to the object — a system-owned
+  liveboard returns HTTP 400 `AUTHORIZATION_FAILURE` (same edit-access rule as tables/models).
+- **Feedback promotion end-to-end** ✓ — full inter-org run (AnujSeth → Anuj Git Dev, both on
+  the same Databricks under different connection names). Findings:
+  - Target model must be **Spotter-enabled** or feedback ops fail `14531`; the tool carries
+    `model.properties.spotter_config.is_spotter_enabled` through, so it lands enabled.
+  - Feedback resolves the target model by **obj_id** (feedback obj_id == model obj_id), so the
+    strip-guid/keep-obj_id transform is correct once the model's obj_id is aligned.
+  - Import is **additive + phrase-dedup** (platform-side): same-phrase entries replace, others
+    are kept — so re-promote does **not** duplicate, and target-only feedback survives.
+  - **MUST import feedback in a SEPARATE call after tables+models commit.** A first-time
+    model+feedback in ONE batch fails `14500` (feedback can't resolve the not-yet-committed
+    model); under ALL_OR_NONE that rolls the model back too. Fixed: `core` = tables+models,
+    feedback imported after.
+  - Feedback is **capture-and-replay only** — editing an entry's tokens breaks its
+    system-managed `nl_context` (`EDOC_FEEDBACK_TML_INVALID`). Export → import; never author.
+  - `type=FEEDBACK` export returns HTTP 400 for a model with **no** feedback; `export_feedback`
+    is per-model + 400-tolerant so that no longer aborts the run.
+
+### Open cells (the "missing pointers")
+
+- **NL instructions (Spotter coaching) NOT promoted — gap.** Model-level coaching text is a
+  distinct object, **not in TML**, managed via `ai/instructions/get` + `set` (Beta, 10.15.0.cl+;
+  `CAN_USE_SPOTTER` + edit/`SPOTTER_COACHING_PRIVILEGE`; org-scoped token). Recipe **verified**
+  (get source → set target round-trips). `set` is a **full replace** (no auto-merge, unlike
+  feedback), so a merge = get target + union + set. Not yet wired into the tool.
+- **Feedback merge/replace preview** — optional enhancement: before pushing, diff target vs
+  source feedback by phrase and show "add X / replace Y / keep Z", with an opt-in Replace mode
+  (delete target-only entries). The platform already merges; this is just visibility + a
+  replace option.
 
 ## Scenarios (smoke tests to run before "done")
 
