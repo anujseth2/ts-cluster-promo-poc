@@ -28,6 +28,7 @@ from services.import_diagnostics import (
     drop_vizzes, table_drop_preview, drop_tables,
 )
 from services.table_matcher import column_signature
+from services.feedback_replace import feedback_preview, replace_prep, replace_finalize
 
 load_dotenv(Path(__file__).parent / ".env")
 
@@ -85,6 +86,18 @@ def _target_name_index(client, types) -> dict:
             if nm:
                 idx.setdefault(nm, []).append(o.get("metadata_id"))
     return idx
+
+
+def _feedback_specs(items) -> list:
+    """Promoted models that carry feedback -> [{name, obj_id, entries}] (obj_id = model obj_id)."""
+    out = []
+    for it in items:
+        d = _parse_edoc(it.get("edoc", "{}"))
+        if "nls_feedback" in d:
+            out.append({"name":   it.get("info", {}).get("name", ""),
+                        "obj_id": d.get("obj_id"),
+                        "entries": (d.get("nls_feedback", {}) or {}).get("feedback", []) or []})
+    return out
 
 
 # ── Clients (cached per session) ──────────────────────────────────────────────
@@ -226,7 +239,8 @@ if step == 0:
                         "_promo_id2name", "_promo_present", "obj_id_status",
                         "table_alignment", "transformed_items", "import_results",
                         "pre_import_index", "dropped_col_names", "dropped_cols_count",
-                        "dropped_vizs_count", "prune_summary"):
+                        "dropped_vizs_count", "prune_summary",
+                        "_fb_previews", "feedback_mode", "ack_replace", "fb_replace_report"):
                 st.session_state.pop(key, None)
 
     assets = st.session_state.get("assets", [])
@@ -935,6 +949,7 @@ elif step == 2:
                 st.session_state.prune_summary = prune_summary
             st.session_state.transformed_items = transformed_items
             st.session_state.warnings          = warnings
+            st.session_state.pop("_fb_previews", None)   # recompute feedback preview vs the fresh export
             # Flag if a configured source_connection matches NO connection in the exported
             # tables (the remap would silently skip -> import failure on the target).
             src_conn   = teams[team_name].get("source_connection", "")
@@ -1356,7 +1371,48 @@ elif step == 2:
                     proceed = st.checkbox("I understand these target columns will be removed — proceed.",
                                           key="ack_silent")
 
-                if st.button("Merge & Import to Target", type="primary", disabled=not proceed):
+                # ── Spotter feedback: merge preview + optional Replace ──
+                fb_specs = _feedback_specs(filtered_items) if st.session_state.get("include_feedback") else []
+                replace_ack = True
+                if fb_specs:
+                    st.markdown("#### Spotter feedback")
+                    if "_fb_previews" not in st.session_state:
+                        with st.spinner("Comparing feedback with the target…"):
+                            st.session_state._fb_previews = [
+                                feedback_preview(target_client(), m["name"], m["obj_id"], m["entries"])
+                                for m in fb_specs]
+                    for pv in st.session_state._fb_previews:
+                        bits = []
+                        if pv["add"]:     bits.append(f"add {len(pv['add'])}")
+                        if pv["replace"]: bits.append(f"replace {len(pv['replace'])} (same phrase)")
+                        if pv["keep"]:    bits.append(f"keep {len(pv['keep'])} target-only")
+                        summary = ", ".join(bits) if bits else (
+                            "no existing target feedback" if pv["target_present"]
+                            else "target model not present yet — will be created")
+                        st.caption(f"**{pv['model']}** — {summary}"
+                                   + (f"  ·  target-only: "
+                                      + ", ".join(f"`{k}`" for k in pv["keep"]) if pv["keep"] else ""))
+                    any_target_only = any(pv["keep"] for pv in st.session_state._fb_previews)
+                    mode = st.radio(
+                        "Feedback handling",
+                        ["Merge — keep the target's own feedback (default, safe)",
+                         "Replace — target ends with ONLY the source's feedback"],
+                        key="feedback_mode")
+                    if mode.startswith("Replace"):
+                        st.warning(
+                            "**Replace rebuilds each model**: it moves the obj_id onto a fresh copy "
+                            "(clean feedback), re-points that model's dependents (answers/liveboards) "
+                            "onto it, then deletes the old model — only if it ends with no non-feedback "
+                            "dependents (otherwise it is kept and flagged). Target-only feedback is dropped."
+                            + ("" if any_target_only else
+                               "  Note: there is no target-only feedback here, so Replace and Merge give "
+                               "the same result."))
+                        replace_ack = st.checkbox(
+                            "I understand Replace rebuilds the model(s) and drops target-only feedback.",
+                            key="ack_replace")
+
+                if st.button("Merge & Import to Target", type="primary",
+                             disabled=not (proceed and replace_ack)):
                     gc = git_client()
 
                     with st.spinner("Merging PR…"):
@@ -1374,6 +1430,19 @@ elif step == 2:
                         if not merged:
                             st.error("Could not find or create a PR to merge.")
                             st.stop()
+
+                    # Feedback REPLACE (opt-in): free each existing target model's obj_id BEFORE import
+                    # so the import creates a fresh model (clean feedback). Deps are re-pointed and the
+                    # old model deleted AFTER import (replace_finalize below). Verified inter-org.
+                    replace_mode = (st.session_state.get("feedback_mode", "").startswith("Replace")
+                                    and st.session_state.get("include_feedback"))
+                    fb_prepped = []
+                    if replace_mode:
+                        with st.spinner("Preparing feedback Replace (freeing target model obj_ids)…"):
+                            fb_prepped = replace_prep(
+                                target_client(),
+                                [{"name": m["name"], "obj_id": m["obj_id"]}
+                                 for m in _feedback_specs(filtered_items)])
 
                     # Import tables + models first, THEN validate the leaves against the live model so
                     # viz/formula errors are caught here instead of surfacing silently at leaf import.
@@ -1410,6 +1479,10 @@ elif step == 2:
                         feedback_results = (target_client().import_tml(files_to_tml_strings(feedback))
                                             if feedback else [])
                         core_results = core_results + feedback_results
+                        # REPLACE finalize: re-point the old models' dependents onto the fresh models,
+                        # delete each old model iff it has no non-feedback dependents left.
+                        if fb_prepped:
+                            st.session_state.fb_replace_report = replace_finalize(target_client(), fb_prepped)
                         st.session_state.import_core_results = core_results
                         st.session_state.import_leaf_files   = leaves
                         leaf_errors = []
@@ -1575,6 +1648,19 @@ elif step == 3:
                     st.markdown("**Columns dropped:** " + ", ".join(f"`{c}`" for c in dropped_cols))
                 if dropped_vizs:
                     st.markdown(f"**Visualizations dropped:** {dropped_vizs}")
+
+        # Feedback Replace report (only when Replace mode rebuilt a model).
+        fb_rep = st.session_state.get("fb_replace_report")
+        if fb_rep:
+            st.markdown("**Feedback Replace**")
+            for r in fb_rep:
+                line = (f"- `{r['model']}` — target now carries only the source's feedback; "
+                        f"re-pointed {len(r['repointed'])} dependent(s)")
+                if r["failed"]:
+                    line += f"; ⚠ failed to re-point: {', '.join(r['failed'])}"
+                line += ("; old model **deleted**" if r["old_model_deleted"]
+                         else f"; old model **kept** (still has: {', '.join(r['kept_deps'])})")
+                st.markdown(line)
 
         st.divider()
 

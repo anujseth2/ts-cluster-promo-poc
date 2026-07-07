@@ -300,6 +300,73 @@ class TSClient:
                         })
         return out
 
+    # ── Spotter-feedback Replace primitives (rebuild model, re-point deps, delete old) ──
+
+    def find_by_obj_id(self, obj_id: str, obj_type: str = "LOGICAL_TABLE") -> Optional[str]:
+        """Return the guid of the object currently holding this obj_id (or None)."""
+        data = self._post("/api/rest/2.0/metadata/search",
+                          {"metadata": [{"type": obj_type}], "record_size": 5000})
+        rows = data if isinstance(data, list) else data.get("metadata", [])
+        for o in rows:
+            if o.get("metadata_obj_id") == obj_id:
+                return o.get("metadata_id")
+        return None
+
+    def real_dependents(self, model_guid: str) -> List[Dict]:
+        """Cluster-wide dependents of a model EXCLUDING its own feedback (type=FEEDBACK).
+        Feedback appears as a dependent but dies with the model, so it must not block deletion."""
+        deps = self.list_dependents([model_guid]).get(model_guid, [])
+        return [d for d in deps if d.get("type") != "FEEDBACK"]
+
+    def delete_metadata(self, obj_type: str, identifier: str) -> int:
+        """Delete a metadata object. Returns the HTTP status (204 on success)."""
+        payload = {"metadata": [{"type": obj_type, "identifier": identifier}]}
+        url = f"{self.host}/api/rest/2.0/metadata/delete"
+        resp = self._session.post(url, json=payload, timeout=60)
+        if resp.status_code == 401 and self._username and self._password:
+            self._session_login()
+            resp = self._session.post(url, json=payload, timeout=60)
+        return resp.status_code
+
+    def export_feedback_entries(self, model_guid: str) -> List[Dict]:
+        """The model's CURRENT feedback entries (list of dicts); [] if none / not exportable."""
+        for it in self.export_feedback([model_guid]):
+            edoc = it.get("edoc", "") or ""
+            doc = json.loads(edoc) if edoc.strip().startswith("{") else yaml.safe_load(edoc)
+            if isinstance(doc, dict) and "nls_feedback" in doc:
+                return (doc.get("nls_feedback", {}) or {}).get("feedback", []) or []
+        return []
+
+    def repoint_dependent(self, dep_guid: str, old_obj_id: str,
+                          new_obj_id: str, new_name: str) -> Dict:
+        """Re-bind a dependent (answer/liveboard) from old_obj_id to new_obj_id by re-importing
+        it with its model refs rewritten. Returns {name, status, error}."""
+        raw   = self.export_tml([dep_guid])
+        items = raw if isinstance(raw, list) else raw.get("object", [])
+        if not items:
+            return {"name": dep_guid, "status": "ERROR", "error": "export failed"}
+        it   = items[0]
+        edoc = it.get("edoc", "") or ""
+        doc  = json.loads(edoc) if edoc.strip().startswith("{") else yaml.safe_load(edoc)
+        name = (it.get("info") or {}).get("name", dep_guid)
+
+        def _fix(tables):
+            for t in (tables or []):
+                if isinstance(t, dict) and t.get("obj_id") == old_obj_id:
+                    t["obj_id"] = new_obj_id
+                    t["name"]   = new_name
+                    t["id"]     = new_name
+                    t.pop("fqn", None)
+
+        if "answer" in doc:
+            _fix(doc["answer"].get("tables"))
+        if "liveboard" in doc:
+            for viz in doc["liveboard"].get("visualizations", []):
+                _fix((viz.get("answer", {}) or {}).get("tables"))
+        res = self.import_tml([json.dumps(doc)], policy="ALL_OR_NONE")
+        row = res[0] if res else {}
+        return {"name": name, "status": row.get("status", "ERROR"), "error": row.get("error", "")}
+
     def update_obj_ids(self, mappings: List[Dict]) -> bool:
         """
         Set obj_id on existing objects. mappings: [{"identifier": <guid>, "new_obj_id": <str>}].

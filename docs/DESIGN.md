@@ -65,6 +65,20 @@ Legend: ✓ handled · ✗ gap · ⚠ handled but unverified live · — n/a
     system-managed `nl_context` (`EDOC_FEEDBACK_TML_INVALID`). Export → import; never author.
   - `type=FEEDBACK` export returns HTTP 400 for a model with **no** feedback; `export_feedback`
     is per-model + 400-tolerant so that no longer aborts the run.
+- **Feedback merge vs Replace** ✓ — import is additive/phrase-dedup, so default **Merge** keeps
+  the target's own feedback. There is **no API to delete feedback** (metadata/delete rejects
+  FEEDBACK; no ai/feedback endpoint; empty-array import doesn't clear). So opt-in **Replace**
+  (target ends with only source's feedback) is done by **rebuilding the model**: rename the old
+  model's obj_id to free it → normal import creates a fresh model + source feedback → re-point
+  the old model's REAL dependents (exclude `type=FEEDBACK`) onto the fresh model → delete the old
+  model iff no real deps remain (else keep + flag). Verified inter-org; behind an explicit ack.
+  `services/feedback_replace.py` + `ts_client` primitives (`find_by_obj_id`, `real_dependents`,
+  `repoint_dependent`, `delete_metadata`, `export_feedback_entries`).
+- **obj_id mechanics** ✓ — dependencies are **GUID-bound**; obj_id is a portable label.
+  Changing a model's OWN obj_id in place is safe: dependents auto-resolve to the new obj_id, no
+  edits (verified). MOVING an obj_id to a different model does NOT move dependents — re-import
+  each dependent (model ref → new obj_id) to shift them (verified). `update-obj-id` can move an
+  obj_id between objects (free, then assign).
 
 ### Open cells (the "missing pointers")
 
@@ -73,10 +87,9 @@ Legend: ✓ handled · ✗ gap · ⚠ handled but unverified live · — n/a
   `CAN_USE_SPOTTER` + edit/`SPOTTER_COACHING_PRIVILEGE`; org-scoped token). Recipe **verified**
   (get source → set target round-trips). `set` is a **full replace** (no auto-merge, unlike
   feedback), so a merge = get target + union + set. Not yet wired into the tool.
-- **Feedback merge/replace preview** — optional enhancement: before pushing, diff target vs
-  source feedback by phrase and show "add X / replace Y / keep Z", with an opt-in Replace mode
-  (delete target-only entries). The platform already merges; this is just visibility + a
-  replace option.
+- ~~Feedback merge/replace preview~~ — **BUILT** (Step-2 gate: "add X / replace Y / keep Z
+  target-only" + Merge/Replace radio; Replace rebuilds the model per above). Service-layer
+  verified inter-org; Streamlit UI wiring pending a live VM run.
 
 ## Scenarios (smoke tests to run before "done")
 
