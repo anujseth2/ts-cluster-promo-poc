@@ -72,3 +72,43 @@ def render_feedback_panel(previews) -> bool:
             "I understand Replace rebuilds the model(s) and drops target-only feedback.",
             key="ack_replace")
     return replace_ack
+
+
+def render_nl_panel(previews) -> bool:
+    """Render the NL-instructions (Spotter coaching) merge/replace preview. Returns nl_ack.
+    Mode in st.session_state['nl_mode']; Replace acknowledgment in 'ack_nl_replace'."""
+    st.markdown("#### Spotter instructions (model coaching)")
+    for pv in previews:
+        st.markdown(f"**{pv['model']}**")
+        st.caption(f"Source instructions ({len(pv['source'])}): "
+                   + ("; ".join(f"“{s}”" for s in pv["source"]) if pv["source"] else "none"))
+        if pv["target_present"]:
+            st.caption(f"On the target now ({len(pv['target'])}): "
+                       + ("; ".join(f"“{s}”" for s in pv["target"]) if pv["target"] else "none"))
+        else:
+            st.caption("On the target now: model not present yet — it will be created.")
+        parts = []
+        if pv["add"]:         parts.append(f"**{len(pv['add'])} new** added")
+        if pv["target_only"]: parts.append(f"**{len(pv['target_only'])} already on the target** the source doesn't have")
+        st.caption("On promote: " + ("; ".join(parts) if parts else "no change") + ".")
+
+    any_target_only = any(pv["target_only"] for pv in previews)
+    mode = st.radio(
+        "Instruction handling",
+        ["Merge — keep the target's own instructions (default, safe)",
+         "Replace — target ends with ONLY the source's instructions"],
+        key="nl_mode")
+    st.caption("Only GLOBAL (model-level) instructions are promoted; any user-scoped instructions "
+               "on the target are left untouched. Merge appends the source's instructions after "
+               "the target's, so please review the instruction order on the target afterward — "
+               "Spotter may weight earlier instructions more.")
+    nl_ack = True
+    if mode.startswith("Replace"):
+        st.warning(
+            "**Replace** sets the target's instructions to exactly the source's — the target's own "
+            "instructions are dropped."
+            + ("" if any_target_only else
+               "  Note: there are no target-only instructions here, so Replace and Merge match."))
+        nl_ack = st.checkbox("I understand Replace drops the target's own instructions.",
+                             key="ack_nl_replace")
+    return nl_ack

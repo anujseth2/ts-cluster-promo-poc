@@ -30,7 +30,8 @@ from services.import_diagnostics import (
 from services.table_matcher import column_signature
 from services.feedback_replace import feedback_preview, replace_prep, replace_finalize
 from services.reconcile import reconcile
-from ui_feedback import render_feedback_panel
+from services.nl_instructions import preview as nl_preview, promote as nl_promote
+from ui_feedback import render_feedback_panel, render_nl_panel
 
 load_dotenv(Path(__file__).parent / ".env")
 
@@ -99,6 +100,21 @@ def _feedback_specs(items) -> list:
             out.append({"name":   it.get("info", {}).get("name", ""),
                         "obj_id": d.get("obj_id"),
                         "entries": (d.get("nls_feedback", {}) or {}).get("feedback", []) or []})
+    return out
+
+
+def _nl_models(items) -> list:
+    """Promoted models -> [{name, obj_id, source_guid}] for NL-instruction promotion (info.id is
+    the source model guid; obj_id resolves the target model)."""
+    out = []
+    for it in items:
+        d = _parse_edoc(it.get("edoc", "{}"))
+        for k in ("model", "worksheet"):
+            node = d.get(k)
+            if isinstance(node, dict) and node.get("name"):
+                out.append({"name": node["name"], "obj_id": d.get("obj_id", ""),
+                            "source_guid": (it.get("info") or {}).get("id", "")})
+                break
     return out
 
 
@@ -417,6 +433,16 @@ if step == 0:
                                     if checked:
                                         sel.add(k)
                         st.session_state.feedback_selected = sel
+
+                # NL (Spotter coaching) instructions — separate artifact, promoted via the
+                # ai/instructions API at import (not TML). Persist the toggle like feedback.
+                if "include_nl" not in st.session_state:
+                    st.session_state["include_nl"] = st.session_state.get("_include_nl", False)
+                inc_nl = st.checkbox(
+                    "Include Spotter instructions (model coaching)", key="include_nl",
+                    help="Also promote each model's NL instructions (model-level Spotter coaching), "
+                         "via the ai/instructions API. Separate from feedback; needs Spotter 10.15+.")
+                st.session_state["_include_nl"] = inc_nl
 
             OPT_CREATE   = "Promote tables (create / update on target)"
             OPT_EXISTING = "Use existing target tables only (don't create)"
@@ -931,7 +957,8 @@ elif step == 2:
         if "transformed_items" in st.session_state:
             for _k in ("pr_url", "validation_errors", "validation_ok", "import_phase",
                        "import_core_results", "import_leaf_files", "import_leaf_errors",
-                       "silent_drops", "_fb_previews"):
+                       "silent_drops", "_fb_previews", "_nl_previews", "nl_report",
+                       "fb_replace_report"):
                 st.session_state.pop(_k, None)
         with st.spinner("Exporting TML (post-alignment) and applying the data-layer transform…"):
             raw   = source_client().export_tml(selected_ids)
@@ -1405,8 +1432,20 @@ elif step == 2:
                                 for m in fb_specs]
                     replace_ack = render_feedback_panel(st.session_state._fb_previews)
 
+                # ── Spotter NL instructions: preview + Merge/Replace ──
+                nl_models = _nl_models(filtered_items) if st.session_state.get("_include_nl") else []
+                nl_ack = True
+                if nl_models:
+                    if "_nl_previews" not in st.session_state:
+                        with st.spinner("Comparing Spotter instructions with the target…"):
+                            st.session_state._nl_previews = [
+                                {**nl_preview(source_client(), target_client(),
+                                              m["source_guid"], m["obj_id"]), "model": m["name"]}
+                                for m in nl_models]
+                    nl_ack = render_nl_panel(st.session_state._nl_previews)
+
                 if st.button("Merge & Import to Target", type="primary",
-                             disabled=not (proceed and replace_ack)):
+                             disabled=not (proceed and replace_ack and nl_ack)):
                     gc = git_client()
 
                     with st.spinner("Merging PR…"):
@@ -1477,6 +1516,13 @@ elif step == 2:
                         # delete each old model iff it has no non-feedback dependents left.
                         if fb_prepped:
                             st.session_state.fb_replace_report = replace_finalize(target_client(), fb_prepped)
+                        # NL instructions (Spotter coaching) — promoted via the ai/instructions API
+                        # now that the target model exists (not part of the TML bundle).
+                        if st.session_state.get("_include_nl"):
+                            nl_mode = ("replace" if st.session_state.get("nl_mode", "").startswith("Replace")
+                                       else "merge")
+                            st.session_state.nl_report = nl_promote(
+                                source_client(), target_client(), _nl_models(filtered_items), mode=nl_mode)
                         st.session_state.import_core_results = core_results
                         st.session_state.import_leaf_files   = leaves
                         leaf_errors = []
@@ -1701,6 +1747,19 @@ elif step == 3:
                 line += ("; old model **deleted**" if r["old_model_deleted"]
                          else f"; old model **kept** (still has: {', '.join(r['kept_deps'])})")
                 st.markdown(line)
+
+        # NL instructions (Spotter coaching) report.
+        nl_rep = st.session_state.get("nl_report")
+        if nl_rep:
+            st.markdown("**Spotter instructions**")
+            for r in nl_rep:
+                bits = []
+                if r.get("added"):   bits.append(f"added {len(r['added'])}")
+                if r.get("kept"):    bits.append(f"kept {len(r['kept'])} target-only")
+                if r.get("dropped"): bits.append(f"dropped {len(r['dropped'])} target-only")
+                flag = "✅" if r["status"] == "ok" else "⚠️"
+                st.markdown(f"- {flag} `{r['model']}` — {r['status']}"
+                            + (f" ({', '.join(bits)}); now {r['count']} instruction(s)" if r["status"] == "ok" else ""))
 
         st.divider()
 

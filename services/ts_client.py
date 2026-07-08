@@ -337,6 +337,69 @@ class TSClient:
                 return (doc.get("nls_feedback", {}) or {}).get("feedback", []) or []
         return []
 
+    # ── NL (Spotter coaching) instructions — separate from TML, ai/instructions API ──
+
+    def get_nl_instruction_blocks(self, data_source_identifier: str) -> List[Dict]:
+        """Raw NL-instruction blocks [{instructions:[...], scope:...}] for a model.
+        ai/instructions/get (Beta 10.15.0.cl+). Returns [] if none / endpoint unavailable /
+        no access. Scope is GLOBAL-only today; a future data-model-user scope would appear as
+        additional blocks here, so callers can inspect/preserve them rather than flattening."""
+        try:
+            d = self._post("/api/rest/2.0/ai/instructions/get",
+                           {"data_source_identifier": data_source_identifier})
+        except requests.HTTPError:
+            return []
+        return [b for b in (d.get("nl_instructions_info") or []) if isinstance(b, dict)]
+
+    def get_nl_instructions(self, data_source_identifier: str, scope: str = "GLOBAL") -> List[str]:
+        """A model's NL instructions for ONE scope (default GLOBAL) as a flat list of strings.
+        Deliberately scoped: only GLOBAL exists today, and reading per-scope stops a future
+        non-GLOBAL (e.g. data-model-user) block from being read/promoted as if it were global."""
+        out: List[str] = []
+        for blk in self.get_nl_instruction_blocks(data_source_identifier):
+            if (blk.get("scope") or "GLOBAL") == scope:
+                out.extend(blk.get("instructions") or [])
+        return out
+
+    def set_nl_instruction_blocks(self, data_source_identifier: str,
+                                  blocks: List[Dict]) -> bool:
+        """Set (FULL REPLACE of the whole model) NL-instruction blocks verbatim, preserving each
+        block's own scope. ai/instructions/set is a full replace, so callers that want to touch
+        only one scope must pass the other scopes' blocks back in unchanged (see
+        nl_instructions.promote).
+
+        Clearing gotcha (verified live): the API rejects an empty nl_instructions_info list with
+        400 'Empty Scope is not allowed'. To CLEAR a scope you must send a block with a valid
+        scope and an empty instructions array. So we keep empty-instruction blocks (they mean
+        'clear this scope'), and if the caller passes no blocks at all we express that as clearing
+        the GLOBAL scope."""
+        info = [{"instructions": list(b.get("instructions") or []),
+                 "scope": b.get("scope") or "GLOBAL"}
+                for b in blocks]
+        if not info:
+            info = [{"instructions": [], "scope": "GLOBAL"}]   # clear GLOBAL (empty list would 400)
+        payload = {"data_source_identifier": data_source_identifier, "nl_instructions_info": info}
+        url = f"{self.host}/api/rest/2.0/ai/instructions/set"
+        resp = self._session.post(url, json=payload, timeout=60)
+        if resp.status_code == 401 and self._username and self._password:
+            self._session_login()
+            resp = self._session.post(url, json=payload, timeout=60)
+        if resp.status_code not in (200, 204):
+            return False
+        try:
+            return bool(resp.json().get("success", True))
+        except ValueError:
+            return True
+
+    def set_nl_instructions(self, data_source_identifier: str,
+                            instructions: List[str], scope: str = "GLOBAL") -> bool:
+        """Convenience single-scope setter. WARNING: because set is a full replace, this drops any
+        OTHER-scope blocks on the model. To preserve other scopes, read blocks first and use
+        set_nl_instruction_blocks. Needs CAN_USE_SPOTTER + edit/SPOTTER_COACHING_PRIVILEGE +
+        an org-scoped token."""
+        return self.set_nl_instruction_blocks(
+            data_source_identifier, [{"instructions": instructions, "scope": scope}])
+
     def repoint_dependent(self, dep_guid: str, old_obj_id: str,
                           new_obj_id: str, new_name: str) -> Dict:
         """Re-bind a dependent (answer/liveboard) from old_obj_id to new_obj_id by re-importing
