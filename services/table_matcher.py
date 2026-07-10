@@ -73,12 +73,19 @@ def physical_coords(doc):
     }
 
 
-def column_signature(doc):
+def column_signature(doc, casefold=True):
     """{physical_column_name -> data_type}, keyed on the warehouse column name
-    (db_column_name) so edited display names don't break matching."""
+    (db_column_name) so edited display names don't break matching.
+
+    casefold=True (default) lowercases the column-name key — right for the fuzzy MATCHER,
+    which must find a renamed/drifted counterpart regardless of case. casefold=False keeps the
+    key case-exact — right for the prune/add DECISION, so a column that differs only in case
+    (Revenue vs revenue) is treated as a genuine difference, not silently conflated. The data
+    type is always compared case-insensitively (types like INT64 are not case-significant)."""
+    keyf = _lower if casefold else (lambda s: (s or "").strip())
     sig = {}
     for c in (doc.get("table", {}) or {}).get("columns", []) or []:
-        col = _lower(c.get("db_column_name") or c.get("name"))
+        col = keyf(c.get("db_column_name") or c.get("name"))
         if not col:
             continue
         sig[col] = _lower((c.get("db_column_properties") or {}).get("data_type", ""))

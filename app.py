@@ -118,6 +118,14 @@ def _nl_models(items) -> list:
     return out
 
 
+def _name_slug(name: str) -> str:
+    """A stable obj_id slug derived from an object's name (used to pre-fill obj_id suggestions
+    for objects that have none). Non-alphanumerics become underscores, repeats collapse."""
+    s = "".join(c if (c.isalnum() or c == "_") else "_" for c in (name or "").strip())
+    s = "_".join(p for p in s.split("_") if p)
+    return s.lower() or "obj"
+
+
 # ── Clients (cached per session) ──────────────────────────────────────────────
 
 def _make_client(prefix: str) -> TSClient:
@@ -183,6 +191,19 @@ st.title("ThoughtSpot Cross-Cluster Promotion")
 teams = load_teams()
 
 with st.sidebar:
+    _hc1, _hc2 = st.columns(2)
+    with _hc1:
+        if st.button("🏠 Home", use_container_width=True,
+                     help="Back to the first page — keeps your current work"):
+            _go(0)
+    with _hc2:
+        if st.button("↺ Reset", use_container_width=True,
+                     help="Clear everything and start a fresh promotion"):
+            for _k in list(st.session_state.keys()):
+                del st.session_state[_k]
+            st.session_state.step = 0
+            st.rerun()
+    st.divider()
     st.header("Team")
     team_name = st.selectbox("Select team", list(teams.keys()))
     team_cfg  = teams[team_name]
@@ -343,6 +364,7 @@ if step == 0:
             st.session_state._resolved_key   = sel_key
             st.session_state.pop("excluded", None)
             st.session_state.pop("prune_tables", None)
+            st.session_state.pop("prune_ack_sig", None)
             for _k in ("obj_id_status", "_raw_items", "table_alignment", "prod_by_name",
                        "prod_leaf", "dev_table_refs", "dev_model_refs", "dev_leaf_refs",
                        "transformed_items", "match_results", "table_remap"):
@@ -387,7 +409,7 @@ if step == 0:
                         # New model set: drop stale per-item checkbox widget state so the
                         # picker rebuilds against the current feedback list.
                         for _wk in [k for k in list(st.session_state.keys())
-                                    if k.startswith("fbchk_")]:
+                                    if k.startswith("fbchk_") or k == "fb_picker"]:
                             del st.session_state[_wk]
                         with st.spinner("Loading Spotter feedback…"):
                             st.session_state._fb_items = \
@@ -403,36 +425,42 @@ if step == 0:
                         st.session_state.feedback_selected = set()
                     else:
                         prev_sel = st.session_state.get("feedback_selected", set())
-                        groups = [
-                            ("Reference questions",
-                             [e for e in fb_entries if e["type"] == "REFERENCE_QUESTION"]),
-                            ("Business terms",
-                             [e for e in fb_entries if e["type"] == "BUSINESS_TERM"]),
-                            ("Other",
-                             [e for e in fb_entries if e["type"]
-                              not in ("REFERENCE_QUESTION", "BUSINESS_TERM")]),
-                        ]
                         multi_model = len({e["model"] for e in fb_entries}) > 1
-                        sel = set()
+                        type_label  = {"REFERENCE_QUESTION": "Reference question",
+                                       "BUSINESS_TERM": "Business term"}
+                        # Tabular picker (like the NL box). Select-only: phrases/tokens are read-only
+                        # because editing feedback tokens breaks the system-managed nl_context.
+                        keys, rows = [], []
+                        for e in fb_entries:
+                            keys.append(feedback_key(e["model"], e["type"], e["phrase"]))
+                            row = {"Promote": True,
+                                   "Type": type_label.get(e["type"], e["type"] or "Other"),
+                                   "Feedback": e["phrase"] or "(unnamed)",
+                                   "Maps to columns": e.get("tokens") or ""}
+                            if multi_model:
+                                row["Model"] = e["model"]
+                            rows.append(row)
+                        col_order = (["Promote", "Type", "Feedback", "Maps to columns"]
+                                     + (["Model"] if multi_model else []))
+                        cfg = {
+                            "Promote": st.column_config.CheckboxColumn("Promote", width="small"),
+                            "Type": st.column_config.TextColumn("Type", disabled=True, width="small"),
+                            "Feedback": st.column_config.TextColumn("Feedback", disabled=True, width="large"),
+                            "Maps to columns": st.column_config.TextColumn("Maps to columns", disabled=True),
+                        }
+                        if multi_model:
+                            cfg["Model"] = st.column_config.TextColumn("Model", disabled=True)
                         with st.expander(
                                 f"Choose feedback to promote "
-                                f"({len(prev_sel)} of {len(fb_entries)} selected)", expanded=True):
-                            for gi, (glabel, grp) in enumerate(groups):
-                                if not grp:
-                                    continue
-                                st.markdown(f"**{glabel}**")
-                                for ei, e in enumerate(grp):
-                                    k = feedback_key(e["model"], e["type"], e["phrase"])
-                                    label = e["phrase"] or "(unnamed)"
-                                    if multi_model:
-                                        label = f"{label}  ·  _{e['model']}_"
-                                    checked = st.checkbox(
-                                        label, value=(k in prev_sel), key=f"fbchk_{gi}_{ei}",
-                                        help=(f"maps to columns: {e['tokens']}"
-                                              if e["tokens"] else None))
-                                    if checked:
-                                        sel.add(k)
-                        st.session_state.feedback_selected = sel
+                                f"({len(prev_sel)} of {len(fb_entries)} selected)", expanded=False):
+                            st.caption("One row = one reference question / business term. Tick "
+                                       "**Promote** to carry it over; **Maps to columns** shows the "
+                                       "columns each one references.")
+                            grid = st.data_editor(
+                                pd.DataFrame(rows)[col_order], key="fb_picker", hide_index=True,
+                                use_container_width=True, num_rows="fixed", column_config=cfg)
+                        st.session_state.feedback_selected = {
+                            keys[i] for i, p in enumerate(grid["Promote"].tolist()) if bool(p)}
 
                 # NL (Spotter coaching) instructions — separate artifact, promoted via the
                 # ai/instructions API at import (not TML). Persist the toggle like feedback.
@@ -443,6 +471,46 @@ if step == 0:
                     help="Also promote each model's NL instructions (model-level Spotter coaching), "
                          "via the ai/instructions API. Separate from feedback; needs Spotter 10.15+.")
                 st.session_state["_include_nl"] = inc_nl
+                if inc_nl:
+                    # Load the source models' instructions once per model set, then show an editable
+                    # box (like the feedback picker) so the operator can edit/add/remove before
+                    # promoting. The edited text is what gets promoted at the import gate.
+                    nl_set_key = tuple(dep["model_ids"])
+                    if st.session_state.get("_nl_loaded_key") != nl_set_key:
+                        with st.spinner("Loading Spotter instructions…"):
+                            st.session_state._nl_src = {
+                                g: source_client().get_nl_instructions(g) for g in dep["model_ids"]}
+                        st.session_state._nl_loaded_key = nl_set_key
+                        for _wk in [k for k in list(st.session_state.keys()) if k.startswith("nl_edit_")]:
+                            del st.session_state[_wk]   # drop stale editors for a new model set
+                    nl_src = st.session_state.get("_nl_src", {})
+                    total  = sum(len(v) for v in nl_src.values())
+                    if not total:
+                        st.caption("No Spotter instructions found on the selected model(s).")
+                        st.session_state._nl_edited = {}
+                    else:
+                        edited = {}
+                        with st.expander(f"Spotter instructions ({total} found) — edit before promoting",
+                                         expanded=False):
+                            st.caption("One row = one instruction. Edit a cell, add a row at the bottom, "
+                                       "or select a row and delete it. The table is exactly what gets "
+                                       "promoted (Merge or Replace at the import gate).")
+                            models_with = [g for g in dep["model_ids"] if nl_src.get(g)]
+                            for g in models_with:
+                                if len(models_with) > 1:      # label only when several models (like feedback)
+                                    st.markdown(f"**{id2name.get(g, g)}**")
+                                grid = st.data_editor(
+                                    pd.DataFrame({"Instruction": nl_src.get(g, [])}),
+                                    key=f"nl_edit_{g}", num_rows="dynamic", hide_index=True,
+                                    use_container_width=True,
+                                    column_config={"Instruction": st.column_config.TextColumn(
+                                        "Instruction", width="large")})
+                                # dropna() drops the blank trailing/added rows; then trim empties.
+                                edited[g] = [s for s in
+                                             (str(v).strip() for v in grid["Instruction"].dropna().tolist())
+                                             if s]
+                        st.session_state._nl_edited = edited
+                        st.session_state.pop("_nl_previews", None)   # reflect edits at the gate
 
             OPT_CREATE   = "Promote tables (create / update on target)"
             OPT_EXISTING = "Use existing target tables only (don't create)"
@@ -479,6 +547,8 @@ if step == 0:
 
             # Tables: untick = skip (bind to the target copy) when on target; when NOT on target
             # it must be pruned out of the model — show the blast radius and require an ack.
+            pending_prune = []   # not-on-target tables unticked -> pruned via ONE gate below
+            safe_skips    = []   # on-target tables unticked -> bind to target's copy (nothing dropped)
             for i in dep["table_ids"]:
                 nm     = id2name.get(i, i)
                 on_tgt = nm in present
@@ -491,27 +561,58 @@ if step == 0:
                 elif on_tgt:
                     excluded.add(i)
                     prune.discard(nm)   # safe skip: the model binds to the target's copy
+                    safe_skips.append(nm)
                 else:
                     excluded.add(i)
-                    pv = table_drop_preview(promo_items, nm)
-                    with st.expander(f"Dropping `{nm}` from the model will remove:", expanded=True):
-                        shown = False
+                    prune.discard(nm)
+                    pending_prune.append((nm, table_drop_preview(promo_items, nm)))
+
+            # ONE gate for every not-on-target table being pruned: list all removals at once,
+            # then a single explicit acknowledgement BUTTON (deliberately not a checkbox, so it
+            # does not look like the selection ticks above).
+            if pending_prune:
+                sig   = frozenset(nm for nm, _ in pending_prune)
+                acked = st.session_state.get("prune_ack_sig") == sig
+                st.divider()
+                st.markdown(f"##### Dropping {len(pending_prune)} table(s) from the model")
+                st.caption("These tables are not on the target, so they will be pruned out of the "
+                           "model on promotion. Expand a table to see exactly what is removed, then "
+                           "acknowledge once.")
+                for nm, pv in pending_prune:
+                    counts = []
+                    if pv["columns"]:  counts.append(f"{len(pv['columns'])} column(s)")
+                    if pv["joins"]:    counts.append(f"{len(pv['joins'])} join(s)")
+                    if pv["formulas"]: counts.append(f"{len(pv['formulas'])} formula(s)")
+                    if pv["vizzes"]:   counts.append(f"{len(pv['vizzes'])} viz(s)")
+                    head = f"`{nm}` — removes " + (", ".join(counts) if counts else "nothing else (clean)")
+                    with st.expander(head, expanded=False):
                         if pv["columns"]:
-                            st.markdown("**Columns:** " + ", ".join(f"`{c}`" for c in pv["columns"])); shown = True
+                            st.markdown("**Columns:** " + ", ".join(f"`{c}`" for c in pv["columns"]))
                         if pv["joins"]:
-                            st.markdown("**Joins:** " + ", ".join(pv["joins"])); shown = True
+                            st.markdown("**Joins:** " + ", ".join(pv["joins"]))
                         if pv["formulas"]:
-                            st.markdown("**Formulas:** " + ", ".join(pv["formulas"])); shown = True
+                            st.markdown("**Formulas:** " + ", ".join(pv["formulas"]))
                         if pv["vizzes"]:
-                            st.markdown("**Visualizations:** " + ", ".join(str(v) for v in pv["vizzes"])); shown = True
-                        if not shown:
+                            st.markdown("**Visualizations:** " + ", ".join(str(v) for v in pv["vizzes"]))
+                        if not counts:
                             st.caption("Nothing else in the promotion depends on it — clean removal.")
-                    if st.checkbox(f"I'm OK dropping `{nm}` and the above from the model",
-                                   key=f"ackprune_{i}"):
+                if acked:
+                    for nm, _ in pending_prune:
                         prune.add(nm)
-                    else:
-                        prune.discard(nm)
+                    st.success(f"Acknowledged — {len(pending_prune)} table(s) will be dropped from the model.")
+                else:
+                    for nm, _ in pending_prune:
                         unsafe.append(nm)
+                    if st.button(f"Acknowledge and drop {len(pending_prune)} table(s) from the model",
+                                 type="primary", key="ack_prune_all"):
+                        st.session_state.prune_ack_sig = sig
+                        st.rerun()
+            else:
+                st.session_state.pop("prune_ack_sig", None)
+
+            if safe_skips:
+                st.caption("Left out but already on the target — the model binds to the target's "
+                           "copy, nothing is dropped: " + ", ".join(f"`{n}`" for n in safe_skips))
 
             st.session_state.excluded     = excluded
             st.session_state.prune_tables = prune
@@ -579,8 +680,9 @@ elif step == 1:
                     status_rows.append({
                         "object": obj_name,
                         "type":   obj_type,
-                        "obj_id": oid,
-                        "ok":     bool(oid),
+                        # No obj_id yet -> pre-fill a suggested name slug (still needs Apply).
+                        "obj_id": oid or _name_slug(obj_name),
+                        "ok":     bool(oid),   # real state: a suggestion is not yet applied
                     })
 
                 # Part B: obj_id of every logical object (table, model, liveboard, answer) —
@@ -675,7 +777,8 @@ elif step == 1:
         if not missing_objs:
             st.success("All selected objects have `obj_id` set.")
         else:
-            st.warning(f"{len(missing_objs)} object(s) missing `obj_id`.")
+            st.warning(f"{len(missing_objs)} object(s) missing `obj_id` — pre-filled with a suggested "
+                       "slug from the name. Edit if needed, then click **Apply** to set them.")
 
         df_obj = pd.DataFrame(status)[["object", "type", "obj_id", "ok"]]
         edited_status = st.data_editor(
@@ -1437,10 +1540,13 @@ elif step == 2:
                 nl_ack = True
                 if nl_models:
                     if "_nl_previews" not in st.session_state:
+                        _nl_edited = st.session_state.get("_nl_edited", {})
                         with st.spinner("Comparing Spotter instructions with the target…"):
                             st.session_state._nl_previews = [
                                 {**nl_preview(source_client(), target_client(),
-                                              m["source_guid"], m["obj_id"]), "model": m["name"]}
+                                              m["source_guid"], m["obj_id"],
+                                              source_instructions=_nl_edited.get(m["source_guid"])),
+                                 "model": m["name"]}
                                 for m in nl_models]
                     nl_ack = render_nl_panel(st.session_state._nl_previews)
 
@@ -1522,7 +1628,8 @@ elif step == 2:
                             nl_mode = ("replace" if st.session_state.get("nl_mode", "").startswith("Replace")
                                        else "merge")
                             st.session_state.nl_report = nl_promote(
-                                source_client(), target_client(), _nl_models(filtered_items), mode=nl_mode)
+                                source_client(), target_client(), _nl_models(filtered_items),
+                                mode=nl_mode, source_map=st.session_state.get("_nl_edited"))
                         st.session_state.import_core_results = core_results
                         st.session_state.import_leaf_files   = leaves
                         leaf_errors = []

@@ -20,9 +20,12 @@ Instructions are plain strings (deduped exactly). Verified inter-org on ps-inter
 from typing import Dict, List
 
 
-def preview(source_client, target_client, source_model_guid: str, target_obj_id: str) -> Dict:
-    """Diff source vs target NL instructions for one model."""
-    src = source_client.get_nl_instructions(source_model_guid)
+def preview(source_client, target_client, source_model_guid: str, target_obj_id: str,
+            source_instructions=None) -> Dict:
+    """Diff source vs target NL instructions for one model. If source_instructions is provided
+    (operator-edited on the select page), it is used verbatim instead of re-fetching the source."""
+    src = list(source_instructions) if source_instructions is not None \
+        else source_client.get_nl_instructions(source_model_guid)
     tgt_guid = target_client.find_by_obj_id(target_obj_id)
     tgt = target_client.get_nl_instructions(tgt_guid) if tgt_guid else []
     return {
@@ -35,13 +38,18 @@ def preview(source_client, target_client, source_model_guid: str, target_obj_id:
     }
 
 
-def promote(source_client, target_client, models: List[Dict], mode: str = "merge") -> List[Dict]:
+def promote(source_client, target_client, models: List[Dict], mode: str = "merge",
+            source_map=None) -> List[Dict]:
     """models: [{name, obj_id, source_guid}]. mode: 'merge' (union) | 'replace' (source only).
-    Promotes GLOBAL instructions only; preserves any non-GLOBAL target block unchanged.
-    Returns a per-model report."""
+    source_map: optional {source_guid: [instructions]} of operator-edited instructions to promote
+    instead of the source's current ones. Promotes GLOBAL instructions only; preserves any
+    non-GLOBAL target block unchanged. Returns a per-model report."""
     report = []
     for m in models:
-        src = source_client.get_nl_instructions(m["source_guid"])          # GLOBAL only
+        if source_map is not None and m["source_guid"] in source_map:
+            src = list(source_map[m["source_guid"]])                       # operator-edited
+        else:
+            src = source_client.get_nl_instructions(m["source_guid"])      # GLOBAL only
         tgt_guid = target_client.find_by_obj_id(m["obj_id"])
         if not tgt_guid:
             report.append({"model": m["name"], "status": "target model not found",

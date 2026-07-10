@@ -119,7 +119,11 @@ def silent_drop_findings(source_table_docs, target_docs_by_name):
         tgt = target_docs_by_name.get(t.get("name"))
         if not tgt:
             continue   # not on target yet -> created fresh, nothing dropped
-        diff = compare_columns(column_signature(d), column_signature(tgt))
+        # Case-EXACT compare: a target column that differs from the source only by case is a real
+        # column that would be dropped, so it must be flagged (not folded away by the matcher's
+        # case-insensitive signature).
+        diff = compare_columns(column_signature(d, casefold=False),
+                               column_signature(tgt, casefold=False))
         if diff["extra_on_target"]:
             out.append({"table": t.get("name"), "columns": diff["extra_on_target"]})
     return out
