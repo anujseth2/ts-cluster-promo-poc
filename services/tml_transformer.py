@@ -105,6 +105,7 @@ def transform_doc(
     db_map: Optional[dict] = None,
     schema_map: Optional[dict] = None,
     table_remap: Optional[dict] = None,
+    column_case_map: Optional[dict] = None,
 ) -> Tuple[dict, List[str]]:
     """
     Apply the data-layer transforms to a single TML document dict.
@@ -114,11 +115,18 @@ def transform_doc(
     table matcher. When a physical table is a matched pair, its binding is repointed to the
     TARGET table's actual db/schema/db_table (so a renamed physical table still binds). This
     wins over the static db_map/schema_map; unmatched tables fall back to those.
+
+    column_case_map: {source_table_name_lower -> {db_column_name_lower -> target_actual_case}}.
+    Some warehouses bind external columns case-sensitively, so a source column CID cannot import
+    against a target warehouse column cid. When the two match case-insensitively we recase ONLY
+    the physical db_column_name to the target's casing; the logical `name` is left untouched so
+    joins, formulas, and visualizations that reference it by name are unaffected.
     """
     warnings = []
     db_map    = db_map or {}
     schema_map = schema_map or {}
     table_remap = table_remap or {}
+    column_case_map = column_case_map or {}
 
     # Feedback (Spotter reference questions + business terms) has no data layer. Keep obj_id
     # for cross-cluster identity, drop the cluster-local guid, and remap nothing — its column
@@ -146,6 +154,17 @@ def transform_doc(
                     obj[k] = tr[k]
         else:
             _remap_location(obj, db_map, schema_map)
+
+        # Align column casing to the target warehouse (case-sensitive binding). Recase only
+        # db_column_name; leave the logical `name` alone so references by name still resolve.
+        cc = column_case_map.get((obj.get("name", "") or "").strip().lower())
+        if cc:
+            for col in obj.get("columns", []) or []:
+                dbn = col.get("db_column_name")
+                if dbn:
+                    tgt = cc.get(dbn.strip().lower())
+                    if tgt and tgt != dbn:
+                        col["db_column_name"] = tgt
 
     elif typ in ("model", "worksheet"):
         # Model references tables by name + fqn; strip fqn so import resolves by obj_id.
@@ -190,6 +209,7 @@ def transform_items(
     db_map: Optional[dict] = None,
     schema_map: Optional[dict] = None,
     table_remap: Optional[dict] = None,
+    column_case_map: Optional[dict] = None,
 ) -> Tuple[List[dict], List[dict]]:
     """
     Transform a list of raw API items (each with 'edoc' string + 'info' dict).
@@ -205,7 +225,7 @@ def transform_items(
         doc  = json.loads(edoc) if edoc.strip().startswith("{") else yaml.safe_load(edoc)
 
         doc, warns = transform_doc(doc, source_connection, target_connection,
-                                   db_map, schema_map, table_remap)
+                                   db_map, schema_map, table_remap, column_case_map)
         for w in warns:
             all_warnings.append({"object": name, "issue": w})
 

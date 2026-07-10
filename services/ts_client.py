@@ -312,6 +312,38 @@ class TSClient:
                 return o.get("metadata_id")
         return None
 
+    def table_column_cases(self, table_names) -> Dict[str, Dict[str, str]]:
+        """{table_name.lower(): {db_column_name.lower(): actual_db_column_name}} for the named
+        tables as they exist on THIS cluster. Used to align a promoted table's column casing to
+        the target warehouse (some warehouses bind external columns case-sensitively)."""
+        out: Dict[str, Dict[str, str]] = {}
+        names = [n for n in (table_names or []) if n]
+        if not names:
+            return out
+        name_to_id = self._resolve_names_to_ids(names, "LOGICAL_TABLE")
+        ids = list(name_to_id.values())
+        if not ids:
+            return out
+        raw   = self.export_tml(ids)
+        items = raw if isinstance(raw, list) else raw.get("object", [])
+        for it in items:
+            edoc = it.get("edoc", "") or ""
+            try:
+                doc = json.loads(edoc) if edoc.strip().startswith("{") else yaml.safe_load(edoc)
+            except (ValueError, yaml.YAMLError):
+                continue
+            t = (doc or {}).get("table")
+            if not t or not t.get("name"):
+                continue
+            cmap = {}
+            for c in t.get("columns", []) or []:
+                dbn = c.get("db_column_name")
+                if dbn:
+                    cmap[dbn.strip().lower()] = dbn
+            if cmap:
+                out[t["name"].strip().lower()] = cmap
+        return out
+
     def real_dependents(self, model_guid: str) -> List[Dict]:
         """Cluster-wide dependents of a model EXCLUDING its own feedback (type=FEEDBACK).
         Feedback appears as a dependent but dies with the model, so it must not block deletion."""

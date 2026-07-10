@@ -118,6 +118,16 @@ def _nl_models(items) -> list:
     return out
 
 
+def _humanize(msg: str) -> str:
+    """Turn ThoughtSpot's HTML-flecked error strings into plain text: <br/> becomes a line
+    break, <b>..</b> becomes markdown bold. Returns the cleaned string."""
+    s = str(msg or "")
+    for br in ("<br/>", "<br />", "<br>"):
+        s = s.replace(br, "\n")
+    s = s.replace("<b>", "**").replace("</b>", "**")
+    return s.strip()
+
+
 def _name_slug(name: str) -> str:
     """A stable obj_id slug derived from an object's name (used to pre-fill obj_id suggestions
     for objects that have none). Non-alphanumerics become underscores, repeats collapse."""
@@ -1085,6 +1095,21 @@ elif step == 2:
                     fb_items = filter_feedback(
                         fb_items, st.session_state.get("feedback_selected"))
                     items = items + fb_items
+            # Align promoted table columns to the TARGET warehouse's casing. Some warehouses bind
+            # external columns case-sensitively (e.g. Databricks), so a source column CID cannot
+            # import against a target column cid. Read the target's actual casing for the tables
+            # being promoted and recase db_column_name to match (logical names are left alone).
+            promoted_tables = []
+            for it in items:
+                d = _parse_edoc(it.get("edoc", "{}"))
+                if "table" in d and (d["table"] or {}).get("name"):
+                    promoted_tables.append(d["table"]["name"])
+            column_case_map = {}
+            if promoted_tables:
+                try:
+                    column_case_map = target_client().table_column_cases(promoted_tables)
+                except Exception:
+                    column_case_map = {}
             transformed_items, warnings = transform_items(
                 items,
                 source_connection=teams[team_name].get("source_connection", ""),
@@ -1092,6 +1117,7 @@ elif step == 2:
                 db_map=teams[team_name].get("db_map", {}),
                 schema_map=teams[team_name].get("schema_map", {}),
                 table_remap=st.session_state.get("table_remap", {}),
+                column_case_map=column_case_map,
             )
             # Prune any tables the user chose to drop out of the model (not-on-target excludes).
             prune = st.session_state.get("prune_tables", set())
@@ -1430,7 +1456,11 @@ elif step == 2:
             if other:
                 st.markdown("#### Other validation errors")
                 for f in other:
-                    st.markdown(f"- **{f['object']}**: {f['error']}")
+                    st.markdown(f"**{f['object']}**")
+                    for line in _humanize(f["error"]).split("\n"):
+                        line = line.strip()
+                        if line:
+                            st.markdown(f"- {line}")
 
         elif val_ok or val_ok == []:
             tbls = mdls = leaves = 0
