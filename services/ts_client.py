@@ -312,6 +312,85 @@ class TSClient:
                 return o.get("metadata_id")
         return None
 
+    def _connection_meta(self, identifier: str):
+        """(connection_guid, inferred_auth_type) for a connection, from its stored config.
+        The auth type is inferred from the configuration keys; None if unrecognised."""
+        try:
+            r = self._post("/api/rest/2.0/connection/search",
+                           {"connections": [{"identifier": identifier}], "include_details": True,
+                            "record_size": -1, "record_offset": 0})
+        except requests.HTTPError:
+            return None, None
+        rows = r if isinstance(r, list) else r.get("connection", [])
+        if not rows:
+            return None, None
+        c   = rows[0]
+        cid = c.get("id")
+        cfg = (c.get("details") or {}).get("configuration")
+        if isinstance(cfg, str):
+            try:
+                cfg = json.loads(cfg)
+            except ValueError:
+                cfg = {}
+        keys = set((cfg or {}).keys())
+        if "personal_access_token" in keys:
+            auth = "PERSONAL_ACCESS_TOKEN"
+        elif keys & {"oauth_client_id", "client_id", "oauth_client_secret", "client_secret"}:
+            auth = "OAUTH_WITH_SERVICE_PRINCIPAL"
+        else:
+            auth = None
+        return cid, auth
+
+    def connection_column_cases(self, connection_identifier: str, tables) -> Dict[str, Dict[str, str]]:
+        """Read the WAREHOUSE's true column casing straight from the connection (no logical table
+        needed, no warehouse secret — ThoughtSpot uses the connection's stored credential).
+
+        tables: [{"name": <ts table name>, "database", "schema", "table" (db_table)}].
+        Returns {name.lower(): {col.lower(): actual_case}}. The connection's own auth type is
+        used; if the guess is off we fall back across the valid types until columns come back."""
+        out: Dict[str, Dict[str, str]] = {}
+        dwos = [{"database": t.get("database", ""), "schema": t.get("schema", ""),
+                 "table": t.get("table", "")} for t in tables if t.get("table")]
+        if not dwos:
+            return out
+        cid, auth = self._connection_meta(connection_identifier)
+        if not cid:
+            return out
+        by_dbtable = {(t.get("table") or "").strip().lower(): t.get("name") for t in tables}
+        candidates = [a for a in (auth, "PERSONAL_ACCESS_TOKEN", "OAUTH_WITH_SERVICE_PRINCIPAL",
+                                  "OAUTH_WITH_PKCE") if a]
+        seen = set(); candidates = [a for a in candidates if not (a in seen or seen.add(a))]
+        for auth_try in candidates:
+            body = {"connections": [{"identifier": cid, "data_warehouse_objects": dwos}],
+                    "data_warehouse_object_type": "COLUMN", "authentication_type": auth_try,
+                    "record_size": -1, "record_offset": 0}
+            try:
+                data = self._session.post(f"{self.host}/api/rest/2.0/connection/search",
+                                          json=body, timeout=120).json()
+            except (ValueError, requests.RequestException):
+                continue
+            rows = data if isinstance(data, list) else [data]
+            for c in rows:
+                dwo = c.get("data_warehouse_objects") if isinstance(c, dict) else None
+                if not dwo:
+                    continue
+                for db in dwo.get("databases", []) or []:
+                    for sch in db.get("schemas", []) or []:
+                        for t in sch.get("tables", []) or []:
+                            ts_name = by_dbtable.get((t.get("name") or "").strip().lower())
+                            if not ts_name:
+                                continue
+                            cmap = {}
+                            for col in t.get("columns", []) or []:
+                                nm = col.get("name")
+                                if nm:
+                                    cmap[nm.strip().lower()] = nm
+                            if cmap:
+                                out[ts_name.strip().lower()] = cmap
+            if out:
+                return out
+        return out
+
     def table_column_cases(self, table_names) -> Dict[str, Dict[str, str]]:
         """{table_name.lower(): {db_column_name.lower(): actual_db_column_name}} for the named
         tables as they exist on THIS cluster. Used to align a promoted table's column casing to

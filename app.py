@@ -1097,19 +1097,41 @@ elif step == 2:
                     items = items + fb_items
             # Align promoted table columns to the TARGET warehouse's casing. Some warehouses bind
             # external columns case-sensitively (e.g. Databricks), so a source column CID cannot
-            # import against a target column cid. Read the target's actual casing for the tables
-            # being promoted and recase db_column_name to match (logical names are left alone).
-            promoted_tables = []
+            # import against a target column cid. Primary source of truth is the TARGET connection
+            # (ThoughtSpot reads the warehouse with its stored credential — no secret needed, works
+            # even when the table isn't a logical table on the target yet). Fall back to reading an
+            # existing target logical table's casing if the connection can't be queried.
+            _dbm = teams[team_name].get("db_map", {})
+            _scm = teams[team_name].get("schema_map", {})
+            _trm = st.session_state.get("table_remap", {})
+            promoted, names = [], []
             for it in items:
-                d = _parse_edoc(it.get("edoc", "{}"))
-                if "table" in d and (d["table"] or {}).get("name"):
-                    promoted_tables.append(d["table"]["name"])
+                t = (_parse_edoc(it.get("edoc", "{}")).get("table") or {})
+                if not t.get("name"):
+                    continue
+                nm = t["name"]; names.append(nm)
+                tr = _trm.get(nm.strip().lower(), {})
+                promoted.append({
+                    "name":     nm,
+                    "database": _dbm.get(t.get("db", ""), t.get("db", "")),
+                    "schema":   _scm.get(t.get("schema", ""), t.get("schema", "")),
+                    "table":    tr.get("db_table") or t.get("db_table", ""),
+                })
             column_case_map = {}
-            if promoted_tables:
+            tgt_conn = teams[team_name].get("target_connection", "")
+            if promoted and tgt_conn:
                 try:
-                    column_case_map = target_client().table_column_cases(promoted_tables)
+                    column_case_map = target_client().connection_column_cases(tgt_conn, promoted)
                 except Exception:
                     column_case_map = {}
+            # Fallback: any table the connection didn't cover -> read an existing target table.
+            uncovered = [n for n in names if n.strip().lower() not in column_case_map]
+            if uncovered:
+                try:
+                    for k, v in target_client().table_column_cases(uncovered).items():
+                        column_case_map.setdefault(k, v)
+                except Exception:
+                    pass
             transformed_items, warnings = transform_items(
                 items,
                 source_connection=teams[team_name].get("source_connection", ""),
