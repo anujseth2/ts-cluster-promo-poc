@@ -335,8 +335,11 @@ class TSClient:
         keys = set((cfg or {}).keys())
         if "personal_access_token" in keys:
             auth = "PERSONAL_ACCESS_TOKEN"
-        elif keys & {"oauth_client_id", "client_id", "oauth_client_secret", "client_secret"}:
+        elif keys & {"oauth_client_id", "oauth_client_secret"}:
             auth = "OAUTH_WITH_SERVICE_PRINCIPAL"
+        elif "user" in keys and "password" in keys:
+            # Databricks "Service Account" auth stores user (often literally "token") + password.
+            auth = "SERVICE_ACCOUNT"
         else:
             auth = None
         return cid, auth
@@ -362,8 +365,8 @@ class TSClient:
         if not cid:
             return out
         by_dbtable = {(t.get("table") or "").strip().lower(): t.get("name") for t in tables}
-        candidates = [a for a in (auth, "PERSONAL_ACCESS_TOKEN", "OAUTH_WITH_SERVICE_PRINCIPAL",
-                                  "OAUTH_WITH_PKCE") if a]
+        candidates = [a for a in (auth, "SERVICE_ACCOUNT", "PERSONAL_ACCESS_TOKEN",
+                                  "OAUTH_WITH_SERVICE_PRINCIPAL", "OAUTH_WITH_PKCE") if a]
         seen = set(); candidates = [a for a in candidates if not (a in seen or seen.add(a))]
         for auth_try in candidates:
             rec = {"auth_type": auth_try, "status": None, "has_objects": False,
