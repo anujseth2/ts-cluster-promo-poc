@@ -1071,7 +1071,7 @@ elif step == 2:
             for _k in ("pr_url", "validation_errors", "validation_ok", "import_phase",
                        "import_core_results", "import_leaf_files", "import_leaf_errors",
                        "silent_drops", "_fb_previews", "_nl_previews", "nl_report",
-                       "fb_replace_report"):
+                       "fb_replace_report", "_casing_diag"):
                 st.session_state.pop(_k, None)
         with st.spinner("Exporting TML (post-alignment) and applying the data-layer transform…"):
             raw   = source_client().export_tml(selected_ids)
@@ -1132,6 +1132,22 @@ elif step == 2:
                         column_case_map.setdefault(k, v)
                 except Exception:
                     pass
+            # Diagnostic: capture how column casing resolved, so the Git Operations page can show
+            # why a table did/didn't get recased (connection found? which coords were tried?).
+            _cid, _auth = (None, None)
+            if tgt_conn:
+                try:
+                    _cid, _auth = target_client()._connection_meta(tgt_conn)
+                except Exception:
+                    pass
+            st.session_state._casing_diag = {
+                "connection":     tgt_conn or "(not set)",
+                "connection_found": bool(_cid),
+                "auth_type":      _auth or "(could not infer)",
+                "resolved":       sorted(k for k in column_case_map),
+                "unresolved":     sorted(n for n in names if n.strip().lower() not in column_case_map),
+                "coords":         {p["name"]: f'{p["database"]}.{p["schema"]}.{p["table"]}' for p in promoted},
+            }
             transformed_items, warnings = transform_items(
                 items,
                 source_connection=teams[team_name].get("source_connection", ""),
@@ -1341,6 +1357,26 @@ elif step == 2:
                 f["object"] = _resolve_finding_table(f)
 
             st.error(f"Validation found {len(findings)} issue(s) to resolve before import.")
+
+            # Casing diagnostic: if a column is flagged as "missing from warehouse", it usually
+            # means the connection-based recasing did not resolve that table. Show what happened.
+            diag = st.session_state.get("_casing_diag")
+            if diag:
+                with st.expander("Column-casing diagnostic (why a column may still be flagged)"):
+                    st.markdown(
+                        f"- Target connection: `{diag['connection']}`  ·  found on cluster: "
+                        f"**{diag['connection_found']}**  ·  auth type: `{diag['auth_type']}`")
+                    st.markdown("- Recased from the connection: "
+                                + (", ".join(f"`{t}`" for t in diag["resolved"]) or "_none_"))
+                    if diag["unresolved"]:
+                        st.markdown("- **Not recased** (no warehouse casing returned): "
+                                    + ", ".join(f"`{t}`" for t in diag["unresolved"]))
+                        st.caption("For each unresolved table, the coordinates the tool queried the "
+                                   "connection with are below. If these do not match the table in the "
+                                   "target warehouse (wrong database/schema, or the connection name is "
+                                   "off), that is why no casing came back.")
+                        for t in diag["unresolved"]:
+                            st.markdown(f"&nbsp;&nbsp;· `{t}` → queried `{diag['coords'].get(t, '?')}`")
 
             # ── source-extra: a source column the target warehouse doesn't have ──
             if wh_missing:
