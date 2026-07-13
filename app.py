@@ -1118,11 +1118,14 @@ elif step == 2:
                     "table":    tr.get("db_table") or t.get("db_table", ""),
                 })
             column_case_map = {}
+            _cc_trace = []
             tgt_conn = teams[team_name].get("target_connection", "")
             if promoted and tgt_conn:
                 try:
-                    column_case_map = target_client().connection_column_cases(tgt_conn, promoted)
-                except Exception:
+                    column_case_map = target_client().connection_column_cases(
+                        tgt_conn, promoted, debug=_cc_trace)
+                except Exception as _e:
+                    _cc_trace.append({"auth_type": "(call failed)", "error": str(_e)[:200]})
                     column_case_map = {}
             # Fallback: any table the connection didn't cover -> read an existing target table.
             uncovered = [n for n in names if n.strip().lower() not in column_case_map]
@@ -1147,6 +1150,7 @@ elif step == 2:
                 "resolved":       sorted(k for k in column_case_map),
                 "unresolved":     sorted(n for n in names if n.strip().lower() not in column_case_map),
                 "coords":         {p["name"]: f'{p["database"]}.{p["schema"]}.{p["table"]}' for p in promoted},
+                "fetch_trace":    _cc_trace,
             }
             transformed_items, warnings = transform_items(
                 items,
@@ -1377,6 +1381,19 @@ elif step == 2:
                                    "off), that is why no casing came back.")
                         for t in diag["unresolved"]:
                             st.markdown(f"&nbsp;&nbsp;· `{t}` → queried `{diag['coords'].get(t, '?')}`")
+                    trace = diag.get("fetch_trace") or []
+                    if trace:
+                        st.markdown("- **Connection fetch attempts** (per auth type tried):")
+                        for a in trace:
+                            bits = [f"auth `{a.get('auth_type')}`", f"HTTP {a.get('status')}",
+                                    f"objects: {a.get('has_objects')}", f"columns: {a.get('columns_found')}"]
+                            line = "&nbsp;&nbsp;· " + " · ".join(bits)
+                            if a.get("error"):
+                                line += f" · error: {a['error']}"
+                            st.markdown(line)
+                        st.caption("If an attempt shows HTTP 200 with objects: False and no error, the "
+                                   "fetch ran but the warehouse returned nothing (service-principal / "
+                                   "catalog path). An error (e.g. code 10086) means a privilege problem.")
 
             # ── source-extra: a source column the target warehouse doesn't have ──
             if wh_missing:

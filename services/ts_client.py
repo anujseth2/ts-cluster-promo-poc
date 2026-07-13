@@ -341,13 +341,18 @@ class TSClient:
             auth = None
         return cid, auth
 
-    def connection_column_cases(self, connection_identifier: str, tables) -> Dict[str, Dict[str, str]]:
+    def connection_column_cases(self, connection_identifier: str, tables,
+                                 debug=None) -> Dict[str, Dict[str, str]]:
         """Read the WAREHOUSE's true column casing straight from the connection (no logical table
         needed, no warehouse secret — ThoughtSpot uses the connection's stored credential).
 
         tables: [{"name": <ts table name>, "database", "schema", "table" (db_table)}].
         Returns {name.lower(): {col.lower(): actual_case}}. The connection's own auth type is
-        used; if the guess is off we fall back across the valid types until columns come back."""
+        used; if the guess is off we fall back across the valid types until columns come back.
+
+        debug: optional list. If given, one record per auth-type attempt is appended, capturing the
+        HTTP status, whether data_warehouse_objects came back, columns found, and any API error —
+        so a run can show whether the fetch is erroring (privilege) or genuinely returning empty."""
         out: Dict[str, Dict[str, str]] = {}
         dwos = [{"database": t.get("database", ""), "schema": t.get("schema", ""),
                  "table": t.get("table", "")} for t in tables if t.get("table")]
@@ -361,19 +366,30 @@ class TSClient:
                                   "OAUTH_WITH_PKCE") if a]
         seen = set(); candidates = [a for a in candidates if not (a in seen or seen.add(a))]
         for auth_try in candidates:
+            rec = {"auth_type": auth_try, "status": None, "has_objects": False,
+                   "columns_found": 0, "error": None}
             body = {"connections": [{"identifier": cid, "data_warehouse_objects": dwos}],
                     "data_warehouse_object_type": "COLUMN", "authentication_type": auth_try,
                     "record_size": -1, "record_offset": 0}
             try:
-                data = self._session.post(f"{self.host}/api/rest/2.0/connection/search",
-                                          json=body, timeout=120).json()
-            except (ValueError, requests.RequestException):
+                resp = self._session.post(f"{self.host}/api/rest/2.0/connection/search",
+                                          json=body, timeout=120)
+                rec["status"] = resp.status_code
+                data = resp.json()
+            except (ValueError, requests.RequestException) as e:
+                rec["error"] = str(e)[:200]
+                if debug is not None:
+                    debug.append(rec)
                 continue
+            if isinstance(data, dict) and data.get("error"):
+                rec["error"] = json.dumps(data.get("error"))[:300]
             rows = data if isinstance(data, list) else [data]
+            found = {}
             for c in rows:
                 dwo = c.get("data_warehouse_objects") if isinstance(c, dict) else None
                 if not dwo:
                     continue
+                rec["has_objects"] = True
                 for db in dwo.get("databases", []) or []:
                     for sch in db.get("schemas", []) or []:
                         for t in sch.get("tables", []) or []:
@@ -386,8 +402,12 @@ class TSClient:
                                 if nm:
                                     cmap[nm.strip().lower()] = nm
                             if cmap:
-                                out[ts_name.strip().lower()] = cmap
-            if out:
+                                found[ts_name.strip().lower()] = cmap
+            rec["columns_found"] = sum(len(v) for v in found.values())
+            if debug is not None:
+                debug.append(rec)
+            if found:
+                out.update(found)
                 return out
         return out
 
