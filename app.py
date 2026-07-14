@@ -25,7 +25,7 @@ from services.tml_transformer import (
 )
 from services.import_diagnostics import (
     classify_import_errors, drop_columns, silent_drop_findings, column_dependents, column_usage,
-    drop_vizzes, table_drop_preview, drop_tables, warehouse_missing_findings,
+    drop_vizzes, table_drop_preview, drop_tables, warehouse_missing_findings, friendly_error,
 )
 from services.table_matcher import column_signature
 from services.feedback_replace import feedback_preview, replace_prep, replace_finalize
@@ -126,6 +126,13 @@ def _humanize(msg: str) -> str:
         s = s.replace(br, "\n")
     s = s.replace("<b>", "**").replace("</b>", "**")
     return s.strip()
+
+
+def _sno(df):
+    """Return a copy of df with a 1-based 'S.No' column inserted first — for display tables."""
+    out = df.copy()
+    out.insert(0, "S.No", range(1, len(out) + 1))
+    return out
 
 
 def _name_slug(name: str) -> str:
@@ -243,9 +250,24 @@ with st.sidebar:
                              value=team_cfg.get("target_connection", ""),
                              key="tgt_conn")
 
+    st.caption("Remap the database / schema names too (leave blank to keep them as-is).")
+    _dbm0 = team_cfg.get("db_map", {}) or {}
+    _scm0 = team_cfg.get("schema_map", {}) or {}
+    _src_db0 = next(iter(_dbm0), ""); _tgt_db0 = _dbm0.get(_src_db0, "")
+    _src_sc0 = next(iter(_scm0), ""); _tgt_sc0 = _scm0.get(_src_sc0, "")
+    _dc1, _dc2 = st.columns(2)
+    with _dc1:
+        src_db = st.text_input("Source database", value=_src_db0, key="src_db")
+        src_sc = st.text_input("Source schema",   value=_src_sc0, key="src_sc")
+    with _dc2:
+        tgt_db = st.text_input("Target database", value=_tgt_db0, key="tgt_db")
+        tgt_sc = st.text_input("Target schema",   value=_tgt_sc0, key="tgt_sc")
+
     if st.button("Save connection config"):
         teams[team_name]["source_connection"] = src_conn
         teams[team_name]["target_connection"] = tgt_conn
+        teams[team_name]["db_map"]     = {src_db.strip(): tgt_db.strip()} if src_db.strip() and tgt_db.strip() else {}
+        teams[team_name]["schema_map"] = {src_sc.strip(): tgt_sc.strip()} if src_sc.strip() and tgt_sc.strip() else {}
         save_teams(teams)
         st.success("Saved.")
 
@@ -338,10 +360,12 @@ if step == 0:
 
         st.caption(f"{len(df)} object(s) — click any column header to sort.")
         df.insert(0, "select", False)
+        df.insert(0, "S.No", range(1, len(df) + 1))
 
         edited = st.data_editor(
             df,
             column_config={
+                "S.No":     st.column_config.NumberColumn("S.No", width="small"),
                 "select":   st.column_config.CheckboxColumn("Promote?", default=False),
                 "name":     st.column_config.TextColumn("Name",     width="large"),
                 "type":     st.column_config.TextColumn("Type",     width="small"),
@@ -352,7 +376,7 @@ if step == 0:
                 "obj_id":   st.column_config.TextColumn("obj_id",   width="medium"),
                 "id":       st.column_config.TextColumn("GUID",     width="small"),
             },
-            disabled=["name", "type", "author", "modified", "created", "tags", "obj_id", "id"],
+            disabled=["S.No", "name", "type", "author", "modified", "created", "tags", "obj_id", "id"],
             use_container_width=True,
             hide_index=True,
         )
@@ -457,16 +481,15 @@ if step == 0:
                                        "BUSINESS_TERM": "Business term"}
                         # Tabular picker (like the NL box). Select-only: phrases/tokens are read-only
                         # because editing feedback tokens breaks the system-managed nl_context.
-                        keys, rows = [], []
+                        # Every entry, with its stable key and display fields.
+                        all_entries = []
                         for e in fb_entries:
-                            keys.append(feedback_key(e["model"], e["type"], e["phrase"]))
-                            row = {"Promote": True,
-                                   "Type": type_label.get(e["type"], e["type"] or "Other"),
-                                   "Feedback": e["phrase"] or "(unnamed)",
-                                   "Maps to columns": e.get("tokens") or ""}
-                            if multi_model:
-                                row["Model"] = e["model"]
-                            rows.append(row)
+                            all_entries.append({
+                                "key":  feedback_key(e["model"], e["type"], e["phrase"]),
+                                "Type": type_label.get(e["type"], e["type"] or "Other"),
+                                "Feedback": e["phrase"] or "(unnamed)",
+                                "Maps to columns": e.get("tokens") or "",
+                                "Model": e["model"]})
                         col_order = (["Promote", "Type", "Feedback", "Maps to columns"]
                                      + (["Model"] if multi_model else []))
                         cfg = {
@@ -477,17 +500,54 @@ if step == 0:
                         }
                         if multi_model:
                             cfg["Model"] = st.column_config.TextColumn("Model", disabled=True)
+                        # expanded=True so ticking a row (which reruns) no longer collapses the picker.
                         with st.expander(
                                 f"Choose feedback to promote "
-                                f"({len(prev_sel)} of {len(fb_entries)} selected)", expanded=False):
+                                f"({len(prev_sel)} of {len(fb_entries)} selected)", expanded=True):
+                            # ── search + type filter (narrow a long list) ──
+                            _fc1, _fc2 = st.columns([3, 1])
+                            with _fc1:
+                                fb_q = st.text_input(
+                                    "Search feedback", key="fb_search",
+                                    placeholder="filter by phrase or mapped column").strip().lower()
+                            with _fc2:
+                                fb_type = st.selectbox(
+                                    "Type", ["All", "Reference question", "Business term"],
+                                    key="fb_type_filter")
                             st.caption("One row = one reference question / business term. Tick "
                                        "**Promote** to carry it over; **Maps to columns** shows the "
-                                       "columns each one references.")
-                            grid = st.data_editor(
-                                pd.DataFrame(rows)[col_order], key="fb_picker", hide_index=True,
-                                use_container_width=True, num_rows="fixed", column_config=cfg)
-                        st.session_state.feedback_selected = {
-                            keys[i] for i, p in enumerate(grid["Promote"].tolist()) if bool(p)}
+                                       "columns each one references. Filtering never changes rows you "
+                                       "can't see — their selection is kept.")
+
+                            def _match(r):
+                                if fb_type != "All" and r["Type"] != fb_type:
+                                    return False
+                                if fb_q and fb_q not in (str(r["Feedback"]) + " "
+                                                         + str(r["Maps to columns"])).lower():
+                                    return False
+                                return True
+                            shown = [r for r in all_entries if _match(r)]
+                            shown_keys = [r["key"] for r in shown]
+                            if not shown:
+                                st.caption("No feedback matches the filter.")
+                                shown_sel = set()
+                            else:
+                                grid_rows = [{"Promote": (r["key"] in prev_sel), "Type": r["Type"],
+                                              "Feedback": r["Feedback"],
+                                              "Maps to columns": r["Maps to columns"],
+                                              **({"Model": r["Model"]} if multi_model else {})}
+                                             for r in shown]
+                                # Widget key includes the filter so state resets cleanly when the
+                                # filter changes (no stale edits mapped to the wrong rows).
+                                _fsig = f"{fb_q}|{fb_type}|{len(shown)}"
+                                grid = st.data_editor(
+                                    pd.DataFrame(grid_rows)[col_order], key=f"fb_picker_{_fsig}",
+                                    hide_index=True, use_container_width=True, num_rows="fixed",
+                                    column_config=cfg)
+                                shown_sel = {shown_keys[i] for i, p in
+                                             enumerate(grid["Promote"].tolist()) if bool(p)}
+                        # Replace selection only for the rows currently shown; keep the rest as-is.
+                        st.session_state.feedback_selected = (prev_sel - set(shown_keys)) | shown_sel
 
                 # NL (Spotter coaching) instructions — separate artifact, promoted via the
                 # ai/instructions API at import (not TML). Persist the toggle like feedback.
@@ -516,26 +576,27 @@ if step == 0:
                         st.caption("No Spotter instructions found on the selected model(s).")
                         st.session_state._nl_edited = {}
                     else:
+                        # READ-ONLY: instructions are promoted exactly as they are on the source.
+                        # Editing them here was risky (drift from the cluster's own coaching); to
+                        # change them, edit the model's Spotter instructions back in the source
+                        # cluster and re-fetch. expanded=True so it doesn't collapse on rerun.
                         edited = {}
-                        with st.expander(f"Spotter instructions ({total} found) — edit before promoting",
-                                         expanded=False):
-                            st.caption("One row = one instruction. Edit a cell, add a row at the bottom, "
-                                       "or select a row and delete it. The table is exactly what gets "
-                                       "promoted (Merge or Replace at the import gate).")
+                        with st.expander(f"Spotter instructions ({total} found) — read-only",
+                                         expanded=True):
+                            st.caption("These are promoted **exactly as they appear on the source** "
+                                       "(Merge or Replace at the import gate). To change them, edit "
+                                       "the model's Spotter instructions in the **source cluster**, "
+                                       "then re-fetch.")
                             models_with = [g for g in dep["model_ids"] if nl_src.get(g)]
                             for g in models_with:
                                 if len(models_with) > 1:      # label only when several models (like feedback)
                                     st.markdown(f"**{id2name.get(g, g)}**")
-                                grid = st.data_editor(
-                                    pd.DataFrame({"Instruction": nl_src.get(g, [])}),
-                                    key=f"nl_edit_{g}", num_rows="dynamic", hide_index=True,
-                                    use_container_width=True,
+                                st.dataframe(
+                                    _sno(pd.DataFrame({"Instruction": nl_src.get(g, [])})),
+                                    hide_index=True, use_container_width=True,
                                     column_config={"Instruction": st.column_config.TextColumn(
                                         "Instruction", width="large")})
-                                # dropna() drops the blank trailing/added rows; then trim empties.
-                                edited[g] = [s for s in
-                                             (str(v).strip() for v in grid["Instruction"].dropna().tolist())
-                                             if s]
+                                edited[g] = [s for s in (str(v).strip() for v in nl_src.get(g, [])) if s]
                         st.session_state._nl_edited = edited
                         st.session_state.pop("_nl_previews", None)   # reflect edits at the gate
 
@@ -683,10 +744,10 @@ if step == 0:
 
 elif step == 1:
     st.subheader("obj_id Health Check")
-    # Any obj_id work here invalidates an earlier export, so Git Operations re-exports fresh
-    # (the exported TML must carry the aligned obj_ids).
-    for _k in ("transformed_items", "conn_mismatch", "warnings"):
-        st.session_state.pop(_k, None)
+    # NOTE: we do NOT clear the export here just for visiting this page — that would throw away
+    # Git Operations progress on mere navigation (Home / breadcrumb). Instead, the obj_id/align
+    # actions below set `_objids_dirty`, and Git Operations re-exports only when that flag is set
+    # (so the exported TML still picks up any real obj_id change).
     st.markdown(
         "Every object being promoted needs `obj_id` set on the **source**. Tables that already "
         "exist on the **target** must share the same `obj_id` (otherwise import duplicates them); "
@@ -815,15 +876,17 @@ elif step == 1:
                        "slug from the name. Edit if needed, then click **Apply** to set them.")
 
         df_obj = pd.DataFrame(status)[["object", "type", "obj_id", "ok"]]
+        df_obj.insert(0, "S.No", range(1, len(df_obj) + 1))
         edited_status = st.data_editor(
             df_obj,
             column_config={
+                "S.No":   st.column_config.NumberColumn("S.No", width="small"),
                 "object": st.column_config.TextColumn("Object", width="large"),
                 "type":   st.column_config.TextColumn("Type",   width="medium"),
                 "obj_id": st.column_config.TextColumn("obj_id (edit to set)", width="large"),
                 "ok":     st.column_config.CheckboxColumn("Has obj_id", disabled=True),
             },
-            disabled=["object", "type", "ok"],
+            disabled=["S.No", "object", "type", "ok"],
             use_container_width=True,
             hide_index=True,
         )
@@ -846,6 +909,7 @@ elif step == 1:
                     with st.spinner(f"Setting obj_id on {len(mappings)} source object(s)…"):
                         source_client().update_obj_ids(mappings)
                     st.success(f"obj_id set on {len(mappings)} source object(s).")
+                    st.session_state._objids_dirty = True   # export is now stale -> Git Ops re-exports
                     for _k in ("obj_id_status", "_raw_items", "table_alignment", "prod_by_name",
                                "prod_leaf", "dev_table_refs", "dev_model_refs", "dev_leaf_refs"):
                         st.session_state.pop(_k, None)
@@ -870,7 +934,7 @@ elif step == 1:
 
         df_tables = pd.DataFrame(table_rows)[["object", "kind", "source_obj_id", "target_obj_id", "state"]]
         st.dataframe(
-            df_tables,
+            _sno(df_tables),
             column_config={"state": st.column_config.TextColumn("State")},
             use_container_width=True,
             hide_index=True,
@@ -915,6 +979,7 @@ elif step == 1:
                             target_client().update_obj_ids(mappings)
                         st.success("obj_id set on target: "
                                    + ", ".join(f"`{t['name']}`→`{t['obj_id']}`" for t in to_fix))
+                        st.session_state._objids_dirty = True   # export is now stale
                         for _k in ("obj_id_status", "_raw_items", "table_alignment",
                                    "prod_by_name", "prod_leaf", "dev_table_refs",
                                    "dev_model_refs", "dev_leaf_refs"):
@@ -1009,7 +1074,7 @@ elif step == 1:
                     "col drift":      _drift(b["columns"]) if b else "—",
                     "obj_id aligned": "yes" if aligned else ("n/a" if r["decision"] == "NO_MATCH" else "no"),
                 })
-            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+            st.dataframe(_sno(pd.DataFrame(rows)), use_container_width=True, hide_index=True)
 
             review   = [r for r in mr if r["decision"] in ("REVIEW", "AMBIGUOUS")]
             no_match = [r for r in mr if r["decision"] == "NO_MATCH"]
@@ -1057,6 +1122,7 @@ elif step == 1:
                             target_client().update_obj_ids(tgt_up)
                     st.success(f"Aligned {len(tgt_up)} pair(s)."
                                + (f"  Skipped (no GUID): {', '.join(skipped)}" if skipped else ""))
+                    st.session_state._objids_dirty = True   # export is now stale
                     for _k in ("obj_id_status", "_raw_items", "table_alignment", "prod_by_name",
                                "prod_leaf", "dev_table_refs", "dev_model_refs", "dev_leaf_refs",
                                "match_results"):
@@ -1096,8 +1162,13 @@ elif step == 2:
     # would too). Changing the choice also invalidates the already-committed PR/validation.
     _fb_state = (bool(st.session_state.get("_include_feedback")),
                  frozenset(st.session_state.get("feedback_selected") or []))
+    # Re-export if we have no bundle yet, the feedback choice changed, or obj_ids/alignment were
+    # changed since the last export (consume the dirty flag). Plain navigation back to this page
+    # (Home / breadcrumb) does none of these, so the last stage is preserved.
+    _objids_dirty = st.session_state.pop("_objids_dirty", False)
     _need_export = ("transformed_items" not in st.session_state
-                    or st.session_state.get("_export_fb_state") != _fb_state)
+                    or st.session_state.get("_export_fb_state") != _fb_state
+                    or _objids_dirty)
     if selected_ids and _need_export:
         if "transformed_items" in st.session_state:
             for _k in ("pr_url", "validation_errors", "validation_ok", "import_phase",
@@ -1105,7 +1176,8 @@ elif step == 2:
                        "silent_drops", "_fb_previews", "_nl_previews", "nl_report",
                        "fb_replace_report", "_casing_diag"):
                 st.session_state.pop(_k, None)
-        with st.spinner("Exporting TML (post-alignment) and applying the data-layer transform…"):
+        with st.status("Preparing the promotion bundle…", expanded=True) as _exp_status:
+            st.write("① Exporting TML from the source cluster…")
             raw   = source_client().export_tml(selected_ids)
             items = raw if isinstance(raw, list) else raw.get("object", [])
             # Opt-in: also pull each model's Spotter feedback (reference questions + business
@@ -1148,50 +1220,74 @@ elif step == 2:
                     "database": _dbm.get(t.get("db", ""), t.get("db", "")),
                     "schema":   _scm.get(t.get("schema", ""), t.get("schema", "")),
                     "table":    tr.get("db_table") or t.get("db_table", ""),
+                    "connection": (t.get("connection") or {}).get("name", ""),
                 })
             column_case_map = {}
+            warehouse_col_map = {}
             _cc_trace = []
             tgt_conn = teams[team_name].get("target_connection", "")
-            # Fast path first: read casing straight from tables already on the target (a TML
-            # metadata read — no warehouse round-trip). This covers every table that already
-            # exists on the target, which is the common case, and keeps this step instant.
-            try:
-                column_case_map = target_client().table_column_cases(names)
-            except Exception:
-                column_case_map = {}
-            # Slow path, only for tables NOT already on the target: ask the warehouse directly
-            # through the connection. This wakes the warehouse and can take minutes on a cold
-            # start, so we do it solely for the tables the fast read couldn't resolve.
-            uncovered = [n for n in names if n.strip().lower() not in column_case_map]
-            if uncovered and tgt_conn:
-                _unc = {n.strip().lower() for n in uncovered}
-                _unc_promoted = [p for p in promoted if p["name"].strip().lower() in _unc]
+            st.write(f"② Reading target warehouse columns for {len(promoted)} table(s) "
+                     "(this hits the connection and can be slow on a cold warehouse)…")
+            # Authoritative source of truth = the TARGET CONNECTION (the CDW). Read the warehouse's
+            # own column set for EVERY promoted table straight from the connection (no logical table
+            # needed, no secret). This is what import error 14536 checks against, so a column absent
+            # here genuinely does not exist in the warehouse. It can be slow (a cold Databricks SQL
+            # warehouse takes time to wake) — warm the warehouse for a fast response.
+            #
+            # Which connection? The team's configured target connection wins (it's what the transform
+            # remaps to); otherwise use each table's OWN connection name from its TML — so this works
+            # with no manual sidebar config, and across tables on different connections. Group tables
+            # by their effective connection and read each one.
+            _conn_groups = {}
+            for p in promoted:
+                eff = tgt_conn or p.get("connection") or ""
+                if eff:
+                    _conn_groups.setdefault(eff, []).append(p)
+            for _conn_name, _conn_tbls in _conn_groups.items():
                 try:
                     for k, v in target_client().connection_column_cases(
-                            tgt_conn, _unc_promoted, debug=_cc_trace).items():
-                        column_case_map.setdefault(k, v)
+                            _conn_name, _conn_tbls, debug=_cc_trace).items():
+                        warehouse_col_map.setdefault(k, v)
                 except Exception as _e:
-                    _cc_trace.append({"auth_type": "(call failed)", "error": str(_e)[:200]})
+                    _cc_trace.append({"auth_type": f"(connection '{_conn_name}' failed)",
+                                      "error": str(_e)[:200]})
+            # Casing map: prefer the CDW casing; fall back to any table already modeled on the target
+            # (a fast TML metadata read) for tables the connection could not introspect.
+            column_case_map = dict(warehouse_col_map)
+            _uncased = [n for n in names if n.strip().lower() not in column_case_map]
+            if _uncased:
+                try:
+                    for k, v in target_client().table_column_cases(_uncased).items():
+                        column_case_map.setdefault(k, v)
+                except Exception:
+                    pass
             # Diagnostic: capture how column casing resolved, so the Git Operations page can show
             # why a table did/didn't get recased (connection found? which coords were tried?).
+            _diag_conn = tgt_conn or (next(iter(_conn_groups)) if _conn_groups else "")
             _cid, _auth = (None, None)
-            if tgt_conn:
+            if _diag_conn:
                 try:
-                    _cid, _auth = target_client()._connection_meta(tgt_conn)
+                    _cid, _auth = target_client()._connection_meta(_diag_conn)
                 except Exception:
                     pass
             st.session_state._casing_diag = {
-                "connection":     tgt_conn or "(not set)",
+                "connection":     _diag_conn or "(not set)",
                 "connection_found": bool(_cid),
                 "auth_type":      _auth or "(could not infer)",
                 "resolved":       sorted(k for k in column_case_map),
                 "unresolved":     sorted(n for n in names if n.strip().lower() not in column_case_map),
                 "coords":         {p["name"]: f'{p["database"]}.{p["schema"]}.{p["table"]}' for p in promoted},
                 "fetch_trace":    _cc_trace,
+                "warehouse_resolved": sorted(warehouse_col_map),
             }
-            # Keep the target column set around: Stage 2 diffs against it to list ALL
-            # missing-from-warehouse columns at once (VALIDATE_ONLY reports one per round).
-            st.session_state._column_case_map = column_case_map
+            # Keep both column sets around for Stage 2's missing-column diff:
+            #   _warehouse_col_map = authoritative CDW columns (source of truth),
+            #   _column_case_map   = CDW + org-modeled fallback (used when the warehouse couldn't
+            #                        be read for a table, flagged 'unverified').
+            # Either way we list ALL missing columns at once — VALIDATE_ONLY reports one per round.
+            st.session_state._warehouse_col_map = warehouse_col_map
+            st.session_state._column_case_map   = column_case_map
+            st.write("③ Applying the data-layer transform (connection remap, obj_ids, column casing)…")
             transformed_items, warnings = transform_items(
                 items,
                 source_connection=teams[team_name].get("source_connection", ""),
@@ -1206,6 +1302,13 @@ elif step == 2:
             if prune:
                 transformed_items, prune_summary = drop_tables(transformed_items, prune)
                 st.session_state.prune_summary = prune_summary
+            # Skip individual columns the user chose to leave out (persisted across re-exports).
+            skip_cols = st.session_state.get("skip_columns", set())
+            if skip_cols:
+                transformed_items, _sc_n, _sv_n = drop_columns(transformed_items, skip_cols)
+                st.session_state.dropped_cols_count = st.session_state.get("dropped_cols_count", 0) + _sc_n
+                st.session_state.dropped_vizs_count = st.session_state.get("dropped_vizs_count", 0) + _sv_n
+                st.session_state.setdefault("dropped_col_names", set()).update(skip_cols)
             st.session_state.transformed_items = transformed_items
             st.session_state.warnings          = warnings
             st.session_state._export_fb_state  = _fb_state   # what feedback choice this export reflects
@@ -1221,6 +1324,9 @@ elif step == 2:
             st.session_state.conn_mismatch = (
                 {"configured": src_conn, "found": sorted(conn_names)}
                 if src_conn and conn_names and src_conn not in conn_names else None)
+            _exp_status.update(
+                label=f"Bundle ready — {len(transformed_items)} object(s) prepared.",
+                state="complete", expanded=False)
 
     transformed_items = st.session_state.get("transformed_items")
     cm = st.session_state.get("conn_mismatch")
@@ -1255,14 +1361,77 @@ elif step == 2:
             if i.get("info", {}).get("name") not in skip_objects
         ]
 
-        def _run_validation(items):
-            """Commit items to dev, create/update PR, validate models from dev. Returns (pr_url, errors, ok)."""
+        # Table shape at a glance: how many columns the SOURCE promotes vs how many the TARGET
+        # warehouse actually has. A gap on either side is what drives adds (source>target) or
+        # silent drops (target>source), so surface it up front.
+        _wh = st.session_state.get("_warehouse_col_map") or {}
+        _shape_rows = []
+        for i in filtered_items:
+            d = _parse_edoc(i.get("edoc", "{}"))
+            t = d.get("table")
+            if not t or not t.get("name"):
+                continue
+            src_n = len(t.get("columns", []) or [])
+            wh    = _wh.get(t["name"].strip().lower())
+            tgt_n = len(wh) if wh is not None else None
+            _shape_rows.append({
+                "Table": t["name"],
+                "Source cols": src_n,
+                "Target warehouse cols": tgt_n if tgt_n is not None else "— (not read)",
+                "Δ": (src_n - tgt_n) if tgt_n is not None else "",
+            })
+        if _shape_rows:
+            with st.expander(f"Table column counts — source vs target warehouse ({len(_shape_rows)} table(s))",
+                             expanded=False):
+                import pandas as pd
+                st.caption("Δ = source − target warehouse. Positive → source has columns the "
+                           "warehouse lacks (must add or drop). Negative → warehouse has extras the "
+                           "source omits (dropped on the target unless carried through).")
+                st.dataframe(_sno(pd.DataFrame(_shape_rows)), use_container_width=True, hide_index=True)
+
+        # ── Skip specific columns (leave a column out without touching the rest) ──
+        _tbl_cols = {}   # table name -> [column display names]
+        for i in filtered_items:
+            d = _parse_edoc(i.get("edoc", "{}"))
+            t = d.get("table")
+            if t and t.get("name"):
+                _tbl_cols[t["name"]] = [(c.get("name") or c.get("db_column_name") or "")
+                                        for c in (t.get("columns") or []) if (c.get("name") or c.get("db_column_name"))]
+        if _tbl_cols:
+            _skip_now = st.session_state.get("skip_columns", set())
+            with st.expander("Skip specific columns (optional) — leave a column out, keep the rest",
+                             expanded=bool(_skip_now)):
+                st.caption("Pick columns to exclude from this promotion. The rest of the table "
+                           "promotes normally; any viz that uses a skipped column is dropped too.")
+                _picked = set()
+                for _tn, _cols in _tbl_cols.items():
+                    _sel = st.multiselect(
+                        f"`{_tn}` — columns to skip", options=sorted(_cols),
+                        default=sorted(c for c in _cols if c in _skip_now),
+                        key=f"skipcols_{_tn}")
+                    _picked.update(_sel)
+                if st.button("Apply column skips & re-export", disabled=(_picked == _skip_now)):
+                    st.session_state.skip_columns = _picked
+                    # Force a clean re-export so the skip set is applied from a fresh bundle
+                    # (avoids compounding drops on an already-edited bundle).
+                    st.session_state.pop("transformed_items", None)
+                    for _k in ("pr_url", "validation_errors", "validation_ok", "dropped_col_names",
+                               "dropped_cols_count", "dropped_vizs_count"):
+                        st.session_state.pop(_k, None)
+                    st.rerun()
+
+        def _run_validation(items, step=None):
+            """Commit items to dev, create/update PR, validate models from dev. Returns (pr_url, errors, ok).
+            step: optional callable(str) to report progress to the UI."""
+            _tick = step or (lambda _m: None)
             # Any re-export invalidates a partial import in progress — reset the import phase.
             for _k in ("import_phase", "import_core_results", "import_leaf_files", "import_leaf_errors"):
                 st.session_state.pop(_k, None)
+            _tick("① Writing TML files to the dev branch…")
             files  = items_to_files(items)
             gc     = git_client()
             sha    = gc.commit_tml(team_name, files)
+            _tick("② Opening / updating the pull request…")
             pr_url = gc.create_pr(team_name, sha)
 
             # Validate ONLY this run's files (what we just committed), not the whole team
@@ -1274,6 +1443,7 @@ elif step == 2:
                            + [c for p, c in files.items() if p.startswith("models/")])
             if not val_strings:
                 return pr_url, [], []
+            _tick(f"③ Validating {len(val_strings)} table/model file(s) against the target…")
             results = target_client().import_tml(val_strings, policy="VALIDATE_ONLY")
             ok  = [r for r in results if r["status"] == "OK"]
             err = [r for r in results if r["status"] != "OK"]
@@ -1374,12 +1544,16 @@ elif step == 2:
         # ── Stage 1: Export & validate ─────────────────────────────────────
         if "pr_url" not in st.session_state:
             if st.button("Export & Validate", type="primary", disabled=not filtered_items):
-                with st.spinner("Committing TML and validating models…"):
-                    pr_url, err, ok = _run_validation(filtered_items)
+                with st.status("Committing & validating…", expanded=True) as _val_status:
+                    pr_url, err, ok = _run_validation(filtered_items, step=st.write)
                     st.session_state.pr_url            = pr_url
                     st.session_state.validation_errors = err
                     st.session_state.validation_ok     = ok
                     st.session_state.pop("silent_drops", None)
+                    _val_status.update(
+                        label=(f"Validation found {len(err)} issue(s)." if err
+                               else "Validation passed."),
+                        state=("error" if err else "complete"), expanded=False)
                 st.rerun()
         else:
             st.markdown(f"**PR:** [{st.session_state.pr_url}]({st.session_state.pr_url})")
@@ -1396,30 +1570,40 @@ elif step == 2:
             other        = [f for f in findings if f["kind"] == "other"]
 
             # VALIDATE_ONLY reports only the FIRST missing column per table, so the reviewer
-            # otherwise fixes them one-per-round. Pre-diff the promoted tables against the target
-            # column set fetched at export to surface EVERY missing column now. Validation-confirmed
-            # findings win over predicted ones (same table+column), so no duplicate rows.
-            ccm = st.session_state.get("_column_case_map") or {}
-            if ccm:
-                confirmed_keys = {(f["object"].strip().lower(), f["column"].strip().lower())
-                                  for f in wh_missing}
-                predicted = warehouse_missing_findings(
-                    st.session_state.get("transformed_items", []), ccm,
-                    connection=teams[team_name].get("target_connection", ""))
-                for f in predicted:
-                    if (f["object"].strip().lower(), f["column"].strip().lower()) not in confirmed_keys:
-                        wh_missing.append(f)
+            # otherwise fixes them one-per-round. Diff every promoted table against the TARGET
+            # CONNECTION's own column set (the CDW — the source of truth 14536 checks against),
+            # fetched at export, to surface EVERY missing column at once. This CDW diff is the
+            # complete, authoritative list for any table the connection could read, so it REPLACES
+            # the one-per-round validation findings for those tables (no duplicate rows). For a
+            # table the warehouse couldn't answer for, we keep the validation-confirmed finding and
+            # fall back to the org-modeled column set (flagged 'unverified').
+            cdw_map = st.session_state.get("_warehouse_col_map") or {}
+            org_map = st.session_state.get("_column_case_map") or {}
+            diff_findings = warehouse_missing_findings(
+                st.session_state.get("transformed_items", []), cdw_map, fallback_map=org_map,
+                connection=teams[team_name].get("target_connection", ""))
+
+            def _tbl_of(f):
+                parts = (f.get("column_fqn") or "").split(".")
+                return (parts[-2] if len(parts) >= 2 else f.get("object", "")).strip().lower()
+
+            covered = {k for k in cdw_map} | {k for k in org_map}
+            # keep only validation-confirmed missing columns for tables neither map could cover
+            confirmed_extra = [f for f in wh_missing if _tbl_of(f) not in covered]
+            for f in confirmed_extra:
+                f["verified"] = True
+            wh_missing = diff_findings + confirmed_extra
 
             # The failed table's header name is often "unknown"; recover the real table name
             # from the error FQN + the promotion bundle so target lookups resolve.
             for f in type_mismatch:
                 f["object"] = _resolve_finding_table(f)
 
-            _predicted_extra = sum(1 for f in wh_missing if f.get("predicted"))
+            _unverified = sum(1 for f in wh_missing if not f.get("verified"))
             _issue_msg = f"Validation found {len(findings)} issue(s) to resolve before import."
-            if _predicted_extra:
-                _issue_msg += (f"  Plus {_predicted_extra} more column(s) predicted missing from the "
-                               "target's known column set (shown below, marked ⚠︎ predicted).")
+            if _unverified:
+                _issue_msg += (f"  {_unverified} column(s) below could not be checked against the "
+                               "warehouse (marked ⚠︎ unverified).")
             st.error(_issue_msg)
 
             # Casing diagnostic: if a column is flagged as "missing from warehouse", it usually
@@ -1463,20 +1647,38 @@ elif step == 2:
                     "cannot import as-is. **Default is to keep them** — add the column to the target "
                     "warehouse, then re-run. Tick a column only to **drop** it from this promotion "
                     "(along with any visualization that uses it).")
-                if any(f.get("predicted") for f in wh_missing):
-                    st.caption("⚠︎ **predicted** rows come from diffing against the target's known "
-                               "column set (not a confirmed import error). Validation reports only the "
-                               "first missing column per table, so these are surfaced early — verify "
-                               "against the warehouse before dropping.")
+                st.caption("Checked against the **target connection** (the warehouse itself), so this "
+                           "is the complete set — not one column per re-validate.")
+                if any(not f.get("verified") for f in wh_missing):
+                    st.caption("⚠︎ **unverified** rows are for a table whose warehouse could not be "
+                               "read; they are inferred from the target's modeled columns and may "
+                               "include a column that actually exists in the warehouse. Verify before "
+                               "dropping.")
                 drop_set = set()
+                _promo_items = st.session_state.get("transformed_items", [])
                 for f in wh_missing:
                     parts = (f.get("column_fqn") or "").split(".")
                     tbl   = parts[-2] if len(parts) >= 2 else f.get("object", "")
-                    mark  = "⚠︎ predicted · " if f.get("predicted") else ""
+                    mark  = "" if f.get("verified") else "⚠︎ unverified · "
                     if st.checkbox(
                             f"{mark}Drop  `{f['column']}`   ·   table `{tbl}`   ·   {f['connection']}",
                             value=False, key=f"dropwh_{f['object']}_{f['column']}"):
                         drop_set.add(f["column"])
+                    # Blast radius: what in the promotion (models, answers, liveboards) uses this
+                    # column and would be pruned along with it. Source-side (the TML being promoted).
+                    usage = column_usage(_promo_items, f["column"])
+                    if usage:
+                        kinds = {}
+                        for u in usage:
+                            kinds[u["kind"]] = kinds.get(u["kind"], 0) + 1
+                        summ = ", ".join(f"{n} {k}{'' if n == 1 else 's'}" for k, n in kinds.items())
+                        with st.expander(f"↳ dropping `{f['column']}` removes {len(usage)} dependent(s) "
+                                         f"on the source — {summ}"):
+                            for u in usage:
+                                st.markdown(f"- **{u['kind']}** · {u['name']} — {', '.join(u['where'])}")
+                    else:
+                        st.caption(f"↳ `{f['column']}` has no dependents in the promotion — dropping "
+                                   "it removes only the column.")
                 if st.button("Apply choices, re-export & re-validate", type="primary"):
                     if drop_set:
                         fixed, dc, dv = drop_columns(st.session_state.transformed_items, drop_set)
@@ -1598,10 +1800,18 @@ elif step == 2:
                 st.markdown("#### Other validation errors")
                 for f in other:
                     st.markdown(f"**{f['object']}**")
-                    for line in _humanize(f["error"]).split("\n"):
-                        line = line.strip()
-                        if line:
-                            st.markdown(f"- {line}")
+                    headline, action, raw = friendly_error(f["error"])
+                    if headline:
+                        st.markdown(f"- {headline}")
+                        if action:
+                            st.caption(f"→ {action}")
+                        with st.expander("Raw error"):
+                            st.code(raw)
+                    else:
+                        for line in raw.split("\n"):
+                            line = line.strip()
+                            if line:
+                                st.markdown(f"- {line}")
 
         elif val_ok or val_ok == []:
             tbls = mdls = leaves = 0
@@ -1820,8 +2030,9 @@ elif step == 2:
                         st.session_state.import_phase = "complete"
                         st.rerun()
 
-    _nav(2, can_next="import_results" in st.session_state,
-         next_hint="Run the import above to see results on the next step.")
+    # No next_hint on Git Operations: the page's own buttons (Export & Validate, Merge &
+    # Import) are the guidance, and a persistent ⛔ caption through the whole flow just nags.
+    _nav(2, can_next="import_results" in st.session_state)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1963,10 +2174,25 @@ elif step == 3:
         failed     = df[df["status"] != "OK"]
 
         dup_ct = int((success["change"] == "⚠ DUPLICATE").sum()) if not success.empty else 0
+        # From → To header: which cluster/team this promotion moved between.
+        _src_h = opt_env("TS_SOURCE_HOST").replace("https://", "").rstrip("/") or "source"
+        _tgt_h = opt_env("TS_TARGET_HOST").replace("https://", "").rstrip("/") or "target"
+        st.markdown(f"Promoted **{len(df)}** object(s):  `{_src_h}`  →  `{_tgt_h}`  ·  team **{team_name}**")
         col1, col2, col3 = st.columns(3)
         col1.metric("Succeeded",  len(success))
         col2.metric("Failed",     len(failed))
         col3.metric("Duplicates", dup_ct)
+        # From → To rollup: how each succeeded object landed on the target.
+        if not success.empty:
+            _created = int((success["change"] == "created").sum())
+            _updated = int((success["change"] == "updated in place").sum())
+            _present = int(success["change"].isin(["present", "synced", "rebuilt (Replace)"]).sum())
+            _bits = []
+            if _created: _bits.append(f"**{_created}** created (new on target)")
+            if _updated: _bits.append(f"**{_updated}** updated in place (same obj_id)")
+            if _present: _bits.append(f"**{_present}** already present / synced")
+            if _bits:
+                st.caption("State on target: " + "  ·  ".join(_bits))
 
         # Loud banner for duplicates — in-place update is the whole point of obj_id.
         if dup_ct:
@@ -2044,12 +2270,16 @@ elif step == 3:
 
         if not success.empty:
             st.markdown("**Succeeded**")
-            st.dataframe(success[["name", "type", "change", "detail", "obj_id", "new_id"]],
-                         use_container_width=True, hide_index=True)
+            _succ = success[["name", "type", "change", "detail", "obj_id", "new_id"]].rename(columns={
+                "name": "Object", "type": "Type", "change": "State on target (from → to)",
+                "detail": "Shape", "obj_id": "obj_id (shared identity)", "new_id": "target GUID"})
+            st.dataframe(_sno(_succ), use_container_width=True, hide_index=True)
 
         if not failed.empty:
             st.markdown("**Failed**")
-            st.dataframe(failed[["name", "type", "detail", "status", "error"]],
-                         use_container_width=True, hide_index=True)
+            _fail = failed[["name", "type", "detail", "status", "error"]].rename(columns={
+                "name": "Object", "type": "Type", "detail": "Shape",
+                "status": "Status", "error": "Error"})
+            st.dataframe(_sno(_fail), use_container_width=True, hide_index=True)
 
     _nav(3)

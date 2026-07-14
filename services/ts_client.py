@@ -345,7 +345,7 @@ class TSClient:
         return cid, auth
 
     def connection_column_cases(self, connection_identifier: str, tables,
-                                 debug=None) -> Dict[str, Dict[str, str]]:
+                                 debug=None, timeout: int = 600) -> Dict[str, Dict[str, str]]:
         """Read the WAREHOUSE's true column casing straight from the connection (no logical table
         needed, no warehouse secret — ThoughtSpot uses the connection's stored credential).
 
@@ -355,7 +355,11 @@ class TSClient:
 
         debug: optional list. If given, one record per auth-type attempt is appended, capturing the
         HTTP status, whether data_warehouse_objects came back, columns found, and any API error —
-        so a run can show whether the fetch is erroring (privilege) or genuinely returning empty."""
+        so a run can show whether the fetch is erroring (privilege) or genuinely returning empty.
+
+        timeout: per-attempt read timeout in seconds. A cold Databricks SQL warehouse can take
+        minutes to wake and enumerate columns, so this is generous by default; warm the warehouse
+        first for a fast response."""
         out: Dict[str, Dict[str, str]] = {}
         dwos = [{"database": t.get("database", ""), "schema": t.get("schema", ""),
                  "table": t.get("table", "")} for t in tables if t.get("table")]
@@ -376,7 +380,7 @@ class TSClient:
                     "record_size": -1, "record_offset": 0}
             try:
                 resp = self._session.post(f"{self.host}/api/rest/2.0/connection/search",
-                                          json=body, timeout=120)
+                                          json=body, timeout=timeout)
                 rec["status"] = resp.status_code
                 data = resp.json()
             except (ValueError, requests.RequestException) as e:

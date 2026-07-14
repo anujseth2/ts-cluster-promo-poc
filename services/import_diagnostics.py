@@ -50,6 +50,52 @@ _VIZ_ERR = re.compile(r"Visualization\s*<b>\s*(.*?)\s*</b>\s*has following error
 _FORMULA = re.compile(r"Formula:\s*([^,<]+)", re.I)
 
 
+def _clean(msg: str) -> str:
+    """Strip ThoughtSpot's HTML flecks: <br/> -> newline, <b>..</b> -> **..**."""
+    s = str(msg or "")
+    for br in ("<br/>", "<br />", "<br>"):
+        s = s.replace(br, "\n")
+    return s.replace("<b>", "**").replace("</b>", "**").strip()
+
+
+# Plain-language translations for the error shapes ThoughtSpot returns verbatim. Each entry:
+# (compiled pattern, lambda match -> (headline, what_to_do)). First match wins.
+_ERROR_RULES = [
+    (re.compile(r"free trial has ended|warehouses? (?:have|has) been suspended|CONNECTION_CREATION_ERROR", re.I),
+     lambda m: ("The target warehouse can't be reached — it looks paused or suspended "
+                "(e.g. a Snowflake trial that ended, or a stopped Databricks warehouse).",
+                "Resume/resize the warehouse in the data platform, then re-run. This is a warehouse "
+                "state problem, not a TML problem.")),
+    (re.compile(r"Data source metadata could not be found", re.I),
+     lambda m: ("ThoughtSpot couldn't read the connection's metadata.",
+                "Usually the warehouse is asleep/suspended or the connection lost its credential — "
+                "wake the warehouse or re-test the connection, then re-run.")),
+    (re.compile(r"10086|not authorized|permission|privilege|access denied", re.I),
+     lambda m: ("Permission problem talking to the connection.",
+                "The account running the promotion needs access to the connection "
+                "(shared at MODIFY/edit) and DATAMANAGEMENT — grant it, then re-run.")),
+    (re.compile(r"Existing guid.*will be used", re.I),
+     lambda m: ("This object already exists on the target and was updated in place (not an error).",
+                "No action needed — this is the normal obj_id update path.")),
+    (re.compile(r"timed out|timeout|504|gateway", re.I),
+     lambda m: ("The request to the warehouse timed out.",
+                "A cold warehouse can exceed the gateway limit — warm it (run a quick query) and "
+                "re-run; if it persists it's the connection's column-introspection latency.")),
+]
+
+
+def friendly_error(msg: str):
+    """Translate a raw TS error into (headline, action, raw_clean). headline/action are None when
+    no rule matches — the caller then just shows the cleaned raw text."""
+    raw = _clean(msg)
+    for pat, fn in _ERROR_RULES:
+        m = pat.search(raw)
+        if m:
+            headline, action = fn(m)
+            return headline, action, raw
+    return None, None, raw
+
+
 def classify_import_errors(results):
     """results: [{'name','type','status','error'}] from TSClient.import_tml.
     Returns findings: list of {kind, object, ...}:
@@ -100,23 +146,30 @@ def classify_import_errors(results):
     return findings
 
 
-def warehouse_missing_findings(items, column_case_map, connection=""):
+def warehouse_missing_findings(items, cdw_map, fallback_map=None, connection=""):
     """Enumerate EVERY promoted table column absent from the target warehouse, UP FRONT.
 
     ThoughtSpot's VALIDATE_ONLY stops at the FIRST missing column per table, so relying on it
-    surfaces missing columns one-per-round (whack-a-mole). We already fetch the target's column
-    set for casing, so diff each table's columns against it and return the whole set at once.
+    surfaces missing columns one-per-round (whack-a-mole). We diff each table's columns against the
+    warehouse's own column set and return the whole set at once.
 
-    column_case_map: {table_name.lower(): {db_column_name.lower(): actual_db_column_name}}.
-      Two provenances (see app export step): the CONNECTION path reads the real warehouse
-      (authoritative), the fast path reads the target's already-MODELED logical table (which may
-      model only a SUBSET of warehouse columns — a valid column can look 'missing' there). So
-      findings are marked `predicted=True` and carry a `caveat`; the UI must not treat them as
-      hard failures the way it treats validation-confirmed errors.
+    Source of truth is the TARGET CONNECTION (the CDW). `cdw_map` is that authoritative set,
+    read straight from the warehouse via connection/search:
+        {table_name.lower(): {db_column_name.lower(): actual_db_column_name}}.
+    A column absent from `cdw_map` genuinely does not exist in the warehouse (this is what import
+    error 14536 reports) → finding marked `verified=True`, no caveat.
+
+    `fallback_map` (optional) is the target org's already-MODELED logical-table columns — used ONLY
+    for a table the connection could not introspect (warehouse unreachable / timed out). The org's
+    modeled set can be a SUBSET of the warehouse, so a column present in the CDW but not modeled
+    there would look missing. Findings from the fallback are marked `verified=False` + a caveat, so
+    the UI can flag them as unconfirmed rather than a hard warehouse error.
 
     Returns findings in the same shape as classify_import_errors' 'missing_in_target_warehouse',
-    plus predicted/caveat flags. Tables with no casing entry are skipped (can't assert).
+    plus a `verified` flag. A table in neither map is skipped (nothing to assert against).
     """
+    cdw_map = cdw_map or {}
+    fallback_map = fallback_map or {}
     findings = []
     for item in items:
         try:
@@ -126,25 +179,32 @@ def warehouse_missing_findings(items, column_case_map, connection=""):
         t = (doc or {}).get("table")
         if not t or not t.get("name"):
             continue
-        wh = column_case_map.get(t["name"].strip().lower())
+        key = t["name"].strip().lower()
+        wh = cdw_map.get(key)
+        verified = wh is not None
+        if wh is None:
+            wh = fallback_map.get(key)
         if not wh:
-            continue  # no warehouse/target casing for this table -> cannot assert anything
+            continue  # warehouse couldn't be read and no fallback -> cannot assert anything
         for c in t.get("columns", []) or []:
             dbn = (c.get("db_column_name") or c.get("name") or "").strip()
             if not dbn or dbn.lower() in wh:
                 continue
             db, sch = t.get("db", ""), t.get("schema", "")
             phys = t.get("db_table") or t.get("name")
-            findings.append({
+            f = {
                 "kind": "missing_in_target_warehouse",
                 "object": t["name"],
                 "column": dbn,
                 "column_fqn": ".".join(x for x in (db, sch, phys, dbn) if x),
                 "connection": (t.get("connection") or {}).get("name") or connection,
-                "predicted": True,
-                "caveat": "predicted from the target's known column set — verify against the "
-                          "warehouse before dropping (a column modeled as a subset can look missing)",
-            })
+                "verified": verified,
+            }
+            if not verified:
+                f["caveat"] = ("could not read the warehouse for this table — based on the target's "
+                               "modeled columns, so a column that exists in the warehouse but isn't "
+                               "modeled could show here. Verify before dropping.")
+            findings.append(f)
     return findings
 
 
