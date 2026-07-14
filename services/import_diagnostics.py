@@ -100,6 +100,54 @@ def classify_import_errors(results):
     return findings
 
 
+def warehouse_missing_findings(items, column_case_map, connection=""):
+    """Enumerate EVERY promoted table column absent from the target warehouse, UP FRONT.
+
+    ThoughtSpot's VALIDATE_ONLY stops at the FIRST missing column per table, so relying on it
+    surfaces missing columns one-per-round (whack-a-mole). We already fetch the target's column
+    set for casing, so diff each table's columns against it and return the whole set at once.
+
+    column_case_map: {table_name.lower(): {db_column_name.lower(): actual_db_column_name}}.
+      Two provenances (see app export step): the CONNECTION path reads the real warehouse
+      (authoritative), the fast path reads the target's already-MODELED logical table (which may
+      model only a SUBSET of warehouse columns — a valid column can look 'missing' there). So
+      findings are marked `predicted=True` and carry a `caveat`; the UI must not treat them as
+      hard failures the way it treats validation-confirmed errors.
+
+    Returns findings in the same shape as classify_import_errors' 'missing_in_target_warehouse',
+    plus predicted/caveat flags. Tables with no casing entry are skipped (can't assert).
+    """
+    findings = []
+    for item in items:
+        try:
+            doc = _parse_edoc(item)
+        except Exception:  # malformed edoc — skip, don't crash the diff
+            continue
+        t = (doc or {}).get("table")
+        if not t or not t.get("name"):
+            continue
+        wh = column_case_map.get(t["name"].strip().lower())
+        if not wh:
+            continue  # no warehouse/target casing for this table -> cannot assert anything
+        for c in t.get("columns", []) or []:
+            dbn = (c.get("db_column_name") or c.get("name") or "").strip()
+            if not dbn or dbn.lower() in wh:
+                continue
+            db, sch = t.get("db", ""), t.get("schema", "")
+            phys = t.get("db_table") or t.get("name")
+            findings.append({
+                "kind": "missing_in_target_warehouse",
+                "object": t["name"],
+                "column": dbn,
+                "column_fqn": ".".join(x for x in (db, sch, phys, dbn) if x),
+                "connection": (t.get("connection") or {}).get("name") or connection,
+                "predicted": True,
+                "caveat": "predicted from the target's known column set — verify against the "
+                          "warehouse before dropping (a column modeled as a subset can look missing)",
+            })
+    return findings
+
+
 def silent_drop_findings(source_table_docs, target_docs_by_name):
     """Pre-import safety net for the SILENT target-extra case the platform never reports.
 

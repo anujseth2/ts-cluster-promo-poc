@@ -25,7 +25,7 @@ from services.tml_transformer import (
 )
 from services.import_diagnostics import (
     classify_import_errors, drop_columns, silent_drop_findings, column_dependents, column_usage,
-    drop_vizzes, table_drop_preview, drop_tables,
+    drop_vizzes, table_drop_preview, drop_tables, warehouse_missing_findings,
 )
 from services.table_matcher import column_signature
 from services.feedback_replace import feedback_preview, replace_prep, replace_finalize
@@ -171,19 +171,31 @@ def git_client() -> GitClient:
 
 def _go(step: int):
     st.session_state.step = step
+    # Remember the furthest step reached so the breadcrumb can navigate FORWARD
+    # to already-completed stages (not just backward). Home returns to step 0 but
+    # keeps this frontier, so it stays distinct from Reset (which clears it).
+    st.session_state.max_step = max(st.session_state.get("max_step", 0), step)
     st.rerun()
 
 
-def _nav(step: int, can_next: bool = True):
+def _nav(step: int, can_next: bool = True, next_hint: str = ""):
     st.divider()
-    col_back, _, col_next = st.columns([1, 6, 1])
+    col_back, col_mid, col_next = st.columns([1, 6, 1])
     with col_back:
         if step > 0 and st.button("← Back", key=f"back_{step}"):
             _go(step - 1)
     with col_next:
-        if step < len(STEPS) - 1 and can_next:
-            if st.button("Next →", type="primary", key=f"next_{step}"):
-                _go(step + 1)
+        if step < len(STEPS) - 1:
+            if can_next:
+                if st.button("Next →", type="primary", key=f"next_{step}"):
+                    _go(step + 1)
+            else:
+                # Show a disabled Next so the control never just vanishes, and
+                # explain WHY it's blocked instead of leaving the user stuck.
+                st.button("Next →", key=f"next_{step}", disabled=True)
+    if step < len(STEPS) - 1 and not can_next and next_hint:
+        with col_mid:
+            st.caption(f"⛔ {next_hint}")
 
 
 # ── Page setup ────────────────────────────────────────────────────────────────
@@ -243,6 +255,10 @@ with st.sidebar:
 # ── Step indicator ─────────────────────────────────────────────────────────────
 
 step = st.session_state.get("step", 0)
+# The furthest stage reached — every step up to here is navigable in BOTH
+# directions from the breadcrumb (keep it at least at the current step).
+max_step = max(st.session_state.get("max_step", 0), step)
+st.session_state.max_step = max_step
 
 cols = st.columns(len(STEPS))
 for i, (col, label) in enumerate(zip(cols, STEPS)):
@@ -253,7 +269,8 @@ for i, (col, label) in enumerate(zip(cols, STEPS)):
                 f"font-weight:700;font-size:13px'>{label}</div>",
                 unsafe_allow_html=True,
             )
-        elif i < step:
+        elif i <= max_step:
+            # Reached before (behind or ahead of the current step) → clickable.
             if st.button(label, key=f"step_{i}", use_container_width=True):
                 _go(i)
         else:
@@ -650,7 +667,14 @@ if step == 0:
             st.session_state.selected_ids = []
 
     can_next = bool(st.session_state.get("selected_ids")) and not unsafe
-    _nav(0, can_next=can_next)
+    if unsafe:
+        hint = ("Some excluded objects are missing on the target — re-include them, "
+                "acknowledge the drop, or add them to the target first.")
+    elif not st.session_state.get("selected_ids"):
+        hint = "Select at least one asset to promote."
+    else:
+        hint = ""
+    _nav(0, can_next=can_next, next_hint=hint)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1045,7 +1069,15 @@ elif step == 1:
         bool(status) and not [r for r in status if not r["ok"]]
         and not [r for r in table_rows if r["state"] == "mismatch"]
     )
-    _nav(1, can_next=all_ok)
+    if not status:
+        nav_hint = "Resolve obj_id setup for the selected assets first."
+    elif [r for r in status if not r["ok"]]:
+        nav_hint = "Some objects still need an obj_id assigned before you can continue."
+    elif [r for r in table_rows if r["state"] == "mismatch"]:
+        nav_hint = "Resolve the table match/mismatch(es) above before continuing."
+    else:
+        nav_hint = ""
+    _nav(1, can_next=all_ok, next_hint=nav_hint)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1120,21 +1152,26 @@ elif step == 2:
             column_case_map = {}
             _cc_trace = []
             tgt_conn = teams[team_name].get("target_connection", "")
-            if promoted and tgt_conn:
+            # Fast path first: read casing straight from tables already on the target (a TML
+            # metadata read — no warehouse round-trip). This covers every table that already
+            # exists on the target, which is the common case, and keeps this step instant.
+            try:
+                column_case_map = target_client().table_column_cases(names)
+            except Exception:
+                column_case_map = {}
+            # Slow path, only for tables NOT already on the target: ask the warehouse directly
+            # through the connection. This wakes the warehouse and can take minutes on a cold
+            # start, so we do it solely for the tables the fast read couldn't resolve.
+            uncovered = [n for n in names if n.strip().lower() not in column_case_map]
+            if uncovered and tgt_conn:
+                _unc = {n.strip().lower() for n in uncovered}
+                _unc_promoted = [p for p in promoted if p["name"].strip().lower() in _unc]
                 try:
-                    column_case_map = target_client().connection_column_cases(
-                        tgt_conn, promoted, debug=_cc_trace)
+                    for k, v in target_client().connection_column_cases(
+                            tgt_conn, _unc_promoted, debug=_cc_trace).items():
+                        column_case_map.setdefault(k, v)
                 except Exception as _e:
                     _cc_trace.append({"auth_type": "(call failed)", "error": str(_e)[:200]})
-                    column_case_map = {}
-            # Fallback: any table the connection didn't cover -> read an existing target table.
-            uncovered = [n for n in names if n.strip().lower() not in column_case_map]
-            if uncovered:
-                try:
-                    for k, v in target_client().table_column_cases(uncovered).items():
-                        column_case_map.setdefault(k, v)
-                except Exception:
-                    pass
             # Diagnostic: capture how column casing resolved, so the Git Operations page can show
             # why a table did/didn't get recased (connection found? which coords were tried?).
             _cid, _auth = (None, None)
@@ -1152,6 +1189,9 @@ elif step == 2:
                 "coords":         {p["name"]: f'{p["database"]}.{p["schema"]}.{p["table"]}' for p in promoted},
                 "fetch_trace":    _cc_trace,
             }
+            # Keep the target column set around: Stage 2 diffs against it to list ALL
+            # missing-from-warehouse columns at once (VALIDATE_ONLY reports one per round).
+            st.session_state._column_case_map = column_case_map
             transformed_items, warnings = transform_items(
                 items,
                 source_connection=teams[team_name].get("source_connection", ""),
@@ -1355,12 +1395,32 @@ elif step == 2:
             type_mismatch = [f for f in findings if f["kind"] == "type_mismatch"]
             other        = [f for f in findings if f["kind"] == "other"]
 
+            # VALIDATE_ONLY reports only the FIRST missing column per table, so the reviewer
+            # otherwise fixes them one-per-round. Pre-diff the promoted tables against the target
+            # column set fetched at export to surface EVERY missing column now. Validation-confirmed
+            # findings win over predicted ones (same table+column), so no duplicate rows.
+            ccm = st.session_state.get("_column_case_map") or {}
+            if ccm:
+                confirmed_keys = {(f["object"].strip().lower(), f["column"].strip().lower())
+                                  for f in wh_missing}
+                predicted = warehouse_missing_findings(
+                    st.session_state.get("transformed_items", []), ccm,
+                    connection=teams[team_name].get("target_connection", ""))
+                for f in predicted:
+                    if (f["object"].strip().lower(), f["column"].strip().lower()) not in confirmed_keys:
+                        wh_missing.append(f)
+
             # The failed table's header name is often "unknown"; recover the real table name
             # from the error FQN + the promotion bundle so target lookups resolve.
             for f in type_mismatch:
                 f["object"] = _resolve_finding_table(f)
 
-            st.error(f"Validation found {len(findings)} issue(s) to resolve before import.")
+            _predicted_extra = sum(1 for f in wh_missing if f.get("predicted"))
+            _issue_msg = f"Validation found {len(findings)} issue(s) to resolve before import."
+            if _predicted_extra:
+                _issue_msg += (f"  Plus {_predicted_extra} more column(s) predicted missing from the "
+                               "target's known column set (shown below, marked ⚠︎ predicted).")
+            st.error(_issue_msg)
 
             # Casing diagnostic: if a column is flagged as "missing from warehouse", it usually
             # means the connection-based recasing did not resolve that table. Show what happened.
@@ -1403,12 +1463,18 @@ elif step == 2:
                     "cannot import as-is. **Default is to keep them** — add the column to the target "
                     "warehouse, then re-run. Tick a column only to **drop** it from this promotion "
                     "(along with any visualization that uses it).")
+                if any(f.get("predicted") for f in wh_missing):
+                    st.caption("⚠︎ **predicted** rows come from diffing against the target's known "
+                               "column set (not a confirmed import error). Validation reports only the "
+                               "first missing column per table, so these are surfaced early — verify "
+                               "against the warehouse before dropping.")
                 drop_set = set()
                 for f in wh_missing:
                     parts = (f.get("column_fqn") or "").split(".")
                     tbl   = parts[-2] if len(parts) >= 2 else f.get("object", "")
+                    mark  = "⚠︎ predicted · " if f.get("predicted") else ""
                     if st.checkbox(
-                            f"Drop  `{f['column']}`   ·   table `{tbl}`   ·   {f['connection']}",
+                            f"{mark}Drop  `{f['column']}`   ·   table `{tbl}`   ·   {f['connection']}",
                             value=False, key=f"dropwh_{f['object']}_{f['column']}"):
                         drop_set.add(f["column"])
                 if st.button("Apply choices, re-export & re-validate", type="primary"):
@@ -1754,7 +1820,8 @@ elif step == 2:
                         st.session_state.import_phase = "complete"
                         st.rerun()
 
-    _nav(2, can_next="import_results" in st.session_state)
+    _nav(2, can_next="import_results" in st.session_state,
+         next_hint="Run the import above to see results on the next step.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
