@@ -8,8 +8,31 @@ import json
 from services.import_diagnostics import (
     classify_import_errors, warehouse_missing_findings, friendly_error,
     drop_columns, drop_vizzes, drop_tables, column_usage, column_dependents,
-    column_drop_cascade, dangling_reference_findings,
+    column_drop_cascade, dangling_reference_findings, table_cleanup_findings,
 )
+
+
+def test_table_cleanup_flags_empty_table():
+    # all columns dropped -> 0 left -> import "0 columns. Not allowed." -> must drop the table.
+    item = {"edoc": json.dumps({"table": {"name": "lupus_x", "columns": []}}), "info": {"name": "t"}}
+    f = table_cleanup_findings([item])
+    assert len(f) == 1 and f[0]["kind"] == "drop_table" and f[0]["reason"] == "empty"
+    assert f[0]["table"] == "lupus_x"
+
+
+def test_table_cleanup_flags_disconnected_table():
+    # C has no join in or out (its join key was dropped) -> unreachable -> drop it. A<->B stay.
+    doc = {"model": {"name": "M", "model_tables": [
+        {"name": "A", "joins": [{"with": "B", "on": "[A::k] = [B::k]"}]},
+        {"name": "B"},
+        {"name": "C"}]}}
+    f = table_cleanup_findings([{"edoc": json.dumps(doc), "info": {"name": "m"}}])
+    assert {x["table"] for x in f if x["reason"] == "disconnected"} == {"C"}
+
+
+def test_table_cleanup_single_table_model_not_flagged():
+    doc = {"model": {"name": "M", "model_tables": [{"name": "solo"}]}}
+    assert table_cleanup_findings([{"edoc": json.dumps(doc), "info": {"name": "m"}}]) == []
 
 
 def test_dangling_reference_findings_flags_formula_pointing_at_removed_formula():

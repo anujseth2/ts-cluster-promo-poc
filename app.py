@@ -26,7 +26,7 @@ from services.tml_transformer import (
 from services.import_diagnostics import (
     classify_import_errors, drop_columns, silent_drop_findings, column_dependents, column_usage,
     drop_vizzes, table_drop_preview, drop_tables, warehouse_missing_findings, friendly_error,
-    column_drop_cascade, finding_key, dangling_reference_findings,
+    column_drop_cascade, finding_key, dangling_reference_findings, table_cleanup_findings,
 )
 from services.table_matcher import column_signature
 from services.feedback_replace import feedback_preview, replace_prep, replace_finalize
@@ -166,6 +166,25 @@ def _log_validate(files, results):
     except Exception:
         pass
     return rec
+
+
+def _prune_tables_whole(items, table_names):
+    """Drop whole tables from the promotion: prune them from the model(s) (drop_tables cascades the
+    model_tables entry, joins, surfaced columns, formulas, vizzes) AND remove each table's own TML
+    item so it is not committed/validated/imported. Returns (new_items, summary)."""
+    names = {(n or "").strip().lower() for n in table_names if n}
+    if not names:
+        return items, {"tables": 0, "columns": 0, "joins": 0, "formulas": 0, "vizzes": 0}
+    pruned, summary = drop_tables(items, table_names)
+    # remove the pruned tables' own TML items (drop_tables only cleans references, not the item)
+    out = []
+    for it in pruned:
+        d = _parse_edoc(it.get("edoc", "{}"))
+        t = d.get("table")
+        if t and (t.get("name") or "").strip().lower() in names:
+            continue   # this IS one of the dropped tables — drop its item entirely
+        out.append(it)
+    return out, summary
 
 
 def _log_discovery_pass(passes, errs, found, drop_set, viz_set, man, removed):
@@ -1598,6 +1617,17 @@ elif step == 2:
                 if viz_set:
                     work, _dv = drop_vizzes(work, viz_set)
                     removed += _dv
+                # Tables emptied (0 columns left) or orphaned (join key dropped -> unreachable) by
+                # those column drops must be pruned WHOLE — else they fail import as "0 columns" /
+                # "No matches found for table". Detect statically and drop them on the copy so the
+                # probe converges instead of dead-ending on the opaque error.
+                _tf = table_cleanup_findings(work)
+                if _tf:
+                    for f in _tf:
+                        seen.setdefault(finding_key(f), f)
+                    work, _ts = _prune_tables_whole(work, {f["table"] for f in _tf})
+                    removed += (_ts["tables"] + _ts["columns"] + _ts["joins"]
+                                + _ts["formulas"] + _ts["vizzes"])
                 _log_discovery_pass(passes, errs, found, drop_set, viz_set, _m, removed)
                 _tick(f"Pass {passes} · dropped {removed} dependent item(s) on the copy "
                       f"(logged to discovery.jsonl); re-validating…", 0.95)
@@ -1859,6 +1889,7 @@ elif step == 2:
             type_mismatch = [f for f in findings if f["kind"] == "type_mismatch"]
             invalid_formula = [f for f in findings if f["kind"] == "invalid_formula_ids"]
             dangling     = [f for f in findings if f["kind"] == "dangling_ref"]
+            drop_table_find = [f for f in findings if f["kind"] == "drop_table"]
             other        = [f for f in findings if f["kind"] == "other"]
 
             # VALIDATE_ONLY reports only the FIRST missing column per table, so the reviewer
@@ -2168,6 +2199,23 @@ elif step == 2:
                                    value=True, key=f"dropdang_{f.get('object','')}_{_nm}"):
                         dang_drop.add(_nm)
 
+            # ── whole tables to prune: emptied (0 columns) or disconnected (join key dropped) ──
+            tbl_drop = set()
+            if drop_table_find:
+                st.markdown("#### Tables to drop whole (unusable after column drops)")
+                st.caption("Detected by the tool — the platform reports these only as “0 columns” "
+                           "or “No matches found for table”. Each has no columns left, or lost the "
+                           "join that connected it. Dropping removes the table, its joins, and the "
+                           "columns it surfaced in the model.")
+                for f in sorted(drop_table_find, key=lambda x: x.get("table", "")):
+                    _tn = f.get("table", "?")
+                    _rz = "empty — 0 columns left" if f.get("reason") == "empty" else "disconnected — join key dropped"
+                    if st.checkbox(f"Drop table  `{_tn}`  ·  _{_rz}_", value=True,
+                                   key=f"droptbl_{_tn}"):
+                        tbl_drop.add(_tn)
+                    if f.get("reason") == "disconnected":
+                        st.caption(f"   ↳ keep it instead by restoring its join-key column in the target warehouse")
+
             # ── anything unrecognised ──
             if other:
                 st.markdown("#### Other validation errors")
@@ -2302,16 +2350,24 @@ elif step == 2:
                     _pre = "dropwh_" if f["kind"] == "missing_in_target_warehouse" else "droptm_"
                     if st.session_state.get(f"{_pre}{f['object']}_{f['column']}"):
                         _all_drop.add(f["column"])
+                _tbl_now = set(tbl_drop)   # whole tables to prune (empty / disconnected)
                 st.divider()
+                _lbl_tbl = f" + {len(_tbl_now)} table(s)" if _tbl_now else ""
                 st.caption("All of the above was found by validating repeatedly until clean — "
                            "tick what to drop, then resolve everything in a single re-validate.")
-                if st.button(f"Apply all resolutions & re-validate  ·  {len(_all_drop)} column(s) to drop",
+                if st.button(f"Apply all resolutions & re-validate  ·  {len(_all_drop)} column(s){_lbl_tbl} to drop",
                              type="primary"):
                     if _all_drop:
                         fixed, _man = drop_columns(st.session_state.transformed_items, _all_drop)
                         st.session_state.transformed_items = fixed
                         _record_drop(_man)
                         st.session_state.setdefault("dropped_col_names", set()).update(_all_drop)
+                    if _tbl_now:
+                        # Prune whole tables (empty / orphaned) and persist so a re-export keeps them
+                        # dropped — mirrors the not-on-target prune path.
+                        pruned, _psum = _prune_tables_whole(st.session_state.transformed_items, _tbl_now)
+                        st.session_state.transformed_items = pruned
+                        st.session_state.setdefault("prune_tables", set()).update(_tbl_now)
                     filtered_fixed = [i for i in st.session_state.transformed_items
                                       if i.get("info", {}).get("name") not in skip_objects]
                     with st.spinner("Re-committing and re-validating…"):

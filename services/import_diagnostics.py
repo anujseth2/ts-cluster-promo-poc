@@ -178,7 +178,62 @@ def finding_key(f):
         return (k, obj, tuple(sorted((x or "").lower() for x in f.get("formulas", []))))
     if k == "dangling_ref":
         return (k, obj, (f.get("name") or "").strip().lower())
+    if k == "drop_table":
+        return (k, (f.get("table") or "").strip().lower())
     return (k, obj, (f.get("error") or "")[:200])
+
+
+def table_cleanup_findings(items):
+    """Tables that must be pruned WHOLE after column drops — the platform reports these only as
+    opaque failures the reviewer can't act on, so detect them statically:
+
+      empty        — the table has 0 columns left after drops. Import hard-fails "Attempting to
+                     create a table with 0 columns. Not allowed."
+      disconnected — a model table with no join path to the rest of the model (its join key was
+                     among the dropped columns), yet its columns are still surfaced. Import fails
+                     "No matches found for table ." during join translation.
+
+    Both resolve by dropping the whole table (drop_tables cascades its model_tables entry, joins,
+    surfaced columns, formulas and vizzes) AND removing the table's own TML from the set. Returns
+    findings kind 'drop_table' with a `reason`, deduped by table name (empty wins over
+    disconnected). A single-table model is never flagged as disconnected."""
+    empty, disconnected = {}, {}
+    for item in items:
+        try:
+            doc = _parse_edoc(item)
+        except Exception:
+            continue
+        t = doc.get("table")
+        if t and t.get("name") and t.get("columns") is not None and len(t["columns"]) == 0:
+            nm = t["name"]
+            empty[nm.lower()] = {"kind": "drop_table", "object": nm, "table": nm, "reason": "empty",
+                                 "error": (f"Table '{nm}' has no columns left after drops — it "
+                                           f"can't be created, so the whole table must be dropped.")}
+        for key in ("model", "worksheet"):
+            node = doc.get(key)
+            if not node:
+                continue
+            mts = node.get("model_tables") or []
+            if len(mts) <= 1:
+                continue   # single-table model — nothing to disconnect
+            has_out, targets = set(), set()
+            for mt in mts:
+                if mt.get("joins"):
+                    has_out.add((mt.get("name") or "").lower())
+                for j in mt.get("joins", []) or []:
+                    targets.add((j.get("with") or "").lower())
+            connected = has_out | targets
+            for mt in mts:
+                nm = mt.get("name") or ""
+                if nm and nm.lower() not in connected:
+                    disconnected[nm.lower()] = {
+                        "kind": "drop_table", "object": nm, "table": nm, "reason": "disconnected",
+                        "error": (f"Table '{nm}' lost its join(s) — its join key was dropped — so "
+                                  f"it's unreachable in the model. Drop the table, or restore the "
+                                  f"join-key column in the target warehouse to keep it.")}
+    out = list(empty.values())
+    out += [f for k, f in disconnected.items() if k not in empty]
+    return out
 
 
 def dangling_reference_findings(items):
