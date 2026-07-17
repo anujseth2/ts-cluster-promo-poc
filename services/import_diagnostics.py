@@ -151,6 +151,19 @@ def classify_import_errors(results):
     return findings
 
 
+def finding_key(f):
+    """Stable identity for a classified finding, for deduping the union across probe passes."""
+    k = f.get("kind")
+    obj = (f.get("object") or "").strip().lower()
+    if k in ("missing_in_target_warehouse", "type_mismatch"):
+        return (k, obj, (f.get("column") or "").strip().lower())
+    if k == "drop_blocked_by_dependents":
+        return (k, obj, tuple(sorted((c or "").lower() for c in f.get("columns", []))))
+    if k == "viz_error":
+        return (k, obj, tuple(sorted(str(v) for v in f.get("vizzes", []))))
+    return (k, obj, (f.get("error") or "")[:200])
+
+
 def warehouse_missing_findings(items, cdw_map, fallback_map=None, connection=""):
     """Enumerate EVERY promoted table column absent from the target warehouse, UP FRONT.
 
@@ -448,33 +461,45 @@ def drop_columns(items, columns):
             node = doc.get(key)
             if not node:
                 continue
-            # Cascade formulas to a fixpoint: removing a formula that used a dropped column can
-            # in turn orphan another formula that referenced it.
-            if node.get("formulas"):
-                changed = True
-                while changed:
-                    changed = False
+            # Formulas AND the columns that surface them cascade together to a fixpoint:
+            #  - a formula referencing a removed name is removed (its name joins `removed`),
+            #  - a model column whose column_id is `formula_<name>` for a removed formula is ALSO
+            #    removed — otherwise it dangles as an "invalid formula ID" on import,
+            #  - removing that column can in turn orphan another formula, so we re-scan.
+            changed = True
+            while changed:
+                changed = False
+                if node.get("formulas"):
                     keep = []
                     for fdef in node["formulas"]:
                         if _refs_any(fdef, removed):
                             man["formulas"].append(fdef.get("name", "?"))
                             nm = (fdef.get("name", "") or "").strip().lower()
                             if nm and nm not in removed:
-                                removed.add(nm); changed = True   # re-scan: downstream formulas
+                                removed.add(nm); changed = True
                         else:
                             keep.append(fdef)
                     node["formulas"] = keep
+                if node.get("columns") is not None:
+                    keep = []
+                    for c in node["columns"]:
+                        cid = (c.get("column_id", "") or "").strip().lower()
+                        surfaces_removed_formula = (
+                            cid.startswith("formula_") and cid[len("formula_"):] in removed)
+                        if _col_name(c) in targets or surfaces_removed_formula:
+                            man["columns"] += 1
+                            dn = (c.get("name", "") or "").strip().lower()
+                            if dn and dn not in removed:
+                                removed.add(dn); changed = True   # re-scan: vizzes/formulas on it
+                        else:
+                            keep.append(c)
+                    node["columns"] = keep
             # Joins whose `on` condition references a removed name.
             for mt in (node.get("model_tables") or node.get("tables") or []):
                 if mt.get("joins"):
                     before = len(mt["joins"])
                     mt["joins"] = [j for j in mt["joins"] if not _refs_any(j, removed)]
                     man["joins"] += before - len(mt["joins"])
-            # The columns themselves (physical target names).
-            if node.get("columns") is not None:
-                before = len(node["columns"])
-                node["columns"] = [c for c in node["columns"] if _col_name(c) not in targets]
-                man["columns"] += before - len(node["columns"])
 
         t = doc.get("table")
         if t and t.get("columns") is not None:

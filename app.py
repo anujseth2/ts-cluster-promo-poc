@@ -26,7 +26,7 @@ from services.tml_transformer import (
 from services.import_diagnostics import (
     classify_import_errors, drop_columns, silent_drop_findings, column_dependents, column_usage,
     drop_vizzes, table_drop_preview, drop_tables, warehouse_missing_findings, friendly_error,
-    column_drop_cascade,
+    column_drop_cascade, finding_key,
 )
 from services.table_matcher import column_signature
 from services.feedback_replace import feedback_preview, replace_prep, replace_finalize
@@ -1477,6 +1477,63 @@ elif step == 2:
             err = [r for r in results if r["status"] != "OK"]
             return pr_url, err, ok
 
+        def _discover_all_issues(items, progress=None):
+            """Probe: VALIDATE_ONLY a throwaway COPY, neutralize each pass's issues (drop the
+            reported columns / vizzes / invalid-formula columns), and re-validate — looping UNTIL
+            the copy validates clean, or a pass makes no progress (can't neutralize -> stop). No
+            git commits; validates TML strings directly. Returns (union_findings, clean, passes).
+            The real promotion bundle is untouched — this only enumerates."""
+            import re as _re
+            _tick = progress or (lambda *_a: None)
+            work = [dict(it) for it in items]
+            seen, passes, clean = {}, 0, False
+            SAFETY = 40   # backstop only; real termination is clean / no-progress
+            while passes < SAFETY:
+                passes += 1
+                files = items_to_files(work)
+                strings = ([c for p, c in files.items() if p.startswith("tables/")]
+                           + [c for p, c in files.items() if p.startswith("models/")])
+                if not strings:
+                    clean = True
+                    break
+                _tick(f"Pass {passes}: validating {len(strings)} file(s)…")
+                try:
+                    results = target_client().import_tml(strings, policy="VALIDATE_ONLY")
+                except Exception as _e:
+                    _tick(f"Pass {passes}: {friendly_error(str(_e))[0] or 'validation failed'}")
+                    break
+                _log_validate(files, results)
+                errs = [r for r in results if r["status"] != "OK"]
+                if not errs:
+                    clean = True
+                    break
+                for f in classify_import_errors(errs):
+                    seen.setdefault(finding_key(f), f)
+                # Neutralize this pass's issues on the copy so the NEXT ones surface.
+                drop_set, viz_set = set(), set()
+                for f in classify_import_errors(errs):
+                    if f["kind"] in ("missing_in_target_warehouse", "type_mismatch"):
+                        drop_set.add(f["column"])
+                    elif f["kind"] == "drop_blocked_by_dependents":
+                        drop_set.update(f.get("columns", []))
+                    elif f["kind"] == "viz_error":
+                        viz_set.update(f.get("vizzes", []))
+                    elif f["kind"] == "other":     # e.g. invalid formula IDs -> drop those columns
+                        for fm in _re.findall(r"<b>(.*?)</b>", f.get("error", "") or ""):
+                            fm = fm.strip()
+                            if fm and not fm.endswith(":"):
+                                drop_set.add(fm)
+                removed = 0
+                if drop_set:
+                    work, _m = drop_columns(work, drop_set)
+                    removed += _m["columns"] + _m["joins"] + len(_m["formulas"])
+                if viz_set:
+                    work, _dv = drop_vizzes(work, viz_set)
+                    removed += _dv
+                if removed == 0:
+                    break   # nothing could be neutralized -> no progress, stop
+            return list(seen.values()), clean, passes
+
         def _safe_validate(items, step=None):
             """_run_validation, but a hard connection failure (e.g. 10054 after the client's
             auto-retries) becomes a friendly message + a logged run — not a raw traceback.
@@ -1609,6 +1666,37 @@ elif step == 2:
         else:
             st.markdown(f"**PR:** [{st.session_state.pr_url}]({st.session_state.pr_url})")
 
+        # Discover ALL issues up front: loop VALIDATE_ONLY (on a throwaway copy) until it validates
+        # clean, so every missing column / type drift surfaces at once and you resolve them in ONE
+        # decision — instead of one column-per-table per manual re-validate. Slower, but it never
+        # touches the connection/search COLUMN path that 504s; it reuses import VALIDATE_ONLY.
+        if "pr_url" in st.session_state and filtered_items:
+            _dm = st.session_state.get("discovered_meta")
+            _lbl = "🔎 Discover all issues (validate repeatedly until clean)"
+            if _dm:
+                _lbl = ("🔎 Re-discover all issues" if _dm.get("clean")
+                        else "🔎 Re-discover (last run stopped before clean)")
+            if st.button(_lbl, help="Validates a throwaway copy repeatedly, neutralizing each pass's "
+                         "issues until it validates clean. The real bundle is untouched."):
+                with st.status("Discovering all issues…", expanded=True) as _disc:
+                    _found, _clean, _passes = _discover_all_issues(filtered_items, progress=st.write)
+                    st.session_state.discovered_findings = _found
+                    st.session_state.discovered_meta = {"clean": _clean, "passes": _passes}
+                    if _found and not st.session_state.get("validation_errors"):
+                        st.session_state.validation_errors = [
+                            {"name": "(probe)", "status": "ERROR", "error": ""}]
+                    _disc.update(
+                        label=(f"Found {len(_found)} issue(s) over {_passes} pass(es)"
+                               + (" — copy then validated clean." if _clean
+                                  else " — stopped (no further progress).")),
+                        state="complete", expanded=False)
+                st.rerun()
+            if _dm:
+                st.caption(f"Discovery: {len(st.session_state.get('discovered_findings', []))} issue(s) "
+                           f"over {_dm['passes']} pass(es)"
+                           + (" · copy validated clean" if _dm.get("clean")
+                              else " · stopped before clean (some errors can't be auto-neutralized)"))
+
         # Raw validation run log — so consecutive runs are diffable (which files were validated,
         # each file's status/error). Full history appended to logs/validate_runs.jsonl.
         _lv = st.session_state.get("_last_validate")
@@ -1624,8 +1712,12 @@ elif step == 2:
         val_errors = st.session_state.get("validation_errors", [])
         val_ok     = st.session_state.get("validation_ok", [])
 
-        if val_errors:
-            findings     = classify_import_errors(val_errors)
+        # Findings come from the discovery probe (the complete union across passes) when it has
+        # run; otherwise from the single latest validate. `_discovered` also switches Stage-2 to a
+        # single "Apply all" (no per-section re-validate round-trips).
+        _discovered = bool(st.session_state.get("discovered_findings"))
+        if val_errors or _discovered:
+            findings     = st.session_state.get("discovered_findings") or classify_import_errors(val_errors)
             wh_missing   = [f for f in findings if f["kind"] == "missing_in_target_warehouse"]
             dep_blocked  = [f for f in findings if f["kind"] == "drop_blocked_by_dependents"]
             type_mismatch = [f for f in findings if f["kind"] == "type_mismatch"]
@@ -1639,22 +1731,24 @@ elif step == 2:
             # the one-per-round validation findings for those tables (no duplicate rows). For a
             # table the warehouse couldn't answer for, we keep the validation-confirmed finding and
             # fall back to the org-modeled column set (flagged 'unverified').
-            cdw_map = st.session_state.get("_warehouse_col_map") or {}
-            org_map = st.session_state.get("_column_case_map") or {}
-            diff_findings = warehouse_missing_findings(
-                st.session_state.get("transformed_items", []), cdw_map, fallback_map=org_map,
-                connection=teams[team_name].get("target_connection", ""))
+            # Skip the CDW merge when the discovery probe already produced the complete union.
+            if not _discovered:
+                cdw_map = st.session_state.get("_warehouse_col_map") or {}
+                org_map = st.session_state.get("_column_case_map") or {}
+                diff_findings = warehouse_missing_findings(
+                    st.session_state.get("transformed_items", []), cdw_map, fallback_map=org_map,
+                    connection=teams[team_name].get("target_connection", ""))
 
-            def _tbl_of(f):
-                parts = (f.get("column_fqn") or "").split(".")
-                return (parts[-2] if len(parts) >= 2 else f.get("object", "")).strip().lower()
+                def _tbl_of(f):
+                    parts = (f.get("column_fqn") or "").split(".")
+                    return (parts[-2] if len(parts) >= 2 else f.get("object", "")).strip().lower()
 
-            covered = {k for k in cdw_map} | {k for k in org_map}
-            # keep only validation-confirmed missing columns for tables neither map could cover
-            confirmed_extra = [f for f in wh_missing if _tbl_of(f) not in covered]
-            for f in confirmed_extra:
-                f["verified"] = True
-            wh_missing = diff_findings + confirmed_extra
+                covered = {k for k in cdw_map} | {k for k in org_map}
+                # keep only validation-confirmed missing columns for tables neither map could cover
+                confirmed_extra = [f for f in wh_missing if _tbl_of(f) not in covered]
+                for f in confirmed_extra:
+                    f["verified"] = True
+                wh_missing = diff_findings + confirmed_extra
 
             # The failed table's header name is often "unknown"; recover the real table name
             # from the error FQN + the promotion bundle so target lookups resolve.
@@ -1749,7 +1843,9 @@ elif step == 2:
                     else:
                         st.caption(f"↳ `{f['column']}` has no dependents in the promotion — dropping "
                                    "it removes only the column.")
-                if st.button("Apply choices, re-export & re-validate", type="primary"):
+                # Per-section apply only in the single-pass path. When discovery has run, one
+                # "Apply all" at the bottom handles every section in a single re-validate.
+                if not _discovered and st.button("Apply choices, re-export & re-validate", type="primary"):
                     if drop_set:
                         fixed, _man = drop_columns(st.session_state.transformed_items, drop_set)
                         st.session_state.transformed_items = fixed
@@ -1857,7 +1953,7 @@ elif step == 2:
                             value=False, key=f"droptm_{f['object']}_{f['column']}"):
                         tm_drop.add(f["column"])
 
-                if st.button("Apply drops, re-export & re-validate", key="tm_apply"):
+                if not _discovered and st.button("Apply drops, re-export & re-validate", key="tm_apply"):
                     if tm_drop:
                         fixed, _man = drop_columns(st.session_state.transformed_items, tm_drop)
                         st.session_state.transformed_items  = fixed
@@ -1894,6 +1990,38 @@ elif step == 2:
                             line = line.strip()
                             if line:
                                 st.markdown(f"- {line}")
+
+            # ── single "Apply all" — only after discovery produced the complete set ──
+            if _discovered:
+                _all_drop = set()
+                for f in wh_missing + type_mismatch:
+                    _pre = "dropwh_" if f["kind"] == "missing_in_target_warehouse" else "droptm_"
+                    if st.session_state.get(f"{_pre}{f['object']}_{f['column']}"):
+                        _all_drop.add(f["column"])
+                st.divider()
+                st.caption("All of the above was found by validating repeatedly until clean — "
+                           "tick what to drop, then resolve everything in a single re-validate.")
+                if st.button(f"Apply all resolutions & re-validate  ·  {len(_all_drop)} column(s) to drop",
+                             type="primary"):
+                    if _all_drop:
+                        fixed, _man = drop_columns(st.session_state.transformed_items, _all_drop)
+                        st.session_state.transformed_items = fixed
+                        _record_drop(_man)
+                        st.session_state.setdefault("dropped_col_names", set()).update(_all_drop)
+                    st.session_state.pop("discovered_findings", None)
+                    st.session_state.pop("discovered_meta", None)
+                    filtered_fixed = [i for i in st.session_state.transformed_items
+                                      if i.get("info", {}).get("name") not in skip_objects]
+                    with st.spinner("Re-committing and re-validating…"):
+                        _res = _safe_validate(filtered_fixed)
+                        if _res:
+                            pr_url, err, ok = _res
+                            st.session_state.pr_url            = pr_url
+                            st.session_state.validation_errors = err
+                            st.session_state.validation_ok     = ok
+                            st.session_state.pop("silent_drops", None)
+                    if _res:
+                        st.rerun()
 
         elif val_ok or val_ok == []:
             tbls = mdls = leaves = 0

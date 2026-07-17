@@ -124,6 +124,30 @@ def test_drop_columns_cascade_removes_dependent_viz_and_prunes_tile(model_item, 
     assert "Viz_1" not in tile_ids           # and its layout tile pruned
 
 
+def test_drop_columns_removes_formula_and_its_surfacing_column():
+    # A model column 'Bio Pen' surfaces a formula that references dropped column CID. Dropping CID
+    # must remove BOTH the formula AND the column that surfaces it (column_id 'formula_Bio Pen'),
+    # else that column dangles as an "invalid formula ID" on import.
+    doc = {"model": {
+        "name": "M",
+        "columns": [
+            {"name": "CID", "column_id": "t::CID"},
+            {"name": "Bio Pen", "column_id": "formula_Bio Pen"},
+            {"name": "Region", "column_id": "t::Region"},
+        ],
+        "formulas": [{"name": "Bio Pen", "expr": "count([CID])"}],
+    }}
+    item = {"edoc": json.dumps(doc), "info": {"name": "M"}}
+    fixed, man = drop_columns([item], {"CID"})
+    out = json.loads(fixed[0]["edoc"])["model"]
+    names = {c["name"] for c in out["columns"]}
+    assert "CID" not in names           # the dropped column
+    assert "Bio Pen" not in names       # its formula-surfacing column — no longer dangles
+    assert "Region" in names            # unrelated column kept
+    assert out["formulas"] == []        # the formula went too
+    assert "Bio Pen" in man["formulas"]
+
+
 def test_column_drop_cascade_is_dry_run(model_item):
     before = json.loads(model_item["edoc"])
     man = column_drop_cascade([model_item], {"Brand_ID"})
