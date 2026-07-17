@@ -566,17 +566,25 @@ def column_dependents(items, columns):
     return deps
 
 
-def _refs_any(obj, removed):
+def _refs_any(obj, removed, removed_qual=None):
     """True if any [table::Col] / [Display] / [Formula Name] / [formula_<Name>] reference inside
-    obj hits a name in `removed` (all lowercased).
+    obj hits a target.
 
-    Formula-to-formula references carry the `formula_` id prefix — `[formula_Call Count]` — while
-    `removed` holds the bare formula NAME (`call count`). So a ref must also match after stripping a
-    leading `formula_`; otherwise a formula that references a dropped formula survives and dangles
-    as a "Schema validation failed" / invalid-formula error on import."""
+    `removed` (bare names, lowercased) matches by NAME regardless of table — used for display
+    names, formula names, and bare-name column drops. `removed_qual` (set of (table, col), both
+    lowercased) matches ONLY a `[table::col]` reference to that exact table — so a warehouse-
+    missing column dropped from ONE table doesn't take out same-named columns on other tables.
+
+    Formula-to-formula refs carry the `formula_` id prefix — `[formula_Call Count]` vs the bare
+    name `call count` — so a ref also matches after stripping a leading `formula_`."""
+    removed_qual = removed_qual or set()
     for expr in _iter_strings(obj):
         for inner in _BRACKET_REF.findall(expr):
-            for cand in (inner.split("::")[-1].strip().lower(), inner.strip().lower()):
+            tail = inner.split("::")[-1].strip().lower()
+            head = inner.split("::")[0].strip().lower() if "::" in inner else None
+            if head is not None and (head, tail) in removed_qual:
+                return True
+            for cand in (tail, inner.strip().lower()):
                 if cand in removed:
                     return True
                 if cand.startswith("formula_") and cand[len("formula_"):] in removed:
@@ -584,12 +592,12 @@ def _refs_any(obj, removed):
     return False
 
 
-def _viz_refs(viz, removed):
+def _viz_refs(viz, removed, removed_qual=None):
     """A liveboard viz references a removed name via its answer_columns or any inner expr."""
     for c in viz.get("answer", {}).get("answer_columns", []) or []:
         if (c.get("name", "") or "").strip().lower() in removed:
             return True
-    return _refs_any(viz, removed)
+    return _refs_any(viz, removed, removed_qual)
 
 
 def drop_columns(items, columns):
@@ -598,12 +606,24 @@ def drop_columns(items, columns):
     (transitively) any formula/viz that referenced THOSE formulas, and any liveboard viz that
     references a removed column/formula. Layout tiles for removed vizzes are pruned too.
 
-    columns may be display or db_column_name.
+    columns may be a bare name (display or db_column_name — matched across ALL tables) OR a
+    qualified `table::col` (matched ONLY on that table, so a warehouse-missing column dropped from
+    one table doesn't take same-named columns off other tables).
     Returns (new_items, manifest) where manifest = {columns, joins, formulas:[names], vizzes}.
     """
-    targets = {c.lower() for c in columns}
+    # Split targets: bare names vs table-qualified (table, col).
+    targets = set()          # bare column names (lowercased)
+    removed_qual = set()     # (table_lower, col_lower) — scoped to that table only
+    for c in columns:
+        cl = (c or "").strip().lower()
+        if "::" in cl:
+            tbl, col = cl.split("::", 1)
+            removed_qual.add((tbl.strip(), col.strip()))
+        else:
+            targets.add(cl)
     # A column dropped by physical name is referenced downstream by its model DISPLAY name, so
-    # seed the "removed reference names" with both.
+    # seed the "removed reference names" with both. (Qualified drops seed their display name when
+    # the surfacing model column is removed, inside the fixpoint loop.)
     all_docs = [_parse_edoc(it) for it in items]
     removed = set(targets) | _resolve_display_names(all_docs, targets)
 
@@ -630,7 +650,7 @@ def drop_columns(items, columns):
                         # Remove a formula if it references a removed column OR is itself a target
                         # (so dropping an invalid/orphaned formula by name works and takes its
                         # surfacing `formula_<name>` column with it).
-                        if _refs_any(fdef, removed) or nm in removed:
+                        if _refs_any(fdef, removed, removed_qual) or nm in removed:
                             man["formulas"].append(fdef.get("name", "?"))
                             if nm and nm not in removed:
                                 removed.add(nm); changed = True
@@ -649,7 +669,12 @@ def drop_columns(items, columns):
                         # removed formula/column.
                         surfaces_removed_formula = (
                             cid.startswith("formula_") and cid[len("formula_"):] in removed)
-                        if _col_name(c) in targets or surfaces_removed_formula or dn in removed:
+                        # qualified: model column_id is `table::col` — drop only if THAT table's
+                        # column is targeted (not a same-named column on another table).
+                        _qual_hit = ("::" in cid
+                                     and (cid.split("::")[0], cid.split("::")[-1]) in removed_qual)
+                        if (_col_name(c) in targets or surfaces_removed_formula or dn in removed
+                                or _qual_hit):
                             man["columns"] += 1
                             man["column_names"].append(c.get("name") or _col_name(c))
                             if dn and dn not in removed:
@@ -660,7 +685,7 @@ def drop_columns(items, columns):
             # Joins whose `on` condition references a removed name.
             for mt in (node.get("model_tables") or node.get("tables") or []):
                 if mt.get("joins"):
-                    _kept_j = [j for j in mt["joins"] if not _refs_any(j, removed)]
+                    _kept_j = [j for j in mt["joins"] if not _refs_any(j, removed, removed_qual)]
                     for j in mt["joins"]:
                         if j not in _kept_j:
                             man["join_names"].append(
@@ -670,9 +695,14 @@ def drop_columns(items, columns):
 
         t = doc.get("table")
         if t and t.get("columns") is not None:
-            _keep_t = [c for c in t["columns"]
-                       if (c.get("name", "") or "").lower() not in targets
-                       and (c.get("db_column_name", "") or "").lower() not in targets]
+            _tl = (t.get("name", "") or "").strip().lower()
+            def _drop_phys(c):
+                nm = (c.get("name", "") or "").lower()
+                dbn = (c.get("db_column_name", "") or "").lower()
+                if nm in targets or dbn in targets:
+                    return True   # bare name — any table
+                return (_tl, nm) in removed_qual or (_tl, dbn) in removed_qual   # qualified — this table
+            _keep_t = [c for c in t["columns"] if not _drop_phys(c)]
             for c in t["columns"]:
                 if c not in _keep_t:
                     man["column_names"].append(f"{t.get('name','')}.{c.get('name') or c.get('db_column_name','')}")
@@ -683,7 +713,7 @@ def drop_columns(items, columns):
         if lb and lb.get("visualizations") is not None:
             kept, kept_ids = [], set()
             for viz in lb["visualizations"]:
-                if _viz_refs(viz, removed):
+                if _viz_refs(viz, removed, removed_qual):
                     man["vizzes"] += 1
                 else:
                     kept.append(viz)

@@ -157,6 +157,41 @@ def test_drop_cascades_formula_that_references_a_dropped_formula():
     assert "Region" in cnames                                 # unrelated column kept
 
 
+def test_drop_columns_qualified_scopes_to_one_table():
+    # Two tables both have column X and both join on it. Dropping "A::X" (qualified) must remove
+    # ONLY A's X and the A-side join ref — B's X and B's own usage stay. Prevents the CID over-drop.
+    doc = {"model": {"name": "M",
+        "columns": [{"name": "A X", "column_id": "A::X"}, {"name": "B X", "column_id": "B::X"}],
+        "model_tables": [
+            {"name": "A", "joins": [{"with": "hub", "on": "[A::X] = [hub::X]"}]},
+            {"name": "B", "joins": [{"with": "hub", "on": "[B::X] = [hub::X]"}]},
+            {"name": "hub"}]}}
+    tblA = {"table": {"name": "A", "columns": [{"name": "X", "db_column_name": "X"}]}}
+    tblB = {"table": {"name": "B", "columns": [{"name": "X", "db_column_name": "X"}]}}
+    items = [{"edoc": json.dumps(doc), "info": {"name": "M"}},
+             {"edoc": json.dumps(tblA), "info": {"name": "A"}},
+             {"edoc": json.dumps(tblB), "info": {"name": "B"}}]
+    fixed, man = drop_columns(items, {"A::X"})   # qualified: only table A
+    m = json.loads(fixed[0]["edoc"])["model"]
+    colids = {c["column_id"] for c in m["columns"]}
+    assert "A::X" not in colids and "B::X" in colids          # only A's model column gone
+    a_join = next(mt for mt in m["model_tables"] if mt["name"] == "A").get("joins", [])
+    b_join = next(mt for mt in m["model_tables"] if mt["name"] == "B").get("joins", [])
+    assert a_join == [] and len(b_join) == 1                   # only A's join dropped, B's kept
+    a_cols = json.loads(fixed[1]["edoc"])["table"]["columns"]
+    b_cols = json.loads(fixed[2]["edoc"])["table"]["columns"]
+    assert a_cols == [] and len(b_cols) == 1                   # only A's physical X gone
+
+
+def test_drop_columns_bare_still_hits_all_tables():
+    # Back-compat: a BARE name still drops from every table (existing behaviour).
+    doc = {"model": {"name": "M",
+        "columns": [{"name": "A X", "column_id": "A::X"}, {"name": "B X", "column_id": "B::X"}]}}
+    fixed, man = drop_columns([{"edoc": json.dumps(doc), "info": {"name": "M"}}], {"X"})
+    m = json.loads(fixed[0]["edoc"])["model"]
+    assert {c["column_id"] for c in m["columns"]} == set()     # both A::X and B::X gone
+
+
 def test_classify_unrecognised_is_other():
     f = classify_import_errors([{"name": "x", "status": "ERROR", "error": "kaboom"}])
     assert f[0]["kind"] == "other" and f[0]["error"] == "kaboom"

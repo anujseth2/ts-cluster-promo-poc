@@ -1604,7 +1604,10 @@ elif step == 2:
                 drop_set, viz_set, tbl_set = set(), set(), set()
                 for f in found:
                     if f["kind"] in ("missing_in_target_warehouse", "type_mismatch"):
-                        drop_set.add(f["column"])
+                        # QUALIFIED drop: the warehouse names the exact table, so scope it to
+                        # <table>::<column> — don't drop same-named columns off other tables.
+                        _obj = (f.get("object") or "").strip()
+                        drop_set.add(f"{_obj}::{f['column']}" if _obj else f["column"])
                     elif f["kind"] == "drop_blocked_by_dependents":
                         drop_set.update(f.get("columns", []))
                     elif f["kind"] == "viz_error":
@@ -2362,7 +2365,8 @@ elif step == 2:
                 for f in wh_missing + type_mismatch:
                     _pre = "dropwh_" if f["kind"] == "missing_in_target_warehouse" else "droptm_"
                     if st.session_state.get(f"{_pre}{f['object']}_{f['column']}"):
-                        _all_drop.add(f["column"])
+                        _obj = (f.get("object") or "").strip()
+                        _all_drop.add(f"{_obj}::{f['column']}" if _obj else f["column"])
                 _tbl_now = set(tbl_drop)   # whole tables to prune (empty / disconnected)
                 st.divider()
                 _lbl_tbl = f" + {len(_tbl_now)} table(s)" if _tbl_now else ""
