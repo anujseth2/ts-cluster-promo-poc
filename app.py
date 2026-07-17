@@ -168,6 +168,36 @@ def _log_validate(files, results):
     return rec
 
 
+def _log_discovery_pass(passes, errs, found, drop_set, viz_set, man, removed):
+    """Append one discovery pass to logs/discovery.jsonl AS IT HAPPENS — so what each pass drops
+    (the "N dependents") is itemized on disk, no one-shot re-capture needed. Never raises."""
+    import datetime
+    from collections import Counter
+    rec = {
+        "ts": datetime.datetime.now().isoformat(timespec="seconds"),
+        "pass": passes,
+        "errors": len(errs),
+        "finding_kinds": dict(Counter(f.get("kind") for f in found)),
+        "targeted_names": sorted(drop_set),
+        "targeted_vizzes": sorted(str(v) for v in viz_set),
+        "removed_total": removed,
+        "dropped": {
+            "columns": (man or {}).get("column_names", []),
+            "joins":   (man or {}).get("join_names", []),
+            "formulas": (man or {}).get("formulas", []),
+            "vizzes":  (man or {}).get("vizzes", 0),
+        },
+    }
+    try:
+        logdir = Path(__file__).parent / "logs"
+        logdir.mkdir(exist_ok=True)
+        with open(logdir / "discovery.jsonl", "a") as fh:
+            fh.write(json.dumps(rec) + "\n")
+    except Exception:
+        pass
+    return rec
+
+
 def _name_slug(name: str) -> str:
     """A stable obj_id slug derived from an object's name (used to pre-fill obj_id suggestions
     for objects that have none). Non-alphanumerics become underscores, repeats collapse."""
@@ -1561,14 +1591,16 @@ elif step == 2:
                             if fm and not fm.endswith(":"):
                                 drop_set.add(fm)
                 removed = 0
+                _m = {}
                 if drop_set:
                     work, _m = drop_columns(work, drop_set)
                     removed += _m["columns"] + _m["joins"] + len(_m["formulas"])
                 if viz_set:
                     work, _dv = drop_vizzes(work, viz_set)
                     removed += _dv
-                _tick(f"Pass {passes} · dropped {removed} dependent item(s) on the copy; "
-                      f"re-validating…", 0.95)
+                _log_discovery_pass(passes, errs, found, drop_set, viz_set, _m, removed)
+                _tick(f"Pass {passes} · dropped {removed} dependent item(s) on the copy "
+                      f"(logged to discovery.jsonl); re-validating…", 0.95)
                 if removed == 0:
                     reason = "no_progress"
                     break   # nothing could be neutralized -> no progress, stop
@@ -2188,37 +2220,43 @@ elif step == 2:
                                     state="complete", expanded=False)
                     st.rerun()
 
-                # Raw error responses are logged AS THEY HAPPEN (target_client().debug_raw_log), so
-                # this opaque failure's full detail is already on disk — offer it for instant grab,
-                # no re-running any validate.
-                _rawlog = Path(__file__).parent / "logs" / "validate_raw.jsonl"
-                if _rawlog.exists() and _rawlog.stat().st_size:
-                    st.caption("Raw error responses are logged automatically as each validate runs "
-                               "— grab this failure's full detail now (no extra calls):")
-                    st.download_button("⬇ Download raw validation log (validate_raw.jsonl)",
-                                       data=_rawlog.read_bytes(), file_name="validate_raw.jsonl",
-                                       mime="application/x-ndjson", key="rawlog_dl")
-                # The one-shot bundle ADDS the leave-one-out bisection — a deliberate experiment,
-                # not a normal call — plus every TML file, for when the raw log alone isn't enough.
-                st.caption("Need the interaction bisection too? Capture a full bundle "
-                           "(leave-one-out + all TML) — slow on a cold warehouse:")
-                if st.button("🐞 Capture debug bundle (leave-one-out + all TML)",
-                             key="dbg_capture"):
+                # Everything is captured AS IT HAPPENS into small logs under logs/ — raw error
+                # responses (validate_raw.jsonl) and every discovery pass's drops (discovery.jsonl).
+                # Grab them instantly; no re-running anything.
+                st.caption("Captured live as the tool ran — download directly, no re-validation:")
+                _dlrow = st.columns(2)
+                for _i, (_lf, _lbl) in enumerate([
+                        ("validate_raw.jsonl", "⬇ Raw validation errors"),
+                        ("discovery.jsonl",    "⬇ Per-pass drop log")]):
+                    _lp = Path(__file__).parent / "logs" / _lf
+                    with _dlrow[_i]:
+                        if _lp.exists() and _lp.stat().st_size:
+                            st.download_button(f"{_lbl} ({_lf})", data=_lp.read_bytes(),
+                                               file_name=_lf, mime="application/x-ndjson",
+                                               key=f"log_dl_{_lf}")
+                        else:
+                            st.caption(f"_{_lf}: none yet_")
+
+                # The bundle just ZIPS those logs + the current TML — instant. Tick 'deep' only for
+                # the rare leave-one-out interaction hunt (many slow validate calls).
+                _deep = st.checkbox("Also run leave-one-out bisection (slow — many validate calls)",
+                                    value=False, key="dbg_deep")
+                if st.button("🐞 Capture debug bundle (logs + all TML)", key="dbg_capture"):
                     from services.debug_dump import capture_zip_bytes
                     from datetime import datetime
                     _ts = datetime.now().strftime("%Y%m%dT%H%M%S")
-                    with st.status("Capturing raw validation debug (this makes many validate "
-                                   "calls — slow on a cold warehouse)…", expanded=True) as _dbg:
+                    _msg = ("Running leave-one-out (slow on a cold warehouse)…" if _deep
+                            else "Packaging logs + TML…")
+                    with st.status(_msg, expanded=True) as _dbg:
                         try:
                             _fn, _bytes, _sm = capture_zip_bytes(
-                                filtered_items, target_client(), _ts,
+                                filtered_items, target_client(), _ts, deep=_deep,
                                 target_connection=teams[team_name].get("target_connection", ""))
                             st.session_state._dbg_bundle = (_fn, _bytes)
                             st.session_state._dbg_summary = _sm
-                            _dbg.update(label=f"Captured — {_sm.get('files')} file(s). "
-                                        f"Batch error: {_sm.get('batch_has_error')}; "
-                                        f"leave-one-out culprits: "
-                                        f"{_sm.get('leave_one_out_culprits') or 'none'}.",
+                            _cul = (f"; leave-one-out culprits: {_sm.get('leave_one_out_culprits')}"
+                                    if _deep else "")
+                            _dbg.update(label=f"Captured — {_sm.get('files')} file(s){_cul}.",
                                         state="complete", expanded=True)
                         except Exception as _e:
                             _dbg.update(label=f"Capture failed: {str(_e)[:300]}",

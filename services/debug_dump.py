@@ -92,7 +92,7 @@ def _split(files):
 
 
 def capture(items, client, out_root, timestamp, target_host="", target_connection="",
-            deep=True):
+            deep=False):
     """Write a full validation-debug bundle for `items` (the promotion set) and zip it.
 
     items           : the transformed promotion bundle (session_state.transformed_items or the
@@ -120,16 +120,21 @@ def capture(items, client, out_root, timestamp, target_host="", target_connectio
             fh.write(content)
 
     summary = {"files": len(files), "tables": len(tables), "models": len(models),
-               "leaves": len(leaves)}
+               "leaves": len(leaves), "deep": bool(deep)}
 
-    # ── 01: raw batch + tables-only + models-only ──
-    batch_raw = _raw_validate(client, batch)
-    _write(run_dir, "01_batch_raw.json", batch_raw)
-    _write(run_dir, "01b_tables_only_raw.json", _raw_validate(client, list(tables.values())))
-    _write(run_dir, "01c_models_only_raw.json", _raw_validate(client, list(models.values())))
-    summary["batch_has_error"] = _has_error(batch_raw)
-
+    # Default (fast): package the as-you-go logs + current TML only — NO live validation. The raw
+    # error responses and per-pass drop history are already captured on disk while the tool ran, so
+    # this is instant. The slow live re-validation below is opt-in (deep=True) for the rare case the
+    # logs aren't enough (e.g. a leave-one-out interaction hunt).
     if deep:
+        # ── 01: raw batch + tables-only + models-only ──
+        batch_raw = _raw_validate(client, batch)
+        _write(run_dir, "01_batch_raw.json", batch_raw)
+        _write(run_dir, "01b_tables_only_raw.json", _raw_validate(client, list(tables.values())))
+        _write(run_dir, "01c_models_only_raw.json", _raw_validate(client, list(models.values())))
+        summary["batch_has_error"] = _has_error(batch_raw)
+
+
         # ── 02: each file ALONE ──
         per_dir = os.path.join(run_dir, "02_per_file_raw")
         os.makedirs(per_dir, exist_ok=True)
@@ -174,9 +179,9 @@ def capture(items, client, out_root, timestamp, target_host="", target_connectio
     }
     _write(run_dir, "00_manifest.json", manifest)
 
-    # ── copy the run history + as-you-go raw error log if present ──
-    for cand in ("logs/validate_runs.jsonl", "logs/validate_raw.jsonl",
-                 "validate_runs.jsonl", "validate_raw.jsonl"):
+    # ── copy the as-you-go logs (the primary artifact now — captured while the tool ran) ──
+    for cand in ("logs/validate_runs.jsonl", "logs/validate_raw.jsonl", "logs/discovery.jsonl",
+                 "validate_runs.jsonl", "validate_raw.jsonl", "discovery.jsonl"):
         if os.path.exists(cand):
             os.makedirs(os.path.join(run_dir, "logs"), exist_ok=True)
             with open(cand) as src, open(os.path.join(run_dir, "logs", os.path.basename(cand)), "w") as dst:

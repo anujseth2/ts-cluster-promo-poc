@@ -552,7 +552,8 @@ def drop_columns(items, columns):
     all_docs = [_parse_edoc(it) for it in items]
     removed = set(targets) | _resolve_display_names(all_docs, targets)
 
-    man = {"columns": 0, "joins": 0, "formulas": [], "vizzes": 0}
+    man = {"columns": 0, "joins": 0, "formulas": [], "vizzes": 0,
+           "column_names": [], "join_names": []}   # names: so a drop can be itemized, not just counted
     out = []
     for item, doc in zip(items, all_docs):
         for key in ("model", "worksheet"):
@@ -595,6 +596,7 @@ def drop_columns(items, columns):
                             cid.startswith("formula_") and cid[len("formula_"):] in removed)
                         if _col_name(c) in targets or surfaces_removed_formula or dn in removed:
                             man["columns"] += 1
+                            man["column_names"].append(c.get("name") or _col_name(c))
                             if dn and dn not in removed:
                                 removed.add(dn); changed = True   # re-scan: vizzes/formulas on it
                         else:
@@ -603,17 +605,24 @@ def drop_columns(items, columns):
             # Joins whose `on` condition references a removed name.
             for mt in (node.get("model_tables") or node.get("tables") or []):
                 if mt.get("joins"):
-                    before = len(mt["joins"])
-                    mt["joins"] = [j for j in mt["joins"] if not _refs_any(j, removed)]
-                    man["joins"] += before - len(mt["joins"])
+                    _kept_j = [j for j in mt["joins"] if not _refs_any(j, removed)]
+                    for j in mt["joins"]:
+                        if j not in _kept_j:
+                            man["join_names"].append(
+                                j.get("name") or f"{mt.get('name','')} -> {j.get('with','')}")
+                    man["joins"] += len(mt["joins"]) - len(_kept_j)
+                    mt["joins"] = _kept_j
 
         t = doc.get("table")
         if t and t.get("columns") is not None:
-            before = len(t["columns"])
-            t["columns"] = [c for c in t["columns"]
-                            if (c.get("name", "") or "").lower() not in targets
-                            and (c.get("db_column_name", "") or "").lower() not in targets]
-            man["columns"] += before - len(t["columns"])
+            _keep_t = [c for c in t["columns"]
+                       if (c.get("name", "") or "").lower() not in targets
+                       and (c.get("db_column_name", "") or "").lower() not in targets]
+            for c in t["columns"]:
+                if c not in _keep_t:
+                    man["column_names"].append(f"{t.get('name','')}.{c.get('name') or c.get('db_column_name','')}")
+            man["columns"] += len(t["columns"]) - len(_keep_t)
+            t["columns"] = _keep_t
 
         lb = doc.get("liveboard")
         if lb and lb.get("visualizations") is not None:
