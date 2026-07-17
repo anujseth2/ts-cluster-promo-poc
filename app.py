@@ -1547,7 +1547,8 @@ elif step == 2:
             _tick = progress or (lambda *_a: None)
             tables, models = [], []
             for it in items:
-                d = _parse_edoc(it)
+                _e = it.get("edoc", "{}")
+                d = _e if isinstance(_e, dict) else _parse_edoc(_e)
                 if "table" in d:
                     tables.append(it)
                 elif "model" in d or "worksheet" in d:
