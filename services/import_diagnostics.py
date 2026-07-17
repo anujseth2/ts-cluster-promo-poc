@@ -502,11 +502,16 @@ def drop_columns(items, columns):
                     keep = []
                     for c in node["columns"]:
                         cid = (c.get("column_id", "") or "").strip().lower()
+                        dn  = (c.get("name", "") or "").strip().lower()
+                        # A formula-surfacing column may carry column_id `formula_<name>` OR no
+                        # column_id at all (linked to its formula purely by NAME). Either way, once
+                        # the formula is removed the column must go too, or it dangles as an
+                        # "invalid formula ID" on import. So also drop a column whose NAME matches a
+                        # removed formula/column.
                         surfaces_removed_formula = (
                             cid.startswith("formula_") and cid[len("formula_"):] in removed)
-                        if _col_name(c) in targets or surfaces_removed_formula:
+                        if _col_name(c) in targets or surfaces_removed_formula or dn in removed:
                             man["columns"] += 1
-                            dn = (c.get("name", "") or "").strip().lower()
                             if dn and dn not in removed:
                                 removed.add(dn); changed = True   # re-scan: vizzes/formulas on it
                         else:
