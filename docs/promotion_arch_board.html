@@ -1,0 +1,399 @@
+<title>Cross-Cluster Promotion — Architecture</title>
+<style>
+  :root{
+    --bg:#EDF1F6; --surface:#FFFFFF; --surface-2:#F3F6FA; --surface-3:#E9EEF5;
+    --ink:#141C29; --ink-soft:#4A5A70; --ink-faint:#8393A8;
+    --line:#D2DBE7; --line-soft:#E4EAF2;
+    --accent:#0E7C8B; --accent-ink:#0A5A66; --accent-glow:rgba(14,124,139,.18);
+    --src:#5A62C6; --app:#0E7C8B; --git:#8250C4; --tgt:#2C8A57; --cdw:#B5731C; --nl:#C0417A;
+    --ok:#2C8A57; --warn:#B5731C;
+    --mono:ui-monospace,"SF Mono","JetBrains Mono",Menlo,Consolas,monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    --shadow:0 1px 2px rgba(20,28,41,.05),0 10px 26px rgba(20,28,41,.09);
+    --shadow-lg:0 16px 44px rgba(20,28,41,.16);
+    --r:14px; --r-sm:9px;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{
+      --bg:#0B1119; --surface:#111A26; --surface-2:#152030; --surface-3:#1A2838;
+      --ink:#E7EDF5; --ink-soft:#A3B4C8; --ink-faint:#69798F; --line:#243347; --line-soft:#1C2A3B;
+      --accent:#35C2D0; --accent-ink:#8CE4EC; --accent-glow:rgba(53,194,208,.2);
+      --src:#8990EC; --app:#35C2D0; --git:#B48CEC; --tgt:#4FBE84; --cdw:#D79A45; --nl:#E576A6;
+      --ok:#4FBE84; --warn:#D79A45;
+      --shadow:0 1px 2px rgba(0,0,0,.3),0 10px 26px rgba(0,0,0,.4);
+      --shadow-lg:0 18px 50px rgba(0,0,0,.55);
+    }
+  }
+  :root[data-theme="light"]{
+    --bg:#EDF1F6;--surface:#FFFFFF;--surface-2:#F3F6FA;--surface-3:#E9EEF5;--ink:#141C29;--ink-soft:#4A5A70;
+    --ink-faint:#8393A8;--line:#D2DBE7;--line-soft:#E4EAF2;--accent:#0E7C8B;--accent-ink:#0A5A66;
+    --accent-glow:rgba(14,124,139,.18);--src:#5A62C6;--app:#0E7C8B;--git:#8250C4;--tgt:#2C8A57;--cdw:#B5731C;--nl:#C0417A;
+    --ok:#2C8A57;--warn:#B5731C;--shadow:0 1px 2px rgba(20,28,41,.05),0 10px 26px rgba(20,28,41,.09);--shadow-lg:0 16px 44px rgba(20,28,41,.16);
+  }
+  :root[data-theme="dark"]{
+    --bg:#0B1119;--surface:#111A26;--surface-2:#152030;--surface-3:#1A2838;--ink:#E7EDF5;--ink-soft:#A3B4C8;
+    --ink-faint:#69798F;--line:#243347;--line-soft:#1C2A3B;--accent:#35C2D0;--accent-ink:#8CE4EC;
+    --accent-glow:rgba(53,194,208,.2);--src:#8990EC;--app:#35C2D0;--git:#B48CEC;--tgt:#4FBE84;--cdw:#D79A45;--nl:#E576A6;
+    --ok:#4FBE84;--warn:#D79A45;--shadow:0 1px 2px rgba(0,0,0,.3),0 10px 26px rgba(0,0,0,.4);--shadow-lg:0 18px 50px rgba(0,0,0,.55);
+  }
+
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);line-height:1.5;-webkit-font-smoothing:antialiased}
+  .wrap{max-width:1100px;margin:0 auto;padding:30px 20px 100px}
+
+  header.mast{display:flex;justify-content:space-between;align-items:flex-start;gap:22px;padding-bottom:20px;border-bottom:1px solid var(--line)}
+  .eyebrow{font-family:var(--mono);font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:var(--accent-ink);font-weight:600}
+  h1{font-size:clamp(24px,3.8vw,37px);line-height:1.06;font-weight:800;letter-spacing:-.02em;margin:.35em 0 .2em;text-wrap:balance;max-width:20ch}
+  .sub{color:var(--ink-soft);font-size:15px;max-width:64ch;margin:0}
+  .sub b{color:var(--ink)}
+  .controls{display:flex;flex-direction:column;gap:9px;align-items:flex-end;flex-shrink:0}
+  .toggle{font-family:var(--mono);font-size:12px;border:1px solid var(--line);background:var(--surface);color:var(--ink-soft);padding:8px 12px;border-radius:99px;cursor:pointer;display:flex;gap:7px;align-items:center}
+  .toggle:hover{border-color:var(--accent);color:var(--ink)}
+  .hint{font-family:var(--mono);font-size:10.5px;color:var(--ink-faint);text-align:right;max-width:20ch}
+
+  .section-label{font-family:var(--mono);font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--ink-faint);margin:32px 0 15px;display:flex;align-items:center;gap:10px}
+  .section-label::after{content:"";flex:1;height:1px;background:var(--line-soft)}
+
+  .board{overflow-x:auto;padding:8px 2px}
+  .inner{min-width:900px;display:flex;flex-direction:column;align-items:center}
+
+  /* org framing */
+  .orgzone{border:1.5px dashed var(--line);border-radius:16px;padding:16px 14px 13px;position:relative;background:linear-gradient(var(--surface-2),transparent 70%)}
+  .orgzone>.orgtag{position:absolute;top:-9px;left:14px;font-family:var(--mono);font-size:9.5px;letter-spacing:.12em;text-transform:uppercase;background:var(--bg);padding:0 8px;color:var(--ink-faint);font-weight:700}
+
+  .hub-top{display:flex;align-items:center;width:100%}
+
+  .node{background:var(--surface);border:1px solid var(--line);border-top:3px solid var(--nc,var(--accent));border-radius:var(--r);padding:13px 15px;box-shadow:var(--shadow);flex:0 0 auto;display:flex;flex-direction:column;gap:8px;cursor:pointer;transition:transform .15s,box-shadow .15s,border-color .15s;text-align:left;font-family:inherit;color:inherit}
+  .node:hover{transform:translateY(-2px);box-shadow:var(--shadow-lg);border-color:var(--nc,var(--accent))}
+  .node:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
+  .node.side{width:206px}
+  .node.hub{width:308px;border-top-width:4px;box-shadow:0 0 0 4px var(--accent-glow),var(--shadow)}
+  .node.hub:hover{box-shadow:0 0 0 4px var(--accent-glow),var(--shadow-lg)}
+  .node .ntag{font-family:var(--mono);font-size:10px;letter-spacing:.09em;text-transform:uppercase;color:var(--nc,var(--accent));font-weight:700}
+  .node h3{font-size:15px;font-weight:800;letter-spacing:-.01em;margin:0}
+  .node .role{font-size:12.2px;color:var(--ink-soft);margin:0}
+  .chips{display:flex;flex-wrap:wrap;gap:5px;margin-top:1px}
+  .chip{font-family:var(--mono);font-size:10.5px;background:var(--surface-3);border:1px solid var(--line-soft);color:var(--ink-soft);padding:2px 7px;border-radius:6px;white-space:nowrap}
+  .chip.key{background:var(--accent-glow);border-color:transparent;color:var(--accent-ink);font-weight:600}
+  .more{font-family:var(--mono);font-size:9.5px;color:var(--accent-ink);letter-spacing:.05em;text-transform:uppercase;opacity:.8}
+  .more::after{content:" ›"}
+
+  /* hub inner sub-cards (clickable) */
+  .subcards{display:flex;flex-direction:column;gap:6px}
+  .subcard{width:100%;text-align:left;font-family:inherit;color:inherit;background:var(--surface-2);border:1px solid var(--line);border-left:3px solid var(--sc,var(--accent));border-radius:var(--r-sm);padding:8px 11px;cursor:pointer;display:flex;flex-direction:column;gap:3px;transition:border-color .15s,background .15s}
+  .subcard:hover{background:var(--surface-3)}
+  .subcard .st{font-size:11.5px;font-weight:700;display:flex;justify-content:space-between;align-items:baseline;gap:8px;text-align:left}
+  .subcard .st .mini{font-family:var(--mono);font-size:8.5px;color:var(--accent-ink);opacity:.75;letter-spacing:.04em}
+  .subcard .sd{font-family:var(--mono);font-size:9.5px;color:var(--ink-faint)}
+
+  /* horizontal wires */
+  .hwire{flex:1 1 0;min-width:112px;position:relative;padding:0 4px}
+  .num{width:22px;height:22px;border-radius:50%;background:var(--wcol,var(--accent));color:#fff;font-family:var(--mono);font-size:11px;font-weight:700;display:grid;place-items:center;margin:0 auto 6px}
+  .hlabel{font-family:var(--mono);font-size:10px;color:var(--ink);text-align:center;margin-bottom:6px;font-weight:700}
+  .track{position:relative;height:3px;border-radius:3px;background:repeating-linear-gradient(90deg,var(--wcol,var(--accent)) 0 9px,transparent 9px 18px);background-size:18px 100%;animation:marchx .55s linear infinite}
+  .track.dashed{opacity:.9}
+  .track::after{content:"";position:absolute;top:50%;transform:translateY(-50%);right:-2px;border-left:8px solid var(--wcol,var(--accent));border-top:5px solid transparent;border-bottom:5px solid transparent}
+  .packet{position:absolute;top:50%;transform:translateY(-50%);font-family:var(--mono);font-size:9px;font-weight:700;color:#fff;background:var(--wcol,var(--accent));padding:2px 7px;border-radius:99px;white-space:nowrap;box-shadow:0 2px 8px var(--accent-glow);animation:glidex 3.6s linear infinite;animation-delay:var(--d,0s)}
+  .hapi{font-family:var(--mono);font-size:9px;color:var(--ink-faint);text-align:center;margin-top:8px}
+  .twopath{display:flex;flex-direction:column;gap:16px}
+  @keyframes marchx{to{background-position:18px 0}}
+  @keyframes glidex{0%{left:2%;opacity:0}12%{opacity:1}86%{opacity:1}100%{left:80%;opacity:0}}
+
+  /* vertical connector */
+  .vconn{display:flex;gap:30px;justify-content:center;padding:8px 0 6px;height:104px}
+  .vlane{display:flex;flex-direction:column;align-items:center;width:120px}
+  .vlabel{font-family:var(--mono);font-size:9px;color:var(--ink);font-weight:700;text-align:center;display:flex;align-items:center;gap:5px;margin-bottom:4px;white-space:nowrap}
+  .vlabel .vn{width:16px;height:16px;border-radius:50%;background:var(--git);color:#fff;font-size:8.5px;display:grid;place-items:center}
+  .vtrack{position:relative;width:3px;flex:1;border-radius:3px;background:repeating-linear-gradient(0deg,var(--git) 0 8px,transparent 8px 16px);background-size:100% 16px;animation:marchdown .6s linear infinite}
+  .vtrack.up{animation-direction:reverse}
+  .vtrack::after{content:"";position:absolute;left:50%;transform:translateX(-50%);border-left:5px solid transparent;border-right:5px solid transparent}
+  .vtrack:not(.up)::after{bottom:-2px;border-top:8px solid var(--git)}
+  .vtrack.up::after{top:-2px;border-bottom:8px solid var(--git)}
+  .vdot{position:absolute;left:50%;width:8px;height:8px;border-radius:50%;background:var(--git);transform:translateX(-50%);animation:vdrop 2.8s linear infinite}
+  .vdot.up{animation:vrise 2.8s linear infinite}
+  .vapi{font-family:var(--mono);font-size:8.5px;color:var(--ink-faint);margin-top:5px;text-align:center}
+  @keyframes marchdown{to{background-position:0 16px}}
+  @keyframes vdrop{0%{top:2%;opacity:0}15%{opacity:1}85%{opacity:1}100%{top:86%;opacity:0}}
+  @keyframes vrise{0%{top:86%;opacity:0}15%{opacity:1}85%{opacity:1}100%{top:2%;opacity:0}}
+
+  .cdw-wrap{display:flex;flex-direction:column;align-items:center;gap:0}
+  .cdw-conn{width:3px;height:26px;background:repeating-linear-gradient(0deg,var(--cdw) 0 6px,transparent 6px 12px);background-size:100% 12px;animation:marchdown .7s linear infinite}
+
+  .hub-note{font-size:12px;color:var(--ink-soft);text-align:center;margin-top:12px;max-width:64ch;margin-left:auto;margin-right:auto}
+  .hub-note b{color:var(--app);font-weight:700}
+
+  .keynote{display:flex;flex-wrap:wrap;gap:8px 16px;margin-top:14px;font-size:12px;color:var(--ink-soft);justify-content:center}
+  .keynote .k{display:flex;align-items:center;gap:6px}
+  .keynote .sw{width:18px;height:4px;border-radius:2px}
+  .keynote .sw.dash{background:repeating-linear-gradient(90deg,var(--nl) 0 4px,transparent 4px 8px)}
+
+  /* legend */
+  .legend{border:1px solid var(--line);border-radius:var(--r);overflow:hidden;box-shadow:var(--shadow);background:var(--surface)}
+  .lrow{display:grid;grid-template-columns:32px 1.3fr 1.6fr 1.3fr;gap:12px;align-items:center;padding:10px 15px;border-bottom:1px solid var(--line-soft);font-size:12.7px}
+  .lrow:last-child{border-bottom:0}
+  .lrow.head{background:var(--surface-2);font-family:var(--mono);font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--ink-faint)}
+  .lnum{font-family:var(--mono);font-weight:700;color:#fff;background:var(--accent);width:24px;height:24px;border-radius:7px;display:grid;place-items:center;font-size:11px}
+  .lnum.x{background:var(--ink-faint)}
+  .lmove{font-weight:650}
+  .lpath{font-family:var(--mono);font-size:11px;color:var(--ink-soft)}
+  .lpath .arr{color:var(--accent-ink);padding:0 2px}
+  .lapi{font-family:var(--mono);font-size:10.5px;color:var(--ink-faint)}
+  @media(max-width:640px){.lrow{grid-template-columns:26px 1fr;row-gap:3px}.lrow .lpath,.lrow .lapi{grid-column:2}.lrow.head{display:none}}
+
+  footer{margin-top:38px;padding-top:18px;border-top:1px solid var(--line);color:var(--ink-faint);font-family:var(--mono);font-size:11px;display:flex;justify-content:space-between;flex-wrap:wrap;gap:10px}
+
+  /* drawer */
+  .scrim{position:fixed;inset:0;background:rgba(8,14,22,.5);opacity:0;pointer-events:none;transition:opacity .2s;z-index:40;backdrop-filter:blur(2px)}
+  .scrim.open{opacity:1;pointer-events:auto}
+  .drawer{position:fixed;top:0;right:0;height:100%;width:min(500px,94vw);background:var(--surface);border-left:1px solid var(--line);box-shadow:var(--shadow-lg);z-index:50;transform:translateX(100%);transition:transform .26s cubic-bezier(.4,0,.2,1);display:flex;flex-direction:column}
+  .drawer.open{transform:none}
+  .dh{display:flex;justify-content:space-between;align-items:flex-start;gap:14px;padding:22px 24px 15px;border-bottom:1px solid var(--line)}
+  .badge{font-family:var(--mono);font-size:10px;letter-spacing:.11em;text-transform:uppercase;color:#fff;padding:3px 9px;border-radius:99px;display:inline-block;margin-bottom:9px}
+  .dh h2{font-size:19px;font-weight:800;letter-spacing:-.015em;margin:0;line-height:1.15}
+  .xbtn{border:1px solid var(--line);background:var(--surface-2);color:var(--ink-soft);border-radius:8px;width:34px;height:34px;cursor:pointer;font-size:18px;flex-shrink:0;line-height:1}
+  .xbtn:hover{border-color:var(--accent);color:var(--ink)}
+  .dbody{padding:18px 24px 40px;overflow-y:auto}
+  .dbody h3{font-family:var(--mono);font-size:10.5px;letter-spacing:.11em;text-transform:uppercase;color:var(--accent-ink);margin:20px 0 8px;font-weight:600}
+  .dbody h3:first-child{margin-top:0}
+  .dbody p{font-size:13.7px;color:var(--ink);margin:0 0 10px}
+  .dbody ul{margin:0 0 11px;padding-left:18px}
+  .dbody li{font-size:13.2px;margin-bottom:5px}
+  .dbody code{font-family:var(--mono);font-size:11.5px;background:var(--surface-3);padding:1.5px 5px;border-radius:5px;border:1px solid var(--line-soft)}
+  .dbody .env{font-family:var(--mono);font-size:11px;color:var(--ink-soft);background:var(--surface-2);border:1px solid var(--line-soft);border-radius:7px;padding:8px 10px;margin:0 0 12px;word-break:break-word}
+  .note{background:var(--surface-2);border:1px solid var(--line);border-left:3px solid var(--warn);border-radius:var(--r-sm);padding:10px 12px;font-size:12.7px;margin:0 0 12px}
+
+  @media (prefers-reduced-motion:reduce){
+    .track,.packet,.vtrack,.vdot,.cdw-conn{animation:none!important}
+    .packet{left:38%!important;opacity:1!important}.vdot{top:44%!important;opacity:1!important}
+    .drawer,.scrim{transition:none!important}
+  }
+</style>
+
+<div class="wrap">
+  <header class="mast">
+    <div>
+      <div class="eyebrow">ThoughtSpot · System Architecture</div>
+      <h1>Streamlit is the hub — everything moves through it</h1>
+      <p class="sub">The two ThoughtSpot clusters and GitHub never talk to each other. The
+        <b>Streamlit app</b> is the only thing connected to all of them, so content round-trips
+        <em>through</em> it by two different paths: <b>TML + feedback</b> travel via Git, while
+        <b>NL instructions</b> are read from source and written to target directly by API — never
+        touching Git. Click any box for detail.</p>
+    </div>
+    <div class="controls">
+      <button class="toggle" id="themeBtn"><span id="themeIco">◐</span> <span id="themeLbl">Theme</span></button>
+      <div class="hint">Click boxes → detail</div>
+    </div>
+  </header>
+
+  <div class="section-label">The hub, the two channels &amp; the round-trip</div>
+  <div class="board">
+    <div class="inner">
+
+      <div class="hub-top">
+        <!-- SOURCE (org-framed) -->
+        <div class="orgzone" style="flex:0 0 auto"><span class="orgtag">Source org</span>
+          <button class="node side" style="--nc:var(--src)" data-drill="source">
+            <span class="ntag">Source · ThoughtSpot</span>
+            <h3>Authoring cluster</h3>
+            <p class="role">Where content is built &amp; exported.</p>
+            <div class="chips"><span class="chip">REST v2</span><span class="chip key">🔑 token / login</span></div>
+            <span class="more">Auth &amp; export</span>
+          </button>
+        </div>
+
+        <div class="hwire twopath">
+          <div>
+            <div class="num" style="--wcol:var(--src)">1</div>
+            <div class="hlabel">Export TML + feedback</div>
+            <div class="track" style="--wcol:var(--src)"><span class="packet" style="--wcol:var(--src)">TML</span></div>
+            <div class="hapi">tml/export</div>
+          </div>
+          <div>
+            <div class="hlabel" style="color:var(--nl)">NL instructions · read</div>
+            <div class="track dashed" style="--wcol:var(--nl)"><span class="packet" style="--wcol:var(--nl);--d:1.4s">NL</span></div>
+            <div class="hapi">ai/instructions/get</div>
+          </div>
+        </div>
+
+        <!-- HUB -->
+        <button class="node hub" style="--nc:var(--app)" data-drill="hub">
+          <span class="ntag">Streamlit app · the hub</span>
+          <h3>Promotion orchestrator</h3>
+          <p class="role">The only component connected to source, target &amp; GitHub. It transforms the
+            bundle, discovers &amp; resolves issues, and drives every hop.</p>
+          <div class="chips"><span class="chip">source_client</span><span class="chip">git_client</span><span class="chip">target_client</span></div>
+          <span class="more">Engine · config · state &amp; logs</span>
+        </button>
+
+        <!-- two channels to target -->
+        <div class="hwire twopath">
+          <div>
+            <div class="num" style="--wcol:var(--tgt)">4</div>
+            <div class="hlabel">Import in place (TML+feedback)</div>
+            <div class="track" style="--wcol:var(--tgt)"><span class="packet" style="--wcol:var(--tgt);--d:1.9s">import</span></div>
+            <div class="hapi">tml/import · obj_id</div>
+          </div>
+          <div>
+            <div class="hlabel" style="color:var(--nl)">NL instructions · write</div>
+            <div class="track dashed" style="--wcol:var(--nl)"><span class="packet" style="--wcol:var(--nl);--d:1s">NL</span></div>
+            <div class="hapi">ai/instructions/set</div>
+          </div>
+        </div>
+
+        <!-- TARGET (org-framed) + CDW -->
+        <div class="orgzone" style="flex:0 0 auto"><span class="orgtag">Target org</span>
+          <div class="cdw-wrap">
+            <button class="node side" style="--nc:var(--tgt)" data-drill="target">
+              <span class="ntag">Target · ThoughtSpot</span>
+              <h3>Landing cluster</h3>
+              <p class="role">Same <code style="font-family:var(--mono);font-size:11px">obj_id</code> ⇒ updated, not duplicated.</p>
+              <div class="chips"><span class="chip">REST v2</span><span class="chip key">🔑 token / login</span></div>
+              <span class="more">Auth · privileges · obj_id</span>
+            </button>
+            <div class="cdw-conn"></div>
+            <button class="node side" style="--nc:var(--cdw)" data-drill="cdw">
+              <span class="ntag">Target CDW · warehouse</span>
+              <h3>Column source of truth</h3>
+              <div class="chips"><span class="chip">read-only</span><span class="chip key">🛡️ delegated</span></div>
+              <span class="more">Delegated auth</span>
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- vertical to GitHub -->
+      <div class="vconn">
+        <div class="vlane">
+          <div class="vlabel"><span class="vn">2</span> commit · PR · merge</div>
+          <div class="vtrack"><span class="vdot"></span></div>
+          <div class="vapi">commit_tml · merge_pr</div>
+        </div>
+        <div class="vlane">
+          <div class="vlabel"><span class="vn">3</span> read merged main</div>
+          <div class="vtrack up"><span class="vdot up"></span></div>
+          <div class="vapi">get_tml_files</div>
+        </div>
+      </div>
+
+      <button class="node" style="--nc:var(--git);width:308px" data-drill="github">
+        <span class="ntag">GitHub bridge</span>
+        <h3>dev → main</h3>
+        <p class="role">The promotion transaction — a squash-merge PR. Git never talks to a cluster; Streamlit carries it both ways.</p>
+        <div class="chips"><span class="chip">PyGithub</span><span class="chip key">🔑 PAT</span></div>
+        <span class="more">Branches · folders · filtering</span>
+      </button>
+
+    </div>
+  </div>
+  <div class="keynote">
+    <div class="k"><span class="sw" style="background:var(--tgt)"></span>TML + feedback (via Git)</div>
+    <div class="k"><span class="sw dash"></span>NL instructions (direct API)</div>
+    <div class="k"><span class="sw" style="background:var(--cdw)"></span>read-only warehouse</div>
+  </div>
+  <p class="hub-note">Content passes through <b>Streamlit</b> twice on the Git path (write → read back);
+    NL instructions also flow source → hub → target, but by API, never entering Git. Source and target
+    never connect directly.</p>
+
+  <div class="section-label">Every hop, in order — all through Streamlit</div>
+  <div class="legend">
+    <div class="lrow head"><span>#</span><span>Hop</span><span>Path</span><span>API</span></div>
+    <div class="lrow"><span class="lnum">1</span><span class="lmove">Export TML + feedback</span><span class="lpath">Source <span class="arr">→</span> Streamlit</span><span class="lapi">metadata/tml/export</span></div>
+    <div class="lrow"><span class="lnum">2</span><span class="lmove">Commit · PR · merge</span><span class="lpath">Streamlit <span class="arr">→</span> GitHub</span><span class="lapi">commit_tml · merge_pr</span></div>
+    <div class="lrow"><span class="lnum">3</span><span class="lmove">Read merged main</span><span class="lpath">GitHub <span class="arr">→</span> Streamlit</span><span class="lapi">get_tml_files</span></div>
+    <div class="lrow"><span class="lnum">4</span><span class="lmove">Import in place</span><span class="lpath">Streamlit <span class="arr">→</span> Target</span><span class="lapi">metadata/tml/import</span></div>
+    <div class="lrow"><span class="lnum x">★</span><span class="lmove">Read NL instructions</span><span class="lpath">Source <span class="arr">→</span> Streamlit (direct)</span><span class="lapi">ai/instructions/get</span></div>
+    <div class="lrow"><span class="lnum x">★</span><span class="lmove">Promote NL instructions</span><span class="lpath">Streamlit <span class="arr">→</span> Target (direct)</span><span class="lapi">ai/instructions/set</span></div>
+    <div class="lrow"><span class="lnum x">+</span><span class="lmove">Align identity</span><span class="lpath">Streamlit <span class="arr">⇄</span> Source &amp; Target</span><span class="lapi">metadata/update-obj-id</span></div>
+    <div class="lrow"><span class="lnum x">+</span><span class="lmove">Validate (loop)</span><span class="lpath">Streamlit <span class="arr">⇄</span> Target</span><span class="lapi">import · VALIDATE_ONLY</span></div>
+    <div class="lrow"><span class="lnum x">+</span><span class="lmove">Read warehouse columns</span><span class="lpath">Streamlit <span class="arr">⇄</span> Target CDW</span><span class="lapi">connection/search · COLUMN</span></div>
+  </div>
+
+  <footer>
+    <span>ts-cluster-promo-poc · architecture</span>
+    <span>source → streamlit → git → streamlit → target</span>
+  </footer>
+</div>
+
+<div class="scrim" id="scrim"></div>
+<aside class="drawer" id="drawer" role="dialog" aria-modal="true" aria-labelledby="dTitle" tabindex="-1">
+  <div class="dh"><div><span class="badge" id="dBadge">—</span><h2 id="dTitle">—</h2></div>
+    <button class="xbtn" id="xbtn" aria-label="Close">×</button></div>
+  <div class="dbody" id="dBody"></div>
+</aside>
+
+<script>
+(function(){
+  var root=document.documentElement,btn=document.getElementById('themeBtn'),lbl=document.getElementById('themeLbl'),ico=document.getElementById('themeIco');
+  function sysDark(){return window.matchMedia&&window.matchMedia('(prefers-color-scheme:dark)').matches;}
+  function apply(t){root.setAttribute('data-theme',t);lbl.textContent=t.charAt(0).toUpperCase()+t.slice(1);ico.textContent=t==='dark'?'☾':'☀';}
+  apply(sysDark()?'dark':'light');
+  btn.addEventListener('click',function(){apply(root.getAttribute('data-theme')==='dark'?'light':'dark');});
+
+  var D={
+    source:{c:'var(--src)',b:'Source org · cluster',t:'Source ThoughtSpot',body:
+      '<h3>What it does</h3><p>Holds the authored content. The hub exports the selected objects as TML (with <code>obj_id</code> + refs) and walks the dependency graph — a liveboard pulls its models, a model pulls its tables.</p>'+
+      '<p>It also <b>reads Spotter NL instructions</b> from here (<code>ai/instructions/get</code>) — these travel direct to the target, not through Git.</p>'+
+      '<h3>Authentication</h3><p>A <b>Bearer token</b>, or an <b>org-scoped session login</b> (username + password + org). Token wins; session mode auto-re-logins on 401.</p>'+
+      '<div class="env">TS_SOURCE_HOST · TS_SOURCE_TOKEN — or — USERNAME / PASSWORD / ORG</div>'+
+      '<p class="note">Org-scoped: the source may share a host with the target but live in a different <b>org</b> (<code>org_identifier</code>).</p>'},
+    hub:{c:'var(--app)',b:'The hub',t:'Streamlit orchestrator',body:
+      '<p>The only component connected to all three systems. It carries content through every hop, holds three API clients (<code>source_client</code>, <code>git_client</code>, <code>target_client</code>), and retries idempotent calls on transient resets (10054) / re-logins on 401.</p>'+
+      '<h3>Engine</h3><ul>'+
+      '<li><b>Transform</b> — rebind connection, remap database/schema, align warehouse column casing, carry obj_ids.</li>'+
+      '<li><b>Discover</b> — loop VALIDATE_ONLY on a throwaway copy: classify → drop → re-validate until clean.</li>'+
+      '<li><b>Cascade</b> — dropping a column removes dependent formulas (incl. formula→formula refs), joins, vizzes, tiles, to a fixpoint.</li></ul>'+
+      '<p class="note">The step-by-step of this engine lives in the companion <b>flow</b> doc.</p>'+
+      '<h3>Configuration (its input)</h3><p>Per-team config drives the transform: source &amp; target connections + the db/schema/table maps that retarget the data layer.</p>'+
+      '<div class="env">teams config (load_teams / save_teams) · TS_*_HOST · GITHUB_REPO · TS_PROXY</div>'+
+      '<h3>State &amp; logs (its memory)</h3><p><code>st.session_state</code> holds the in-flight bundle + findings (ephemeral). As-you-go logs on disk:</p>'+
+      '<ul><li><code>validate_runs.jsonl</code> — each pass\'s results.</li><li><code>validate_raw.jsonl</code> — full raw error responses.</li><li><code>discovery.jsonl</code> — what each pass dropped, itemized.</li></ul>'},
+    engine:{c:'var(--app)',b:'Hub · engine',t:'Transform · Discover · Cascade',body:
+      '<h3>The work the hub does</h3><ul>'+
+      '<li><b>Transform</b> — rebind connection, remap database/schema, align warehouse column casing, carry obj_ids.</li>'+
+      '<li><b>Discover</b> — loop VALIDATE_ONLY on a throwaway copy: classify → drop → re-validate until clean.</li>'+
+      '<li><b>Cascade</b> — dropping a column removes dependent formulas (incl. formula→formula refs), joins, vizzes, layout tiles, to a fixpoint.</li></ul>'+
+      '<h3>Resilience</h3><p>Idempotent calls retry with backoff on transient resets (WinError 10054); session auth re-logins on 401.</p>'+
+      '<p class="note">The step-by-step of this engine lives in the companion <b>flow</b> doc; here it\'s one component of the hub.</p>'},
+    config:{c:'var(--ink-soft)',b:'Hub · input',t:'Configuration store',body:
+      '<h3>What drives the transform</h3><p>Per-team config: the source &amp; target <b>connections</b>, and the <b>db_map / schema_map / table_remap</b> that retarget the data layer. Secrets + hosts come from env.</p>'+
+      '<ul><li>Connections → which warehouse the promoted tables bind to.</li><li>db/schema/table maps → source coordinates → target coordinates.</li></ul>'+
+      '<div class="env">teams config (load_teams / save_teams) · TS_*_HOST · GITHUB_REPO · TS_PROXY</div>'+
+      '<p>Without this the transform has nothing to retarget — it is the hub\'s primary input.</p>'},
+    state:{c:'var(--ink-soft)',b:'Hub · memory & audit',t:'State & logs',body:
+      '<h3>In-flight state</h3><p><code>st.session_state</code> holds the working bundle (<code>transformed_items</code>), discovered findings, and import phase — ephemeral, per session.</p>'+
+      '<h3>As-you-go logs (on disk)</h3><ul>'+
+      '<li><code>validate_runs.jsonl</code> — every validate pass\'s results.</li>'+
+      '<li><code>validate_raw.jsonl</code> — full raw error responses, captured on error.</li>'+
+      '<li><code>discovery.jsonl</code> — what each pass dropped, itemized.</li></ul>'+
+      '<p>The debug bundle simply zips these + the current TML — captured while running, not re-run.</p>'},
+    target:{c:'var(--tgt)',b:'Target org · cluster',t:'Target ThoughtSpot',body:
+      '<h3>What it does</h3><p>Content lands here. Matching <code>obj_id</code> makes the import an <b>update in place</b>; a mismatch creates a duplicate — which is why identity alignment happens first.</p>'+
+      '<h3>Authentication &amp; privilege</h3><p>Same mechanism as source, its own credential.</p>'+
+      '<div class="env">TS_TARGET_HOST · TS_TARGET_TOKEN — or — USERNAME / PASSWORD / ORG</div>'+
+      '<p class="note">Needs <b>DATAMANAGEMENT / ADMINISTRATION</b> for obj_id writes, and SPOTTER_COACHING for NL instructions.</p>'+
+      '<h3>Ordering quirk</h3><p>Feedback imports as a <b>separate call</b> after tables+models commit (a first-time model+feedback batch fails with err 14500).</p>'},
+    cdw:{c:'var(--cdw)',b:'Target org · warehouse',t:'Target CDW',body:
+      '<h3>Role</h3><p>The authoritative source of truth for which columns actually exist. The hub diffs the whole promotion against it up front (no whack-a-mole) and aligns column casing.</p>'+
+      '<h3>Authentication — delegated</h3><p><b>The app holds no warehouse secret.</b> It reads columns through ThoughtSpot\'s stored connection credential — PAT / OAuth service principal / service account — which the app infers.</p>'+
+      '<div class="env">connection/search · data_warehouse_object_type=COLUMN (on the target cluster)</div>'+
+      '<p>Read-only; never written to. A nice security property: no CDW credentials live in the promotion tool.</p>'},
+    github:{c:'var(--git)',b:'Transport',t:'GitHub bridge',body:
+      '<h3>The promotion transaction</h3><p>TML is written to a disposable <code>dev</code> branch, opened as a PR, and <b>squash-merged</b> to <code>main</code>. Merged <code>main</code> is the source of truth the hub imports from.</p>'+
+      '<h3>Layout &amp; safety</h3><ul>'+
+      '<li>Folders: <code>tables/ models/ liveboards/ answers/ feedback/</code>.</li>'+
+      '<li><b>Per-run file filtering</b> — only this run\'s files import, so the accumulating repo never re-imports stale objects.</li>'+
+      '<li>Git never talks to a cluster — the hub reads it and pushes to the target.</li></ul>'+
+      '<h3>Authentication</h3><div class="env">GITHUB_TOKEN (PAT, via PyGithub) · GITHUB_REPO</div>'},
+  };
+  var scrim=document.getElementById('scrim'),drawer=document.getElementById('drawer'),
+      dT=document.getElementById('dTitle'),dB=document.getElementById('dBadge'),dBody=document.getElementById('dBody'),
+      xbtn=document.getElementById('xbtn'),last=null;
+  function open(id){var d=D[id];if(!d)return;last=document.activeElement;dT.textContent=d.t;dB.textContent=d.b;
+    dB.style.background=d.c;dBody.innerHTML=d.body;scrim.classList.add('open');drawer.classList.add('open');drawer.focus();dBody.scrollTop=0;}
+  function close(){scrim.classList.remove('open');drawer.classList.remove('open');if(last)last.focus();}
+  document.querySelectorAll('[data-drill]').forEach(function(el){el.addEventListener('click',function(e){e.stopPropagation();open(el.getAttribute('data-drill'));});});
+  xbtn.addEventListener('click',close);scrim.addEventListener('click',close);
+  document.addEventListener('keydown',function(e){if(e.key==='Escape'&&drawer.classList.contains('open'))close();});
+})();
+</script>
