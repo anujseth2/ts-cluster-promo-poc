@@ -1481,12 +1481,13 @@ elif step == 2:
             """Probe: VALIDATE_ONLY a throwaway COPY, neutralize each pass's issues (drop the
             reported columns / vizzes / invalid-formula columns), and re-validate — looping UNTIL
             the copy validates clean, or a pass makes no progress (can't neutralize -> stop). No
-            git commits; validates TML strings directly. Returns (union_findings, clean, passes).
-            The real promotion bundle is untouched — this only enumerates."""
+            git commits; validates TML strings directly. Returns (union_findings, clean, passes,
+            reason) where reason is 'clean' | 'no_progress' | 'request_failed'. The real promotion
+            bundle is untouched — this only enumerates."""
             import re as _re
             _tick = progress or (lambda *_a: None)
             work = [dict(it) for it in items]
-            seen, passes, clean = {}, 0, False
+            seen, passes, clean, reason = {}, 0, False, "no_progress"
             SAFETY = 40   # backstop only; real termination is clean / no-progress
             while passes < SAFETY:
                 passes += 1
@@ -1494,18 +1495,19 @@ elif step == 2:
                 strings = ([c for p, c in files.items() if p.startswith("tables/")]
                            + [c for p, c in files.items() if p.startswith("models/")])
                 if not strings:
-                    clean = True
+                    clean = True; reason = "clean"
                     break
                 _tick(f"Pass {passes}: validating {len(strings)} file(s)…")
                 try:
                     results = target_client().import_tml(strings, policy="VALIDATE_ONLY")
                 except Exception as _e:
                     _tick(f"Pass {passes}: {friendly_error(str(_e))[0] or 'validation failed'}")
+                    reason = "request_failed"
                     break
                 _log_validate(files, results)
                 errs = [r for r in results if r["status"] != "OK"]
                 if not errs:
-                    clean = True
+                    clean = True; reason = "clean"
                     break
                 for f in classify_import_errors(errs):
                     seen.setdefault(finding_key(f), f)
@@ -1531,8 +1533,9 @@ elif step == 2:
                     work, _dv = drop_vizzes(work, viz_set)
                     removed += _dv
                 if removed == 0:
+                    reason = "no_progress"
                     break   # nothing could be neutralized -> no progress, stop
-            return list(seen.values()), clean, passes
+            return list(seen.values()), clean, passes, reason
 
         def _safe_validate(items, step=None):
             """_run_validation, but a hard connection failure (e.g. 10054 after the client's
@@ -1679,23 +1682,33 @@ elif step == 2:
             if st.button(_lbl, help="Validates a throwaway copy repeatedly, neutralizing each pass's "
                          "issues until it validates clean. The real bundle is untouched."):
                 with st.status("Discovering all issues…", expanded=True) as _disc:
-                    _found, _clean, _passes = _discover_all_issues(filtered_items, progress=st.write)
-                    st.session_state.discovered_findings = _found
-                    st.session_state.discovered_meta = {"clean": _clean, "passes": _passes}
-                    if _found and not st.session_state.get("validation_errors"):
-                        st.session_state.validation_errors = [
-                            {"name": "(probe)", "status": "ERROR", "error": ""}]
-                    _disc.update(
-                        label=(f"Found {len(_found)} issue(s) over {_passes} pass(es)"
-                               + (" — copy then validated clean." if _clean
-                                  else " — stopped (no further progress).")),
-                        state="complete", expanded=False)
+                    _found, _clean, _passes, _reason = _discover_all_issues(
+                        filtered_items, progress=st.write)
+                    # A failed request must NOT wipe a good prior discovery — keep the previous
+                    # findings if this attempt died on the connection and found nothing.
+                    if _reason == "request_failed" and not _found and st.session_state.get("discovered_findings"):
+                        _disc.update(label="Couldn't reach the target — kept the previous discovery.",
+                                     state="error", expanded=False)
+                    else:
+                        st.session_state.discovered_findings = _found
+                        st.session_state.discovered_meta = {"clean": _clean, "passes": _passes,
+                                                            "reason": _reason}
+                        if _found and not st.session_state.get("validation_errors"):
+                            st.session_state.validation_errors = [
+                                {"name": "(probe)", "status": "ERROR", "error": ""}]
+                        _tail = {"clean": " — copy then validated clean.",
+                                 "no_progress": " — stopped; remaining errors can't be auto-resolved.",
+                                 "request_failed": " — stopped: the target connection failed."}[_reason]
+                        _disc.update(label=f"Found {len(_found)} issue(s) over {_passes} pass(es)" + _tail,
+                                     state=("complete" if _reason != "request_failed" else "error"),
+                                     expanded=False)
                 st.rerun()
             if _dm:
+                _rtail = {"clean": " · copy validated clean",
+                          "no_progress": " · stopped before clean (remaining errors can't be auto-resolved)",
+                          "request_failed": " · stopped: connection to the target failed — warm the warehouse and retry"}
                 st.caption(f"Discovery: {len(st.session_state.get('discovered_findings', []))} issue(s) "
-                           f"over {_dm['passes']} pass(es)"
-                           + (" · copy validated clean" if _dm.get("clean")
-                              else " · stopped before clean (some errors can't be auto-neutralized)"))
+                           f"over {_dm['passes']} pass(es)" + _rtail.get(_dm.get("reason", ""), ""))
 
         # Raw validation run log — so consecutive runs are diffable (which files were validated,
         # each file's status/error). Full history appended to logs/validate_runs.jsonl.
@@ -2008,8 +2021,6 @@ elif step == 2:
                         st.session_state.transformed_items = fixed
                         _record_drop(_man)
                         st.session_state.setdefault("dropped_col_names", set()).update(_all_drop)
-                    st.session_state.pop("discovered_findings", None)
-                    st.session_state.pop("discovered_meta", None)
                     filtered_fixed = [i for i in st.session_state.transformed_items
                                       if i.get("info", {}).get("name") not in skip_objects]
                     with st.spinner("Re-committing and re-validating…"):
@@ -2020,6 +2031,10 @@ elif step == 2:
                             st.session_state.validation_errors = err
                             st.session_state.validation_ok     = ok
                             st.session_state.pop("silent_drops", None)
+                            # Clear discovery ONLY after a successful validate — a failed
+                            # re-validate (connection reset) must not throw away the discovered set.
+                            st.session_state.pop("discovered_findings", None)
+                            st.session_state.pop("discovered_meta", None)
                     if _res:
                         st.rerun()
 
