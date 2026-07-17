@@ -54,6 +54,12 @@ class TSClient:
             self._session_login()
         elif token:
             self._session.headers["Authorization"] = f"Bearer {token}"
+        # Debug breadcrumbs (opt-in): the raw JSON of the most recent import/validate, and an
+        # optional rolling log path. When set, import_tml appends the FULL raw response of any
+        # call that comes back with an error — so a failure is already captured as it happens,
+        # no expensive one-shot re-capture needed. Never carries auth.
+        self.last_raw_import = None
+        self.debug_raw_log = None
 
     def _session_login(self):
         """Login via session cookie — correctly scopes to org_id."""
@@ -658,6 +664,35 @@ class TSClient:
                     time.sleep(_RETRY_BACKOFF[min(attempt, len(_RETRY_BACKOFF) - 1)])
         raise last
 
+    @staticmethod
+    def _raw_has_error(data) -> bool:
+        """True if any object in a raw import/validate response is non-OK (ignoring the benign
+        'Existing guid … will be used' update notice)."""
+        rows = data if isinstance(data, list) else (data.get("object", []) if isinstance(data, dict) else [])
+        for item in rows:
+            if not isinstance(item, dict):
+                continue
+            status = (item.get("response", item).get("status") or {})
+            code = status.get("status_code", "OK")
+            if code and code != "OK" and "will be used" not in (status.get("error_message") or ""):
+                return True
+        return False
+
+    def _append_raw_log(self, policy, count, status_code, data):
+        """Append the FULL raw response to debug_raw_log when it carries an error. Best-effort:
+        logging must never break a validate/import. No auth is written."""
+        try:
+            if not self._raw_has_error(data):
+                return
+            rec = {"ts": datetime.now().isoformat(timespec="seconds"), "host": self.host,
+                   "policy": policy, "tml_count": count, "http_status": status_code, "raw": data}
+            import os
+            os.makedirs(os.path.dirname(self.debug_raw_log) or ".", exist_ok=True)
+            with open(self.debug_raw_log, "a") as fh:
+                fh.write(json.dumps(rec, default=str) + "\n")
+        except Exception:
+            pass
+
     def import_tml(self, tml_strings: List[str],
                    policy: str = "PARTIAL") -> List[Dict]:
         """
@@ -678,6 +713,11 @@ class TSClient:
             self._session_login()
             resp = self._retry_post(url, payload, timeout=180)
         data = resp.json()
+        # Breadcrumb the raw response as we go — so an opaque failure is already captured the
+        # moment it happens (no need to re-run every validate in a one-shot capture later).
+        self.last_raw_import = data
+        if self.debug_raw_log:
+            self._append_raw_log(policy, len(tml_strings), resp.status_code, data)
 
         # Normalise — API may return list or {"object": [...]}
         if isinstance(data, list):

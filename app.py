@@ -199,7 +199,11 @@ def source_client() -> TSClient:
 
 @st.cache_resource
 def target_client() -> TSClient:
-    return _make_client("TARGET")
+    c = _make_client("TARGET")
+    # Capture raw error responses as they happen — a failure is on disk the moment it occurs, so
+    # debugging is "read the log", not "re-run every validate". Errors only, so it stays small.
+    c.debug_raw_log = str(Path(__file__).parent / "logs" / "validate_raw.jsonl")
+    return c
 
 
 @st.cache_resource
@@ -2132,12 +2136,21 @@ elif step == 2:
                                     state="complete", expanded=False)
                     st.rerun()
 
-                # Opaque + no single culprit == batch-level interaction, and our normalized error
-                # hides the raw detail. Capture EVERYTHING from the wire (raw batch/per-file/
-                # leave-one-out + all TML) into a zip to hand off for debugging.
-                st.caption("Still stuck? Capture a full debug bundle (raw API responses + all TML) "
-                           "to hand off:")
-                if st.button("🐞 Capture debug bundle (raw responses + leave-one-out)",
+                # Raw error responses are logged AS THEY HAPPEN (target_client().debug_raw_log), so
+                # this opaque failure's full detail is already on disk — offer it for instant grab,
+                # no re-running any validate.
+                _rawlog = Path(__file__).parent / "logs" / "validate_raw.jsonl"
+                if _rawlog.exists() and _rawlog.stat().st_size:
+                    st.caption("Raw error responses are logged automatically as each validate runs "
+                               "— grab this failure's full detail now (no extra calls):")
+                    st.download_button("⬇ Download raw validation log (validate_raw.jsonl)",
+                                       data=_rawlog.read_bytes(), file_name="validate_raw.jsonl",
+                                       mime="application/x-ndjson", key="rawlog_dl")
+                # The one-shot bundle ADDS the leave-one-out bisection — a deliberate experiment,
+                # not a normal call — plus every TML file, for when the raw log alone isn't enough.
+                st.caption("Need the interaction bisection too? Capture a full bundle "
+                           "(leave-one-out + all TML) — slow on a cold warehouse:")
+                if st.button("🐞 Capture debug bundle (leave-one-out + all TML)",
                              key="dbg_capture"):
                     from services.debug_dump import capture_zip_bytes
                     from datetime import datetime

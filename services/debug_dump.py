@@ -174,13 +174,13 @@ def capture(items, client, out_root, timestamp, target_host="", target_connectio
     }
     _write(run_dir, "00_manifest.json", manifest)
 
-    # ── copy the validate-run history if present ──
-    for cand in ("logs/validate_runs.jsonl", "validate_runs.jsonl"):
+    # ── copy the run history + as-you-go raw error log if present ──
+    for cand in ("logs/validate_runs.jsonl", "logs/validate_raw.jsonl",
+                 "validate_runs.jsonl", "validate_raw.jsonl"):
         if os.path.exists(cand):
             os.makedirs(os.path.join(run_dir, "logs"), exist_ok=True)
-            with open(cand) as src, open(os.path.join(run_dir, "logs", "validate_runs.jsonl"), "w") as dst:
+            with open(cand) as src, open(os.path.join(run_dir, "logs", os.path.basename(cand)), "w") as dst:
                 dst.write(src.read())
-            break
 
     zip_path = run_dir + ".zip"
     _zip_dir(run_dir, zip_path)
