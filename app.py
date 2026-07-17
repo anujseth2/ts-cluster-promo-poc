@@ -2131,6 +2131,39 @@ elif step == 2:
                                            if (_routed or _opaque) else "No single object failed."),
                                     state="complete", expanded=False)
                     st.rerun()
+
+                # Opaque + no single culprit == batch-level interaction, and our normalized error
+                # hides the raw detail. Capture EVERYTHING from the wire (raw batch/per-file/
+                # leave-one-out + all TML) into a zip to hand off for debugging.
+                st.caption("Still stuck? Capture a full debug bundle (raw API responses + all TML) "
+                           "to hand off:")
+                if st.button("🐞 Capture debug bundle (raw responses + leave-one-out)",
+                             key="dbg_capture"):
+                    from services.debug_dump import capture_zip_bytes
+                    from datetime import datetime
+                    _ts = datetime.now().strftime("%Y%m%dT%H%M%S")
+                    with st.status("Capturing raw validation debug (this makes many validate "
+                                   "calls — slow on a cold warehouse)…", expanded=True) as _dbg:
+                        try:
+                            _fn, _bytes, _sm = capture_zip_bytes(
+                                filtered_items, target_client(), _ts,
+                                target_connection=teams[team_name].get("target_connection", ""))
+                            st.session_state._dbg_bundle = (_fn, _bytes)
+                            st.session_state._dbg_summary = _sm
+                            _dbg.update(label=f"Captured — {_sm.get('files')} file(s). "
+                                        f"Batch error: {_sm.get('batch_has_error')}; "
+                                        f"leave-one-out culprits: "
+                                        f"{_sm.get('leave_one_out_culprits') or 'none'}.",
+                                        state="complete", expanded=True)
+                        except Exception as _e:
+                            _dbg.update(label=f"Capture failed: {str(_e)[:300]}",
+                                        state="error", expanded=True)
+                if st.session_state.get("_dbg_bundle"):
+                    _fn, _bytes = st.session_state._dbg_bundle
+                    st.json(st.session_state.get("_dbg_summary", {}), expanded=False)
+                    st.download_button("⬇ Download debug bundle", data=_bytes, file_name=_fn,
+                                       mime="application/zip", key="dbg_dl")
+
                 _iso_res = st.session_state.get("isolation")
                 if _iso_res:
                     st.markdown("**Objects that fail with an unclassifiable error (skip to proceed):**")
