@@ -1539,6 +1539,55 @@ elif step == 2:
                     break   # nothing could be neutralized -> no progress, stop
             return list(seen.values()), clean, passes, reason
 
+        def _isolate_failures(items, progress=None):
+            """Attribute an opaque/unnamed validation error (e.g. bare 'Schema validation failed')
+            to a specific object by validating files individually. Tables are validated alone
+            (no cross-file deps); each model is validated WITH all tables present (so table refs
+            resolve and only the model varies). Returns [{name, type, error}] for files that fail."""
+            _tick = progress or (lambda *_a: None)
+            tables, models = [], []
+            for it in items:
+                d = _parse_edoc(it)
+                if "table" in d:
+                    tables.append(it)
+                elif "model" in d or "worksheet" in d:
+                    models.append(it)
+
+            def _strings(items_):
+                f = items_to_files(items_)
+                return [c for p, c in f.items() if p.startswith(("tables/", "models/"))]
+
+            all_table_strings = _strings(tables)
+            failures, i, total = [], 0, len(tables) + len(models)
+            for it in tables:
+                i += 1
+                nm = it.get("info", {}).get("name", "?")
+                _tick(f"{i}/{total}: table `{nm}`…")
+                try:
+                    res = target_client().import_tml(_strings([it]), policy="VALIDATE_ONLY")
+                    bad = [r for r in res if r["status"] != "OK"]
+                    if bad:
+                        failures.append({"name": nm, "type": "table",
+                                         "error": (bad[0].get("error") or "")[:800]})
+                except Exception as e:
+                    failures.append({"name": nm, "type": "table", "error": f"request failed: {str(e)[:200]}"})
+            # Only isolate models once tables are clean, so a table fault isn't misattributed.
+            if not failures:
+                for it in models:
+                    i += 1
+                    nm = it.get("info", {}).get("name", "?")
+                    _tick(f"{i}/{total}: model `{nm}`…")
+                    try:
+                        res = target_client().import_tml(all_table_strings + _strings([it]),
+                                                         policy="VALIDATE_ONLY")
+                        bad = [r for r in res if r["status"] != "OK"]
+                        if bad:
+                            failures.append({"name": nm, "type": "model",
+                                             "error": (bad[0].get("error") or "")[:800]})
+                    except Exception as e:
+                        failures.append({"name": nm, "type": "model", "error": f"request failed: {str(e)[:200]}"})
+            return failures
+
         def _safe_validate(items, step=None):
             """_run_validation, but a hard connection failure (e.g. 10054 after the client's
             auto-retries) becomes a friendly message + a logged run — not a raw traceback.
@@ -2037,6 +2086,47 @@ elif step == 2:
                             line = line.strip()
                             if line:
                                 st.markdown(f"- {line}")
+
+                # These errors are often unattributed (name "unknown"). Validate each file on its
+                # own to name the culprit, then let the reviewer skip that object.
+                st.caption("ThoughtSpot didn't say which object failed. Isolate it:")
+                if st.button("🔬 Find which object fails (validate each file on its own)",
+                             key="isolate_btn"):
+                    with st.status("Isolating…", expanded=True) as _iso:
+                        _fails = _isolate_failures(filtered_items, progress=st.write)
+                        st.session_state.isolation = _fails
+                        _iso.update(label=(f"{len(_fails)} object(s) fail on their own"
+                                           if _fails else "No single object failed in isolation "
+                                           "(the error may be cross-object)."),
+                                    state="complete", expanded=False)
+                    st.rerun()
+                _iso_res = st.session_state.get("isolation")
+                if _iso_res:
+                    st.markdown("**Objects that fail schema/validation on their own:**")
+                    _skip_pick = set()
+                    for r in _iso_res:
+                        if st.checkbox(f"Skip **{r['type']} `{r['name']}`** from this promotion",
+                                       value=False, key=f"skipobj_{r['name']}"):
+                            _skip_pick.add(r["name"])
+                        with st.expander(f"error · {r['name']}"):
+                            st.code(r["error"])
+                    if _skip_pick and st.button("Skip selected & re-validate", key="skip_apply"):
+                        st.session_state.setdefault("skip_objects", set()).update(_skip_pick)
+                        st.session_state.pop("isolation", None)
+                        st.session_state.pop("discovered_findings", None)
+                        st.session_state.pop("discovered_meta", None)
+                        _ff = [i for i in st.session_state.transformed_items
+                               if i.get("info", {}).get("name") not in st.session_state["skip_objects"]]
+                        with st.spinner("Re-committing and re-validating…"):
+                            _res = _safe_validate(_ff)
+                            if _res:
+                                pr_url, err, ok = _res
+                                st.session_state.pr_url            = pr_url
+                                st.session_state.validation_errors = err
+                                st.session_state.validation_ok     = ok
+                                st.session_state.pop("silent_drops", None)
+                        if _res:
+                            st.rerun()
 
             # ── single "Apply all" — only after discovery produced the complete set ──
             if _discovered:

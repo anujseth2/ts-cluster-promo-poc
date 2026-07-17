@@ -81,6 +81,10 @@ _ERROR_RULES = [
      lambda m: ("The request to the warehouse timed out.",
                 "A cold warehouse can exceed the gateway limit — warm it (run a quick query) and "
                 "re-run; if it persists it's the connection's column-introspection latency.")),
+    (re.compile(r"schema validation failed", re.I),
+     lambda m: ("One object's TML failed schema validation, but ThoughtSpot didn't say which.",
+                "Use 'Find which object fails' below to validate each file on its own and pin "
+                "down the culprit — then skip or fix that object.")),
     (re.compile(r"10054|connection (?:reset|aborted)|forcibly closed|Max retries", re.I),
      lambda m: ("The connection to the target was reset before the request finished.",
                 "Usually a slow server-side warehouse validation dropped by a gateway/proxy. The "
