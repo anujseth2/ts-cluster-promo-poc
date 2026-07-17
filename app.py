@@ -135,6 +135,28 @@ def _sno(df):
     return out
 
 
+def _log_validate(files, results):
+    """Append one VALIDATE_ONLY run to logs/validate_runs.jsonl so runs are diffable —
+    which files were validated + each file's status/error. Never raises (logging must not
+    break validation). Returns the record so the UI can also show it inline."""
+    import datetime
+    rec = {
+        "ts": datetime.datetime.now().isoformat(timespec="seconds"),
+        "files": sorted(files.keys()),
+        "results": [{"name": r.get("name"), "type": r.get("type", ""),
+                     "status": r.get("status"), "error": (r.get("error") or "")[:1500]}
+                    for r in results],
+    }
+    try:
+        logdir = Path(__file__).parent / "logs"
+        logdir.mkdir(exist_ok=True)
+        with open(logdir / "validate_runs.jsonl", "a") as fh:
+            fh.write(json.dumps(rec) + "\n")
+    except Exception:
+        pass
+    return rec
+
+
 def _name_slug(name: str) -> str:
     """A stable obj_id slug derived from an object's name (used to pre-fill obj_id suggestions
     for objects that have none). Non-alphanumerics become underscores, repeats collapse."""
@@ -1438,6 +1460,9 @@ elif step == 2:
                 return pr_url, [], []
             _tick(f"③ Validating {len(val_strings)} table/model file(s) against the target…")
             results = target_client().import_tml(val_strings, policy="VALIDATE_ONLY")
+            # Record the raw run so consecutive validates are diffable (why did the finding set
+            # change?) — persisted to logs/validate_runs.jsonl and kept for the inline expander.
+            st.session_state._last_validate = _log_validate(files, results)
             ok  = [r for r in results if r["status"] == "OK"]
             err = [r for r in results if r["status"] != "OK"]
             return pr_url, err, ok
@@ -1550,6 +1575,17 @@ elif step == 2:
                 st.rerun()
         else:
             st.markdown(f"**PR:** [{st.session_state.pr_url}]({st.session_state.pr_url})")
+
+        # Raw validation run log — so consecutive runs are diffable (which files were validated,
+        # each file's status/error). Full history appended to logs/validate_runs.jsonl.
+        _lv = st.session_state.get("_last_validate")
+        if _lv:
+            _n_err = sum(1 for r in _lv["results"] if r["status"] != "OK")
+            with st.expander(f"Validation run log — {len(_lv['results'])} file(s), {_n_err} error(s) "
+                             f"· {_lv['ts']}  (full history in logs/validate_runs.jsonl)"):
+                import pandas as pd
+                st.dataframe(_sno(pd.DataFrame(_lv["results"])[["name", "status", "error"]]),
+                             use_container_width=True, hide_index=True)
 
         # ── Stage 2: Column drop (if validation failed) ────────────────────
         val_errors = st.session_state.get("validation_errors", [])
