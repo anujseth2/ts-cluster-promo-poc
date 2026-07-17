@@ -1223,70 +1223,23 @@ elif step == 2:
                     "connection": (t.get("connection") or {}).get("name", ""),
                 })
             column_case_map = {}
-            warehouse_col_map = {}
-            _cc_trace = []
             tgt_conn = teams[team_name].get("target_connection", "")
-            st.write(f"② Reading target warehouse columns for {len(promoted)} table(s) "
-                     "(this hits the connection and can be slow on a cold warehouse)…")
-            # Authoritative source of truth = the TARGET CONNECTION (the CDW). Read the warehouse's
-            # own column set for EVERY promoted table straight from the connection (no logical table
-            # needed, no secret). This is what import error 14536 checks against, so a column absent
-            # here genuinely does not exist in the warehouse. It can be slow (a cold Databricks SQL
-            # warehouse takes time to wake) — warm the warehouse for a fast response.
-            #
-            # Which connection? The team's configured target connection wins (it's what the transform
-            # remaps to); otherwise use each table's OWN connection name from its TML — so this works
-            # with no manual sidebar config, and across tables on different connections. Group tables
-            # by their effective connection and read each one.
-            _conn_groups = {}
-            for p in promoted:
-                eff = tgt_conn or p.get("connection") or ""
-                if eff:
-                    _conn_groups.setdefault(eff, []).append(p)
-            for _conn_name, _conn_tbls in _conn_groups.items():
-                try:
-                    for k, v in target_client().connection_column_cases(
-                            _conn_name, _conn_tbls, debug=_cc_trace).items():
-                        warehouse_col_map.setdefault(k, v)
-                except Exception as _e:
-                    _cc_trace.append({"auth_type": f"(connection '{_conn_name}' failed)",
-                                      "error": str(_e)[:200]})
-            # Casing map: prefer the CDW casing; fall back to any table already modeled on the target
-            # (a fast TML metadata read) for tables the connection could not introspect.
-            column_case_map = dict(warehouse_col_map)
-            _uncased = [n for n in names if n.strip().lower() not in column_case_map]
-            if _uncased:
-                try:
-                    for k, v in target_client().table_column_cases(_uncased).items():
-                        column_case_map.setdefault(k, v)
-                except Exception:
-                    pass
-            # Diagnostic: capture how column casing resolved, so the Git Operations page can show
-            # why a table did/didn't get recased (connection found? which coords were tried?).
-            _diag_conn = tgt_conn or (next(iter(_conn_groups)) if _conn_groups else "")
-            _cid, _auth = (None, None)
-            if _diag_conn:
-                try:
-                    _cid, _auth = target_client()._connection_meta(_diag_conn)
-                except Exception:
-                    pass
-            st.session_state._casing_diag = {
-                "connection":     _diag_conn or "(not set)",
-                "connection_found": bool(_cid),
-                "auth_type":      _auth or "(could not infer)",
-                "resolved":       sorted(k for k in column_case_map),
-                "unresolved":     sorted(n for n in names if n.strip().lower() not in column_case_map),
-                "coords":         {p["name"]: f'{p["database"]}.{p["schema"]}.{p["table"]}' for p in promoted},
-                "fetch_trace":    _cc_trace,
-                "warehouse_resolved": sorted(warehouse_col_map),
-            }
-            # Keep both column sets around for Stage 2's missing-column diff:
-            #   _warehouse_col_map = authoritative CDW columns (source of truth),
-            #   _column_case_map   = CDW + org-modeled fallback (used when the warehouse couldn't
-            #                        be read for a table, flagged 'unverified').
-            # Either way we list ALL missing columns at once — VALIDATE_ONLY reports one per round.
-            st.session_state._warehouse_col_map = warehouse_col_map
-            st.session_state._column_case_map   = column_case_map
+            st.write("② Reading column casing from tables already on the target (fast)…")
+            # FAST PATH ONLY during export — a TML metadata read of tables already modeled on the
+            # target, no warehouse round-trip. The authoritative CDW column read (via connection/
+            # search) is OPT-IN on this page, because COLUMN introspection can be very slow or time
+            # out on some warehouses (the GSK 504) and must NEVER block the export.
+            try:
+                column_case_map = target_client().table_column_cases(names)
+            except Exception:
+                column_case_map = {}
+            # A fresh export resets any prior warehouse (CDW) read — re-verify on demand below.
+            st.session_state._column_case_map = column_case_map
+            st.session_state._warehouse_col_map = {}
+            # Persist coords + connection so the opt-in "verify against the warehouse" button can
+            # issue the (slow) connection read without re-exporting.
+            st.session_state._promoted_coords = promoted
+            st.session_state._promoted_tgt_conn = tgt_conn
             st.write("③ Applying the data-layer transform (connection remap, obj_ids, column casing)…")
             transformed_items, warnings = transform_items(
                 items,
@@ -1360,6 +1313,46 @@ elif step == 2:
             i for i in transformed_items
             if i.get("info", {}).get("name") not in skip_objects
         ]
+
+        # Opt-in authoritative warehouse read. Kept OFF the export critical path because COLUMN
+        # introspection can be very slow / 504 on some warehouses (GSK). Missing-column checks work
+        # without it (falling back to the target's modeled columns, flagged 'unverified'); click
+        # this to upgrade them to warehouse-verified when the connection can answer.
+        _coords = st.session_state.get("_promoted_coords") or []
+        if _coords:
+            _bcol1, _bcol2 = st.columns([3, 2])
+            with _bcol1:
+                if st.session_state.get("_warehouse_col_map"):
+                    st.caption(f"✅ Warehouse-verified columns for "
+                               f"{len(st.session_state['_warehouse_col_map'])} table(s).")
+                else:
+                    st.caption("Column checks use the target's **modeled** columns (fast). Verify "
+                               "against the warehouse for authoritative results — may be slow.")
+            with _bcol2:
+                if st.button("🔌 Verify columns against warehouse", help="Reads columns via the "
+                             "connection. Slow / can time out on some warehouses; never blocks export."):
+                    _tconn = st.session_state.get("_promoted_tgt_conn") or ""
+                    _groups = {}
+                    for _p in _coords:
+                        _eff = _tconn or _p.get("connection") or ""
+                        if _eff:
+                            _groups.setdefault(_eff, []).append(_p)
+                    _wh_new = {}
+                    with st.status("Reading warehouse columns via the connection…",
+                                   expanded=True) as _wh_status:
+                        for _cn, _tbls in _groups.items():
+                            st.write(f"connection `{_cn}` — {len(_tbls)} table(s)…")
+                            try:
+                                for _k, _v in target_client().connection_column_cases(
+                                        _cn, _tbls).items():
+                                    _wh_new.setdefault(_k, _v)
+                            except Exception as _e:
+                                st.write(f"⚠ `{_cn}` failed: {str(_e)[:200]}")
+                        _wh_status.update(
+                            label=f"Warehouse read done — {len(_wh_new)} table(s) resolved.",
+                            state=("complete" if _wh_new else "error"), expanded=False)
+                    st.session_state._warehouse_col_map = _wh_new
+                    st.rerun()
 
         # Table shape at a glance: how many columns the SOURCE promotes vs how many the TARGET
         # warehouse actually has. A gap on either side is what drives adds (source>target) or
