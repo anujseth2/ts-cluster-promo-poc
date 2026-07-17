@@ -1,0 +1,590 @@
+<title>Cross-Cluster Promotion — Architecture Flow</title>
+<style>
+  :root{
+    --bg:#EEF1F5; --surface:#FFFFFF; --surface-2:#F4F7FB; --surface-3:#EAEFF6;
+    --ink:#16202E; --ink-soft:#4B5B70; --ink-faint:#7C8A9E;
+    --line:#D3DBE6; --line-soft:#E3E9F1;
+    --accent:#0E7C8B; --accent-ink:#095561; --accent-soft:#DBEEF1;
+    --ok:#2E8B57; --ok-soft:#DEF0E6;
+    --warn:#B5761F; --warn-soft:#F6EAD5;
+    --crit:#C0392B; --crit-soft:#F6DEDA;
+    --s0:#5B63C4; --s1:#0E7C8B; --s2:#3D6E8E; --s3:#2E8B57;
+    --shadow:0 1px 2px rgba(20,32,46,.06), 0 8px 24px rgba(20,32,46,.08);
+    --shadow-lg:0 12px 40px rgba(20,32,46,.16);
+    --mono:ui-monospace,"SF Mono","JetBrains Mono",Menlo,Consolas,monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    --radius:14px; --radius-sm:9px;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{
+      --bg:#0C121C; --surface:#121B28; --surface-2:#16212F; --surface-3:#1B2838;
+      --ink:#E7EEF6; --ink-soft:#A5B6CA; --ink-faint:#6E8098;
+      --line:#26344A; --line-soft:#1E2B3D;
+      --accent:#35B7C6; --accent-ink:#8FE0E9; --accent-soft:#123642;
+      --ok:#49B87E; --ok-soft:#123528; --warn:#D69A44; --warn-soft:#332715;
+      --crit:#E06A5C; --crit-soft:#331d1a;
+      --s0:#8B92E6; --s1:#35B7C6; --s2:#6BA2C6; --s3:#49B87E;
+      --shadow:0 1px 2px rgba(0,0,0,.3), 0 8px 24px rgba(0,0,0,.35);
+      --shadow-lg:0 16px 48px rgba(0,0,0,.55);
+    }
+  }
+  :root[data-theme="light"]{
+    --bg:#EEF1F5; --surface:#FFFFFF; --surface-2:#F4F7FB; --surface-3:#EAEFF6;
+    --ink:#16202E; --ink-soft:#4B5B70; --ink-faint:#7C8A9E;
+    --line:#D3DBE6; --line-soft:#E3E9F1;
+    --accent:#0E7C8B; --accent-ink:#095561; --accent-soft:#DBEEF1;
+    --ok:#2E8B57; --ok-soft:#DEF0E6; --warn:#B5761F; --warn-soft:#F6EAD5;
+    --crit:#C0392B; --crit-soft:#F6DEDA;
+    --s0:#5B63C4; --s1:#0E7C8B; --s2:#3D6E8E; --s3:#2E8B57;
+    --shadow:0 1px 2px rgba(20,32,46,.06), 0 8px 24px rgba(20,32,46,.08);
+    --shadow-lg:0 12px 40px rgba(20,32,46,.16);
+  }
+  :root[data-theme="dark"]{
+    --bg:#0C121C; --surface:#121B28; --surface-2:#16212F; --surface-3:#1B2838;
+    --ink:#E7EEF6; --ink-soft:#A5B6CA; --ink-faint:#6E8098;
+    --line:#26344A; --line-soft:#1E2B3D;
+    --accent:#35B7C6; --accent-ink:#8FE0E9; --accent-soft:#123642;
+    --ok:#49B87E; --ok-soft:#123528; --warn:#D69A44; --warn-soft:#332715;
+    --crit:#E06A5C; --crit-soft:#331d1a;
+    --s0:#8B92E6; --s1:#35B7C6; --s2:#6BA2C6; --s3:#49B87E;
+    --shadow:0 1px 2px rgba(0,0,0,.3), 0 8px 24px rgba(0,0,0,.35);
+    --shadow-lg:0 16px 48px rgba(0,0,0,.55);
+  }
+
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);
+    line-height:1.5;-webkit-font-smoothing:antialiased;
+    background-image:radial-gradient(circle at 1px 1px, var(--line-soft) 1px, transparent 0);
+    background-size:26px 26px;}
+  .wrap{max-width:1040px;margin:0 auto;padding:32px 22px 120px}
+
+  /* ── Header ── */
+  header.masthead{display:flex;justify-content:space-between;align-items:flex-start;gap:24px;
+    padding-bottom:22px;border-bottom:1px solid var(--line);margin-bottom:8px}
+  .eyebrow{font-family:var(--mono);font-size:11.5px;letter-spacing:.16em;text-transform:uppercase;
+    color:var(--accent-ink);font-weight:600}
+  h1{font-size:clamp(26px,4.4vw,40px);line-height:1.06;font-weight:800;letter-spacing:-.02em;
+    margin:.35em 0 .15em;text-wrap:balance;max-width:16ch}
+  .sub{color:var(--ink-soft);font-size:15.5px;max-width:60ch;margin:0}
+  .controls{display:flex;flex-direction:column;gap:10px;align-items:flex-end;flex-shrink:0}
+  .toggle{font-family:var(--mono);font-size:12px;border:1px solid var(--line);background:var(--surface);
+    color:var(--ink-soft);padding:8px 12px;border-radius:99px;cursor:pointer;display:flex;gap:7px;align-items:center}
+  .toggle:hover{border-color:var(--accent);color:var(--ink)}
+  .hint{font-family:var(--mono);font-size:11px;color:var(--ink-faint);text-align:right;max-width:22ch}
+
+  /* ── Legend ── */
+  .legend{display:flex;flex-wrap:wrap;gap:16px 22px;margin:22px 0 30px;padding:14px 18px;
+    background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow)}
+  .legend .grp{display:flex;gap:9px;align-items:center;font-size:12.5px;color:var(--ink-soft)}
+  .swatch{width:13px;height:13px;border-radius:4px;flex-shrink:0}
+  .legend .k{font-family:var(--mono);font-size:11px;letter-spacing:.04em}
+
+  /* ── Flow spine ── */
+  .flow{position:relative;padding-left:38px}
+  .flow::before{content:"";position:absolute;left:13px;top:12px;bottom:26px;width:2px;
+    background:linear-gradient(var(--s0),var(--s1),var(--s2),var(--s3));opacity:.5;border-radius:2px}
+
+  .endpoint{position:relative;margin:0 0 10px}
+  .endpoint .cluster{display:flex;gap:12px;align-items:center;background:var(--surface-2);
+    border:1px dashed var(--line);border-radius:var(--radius);padding:13px 16px}
+  .endpoint .cluster .ic{width:30px;height:30px;flex-shrink:0}
+  .endpoint .cluster b{font-size:14.5px}
+  .endpoint .cluster span{color:var(--ink-soft);font-size:13px}
+  .dot{position:absolute;left:-31.5px;top:18px;width:16px;height:16px;border-radius:50%;
+    background:var(--surface);border:3px solid var(--ink-faint);z-index:2}
+
+  .stage{position:relative;margin:0 0 8px}
+  .stage>.dot{border-color:var(--sc)}
+  .stage-head{display:flex;align-items:center;gap:13px;padding:6px 0 12px}
+  .stage-idx{font-family:var(--mono);font-weight:700;font-size:13px;color:#fff;background:var(--sc);
+    width:30px;height:30px;border-radius:8px;display:grid;place-items:center;flex-shrink:0;letter-spacing:-.02em}
+  .stage-name{font-size:19px;font-weight:800;letter-spacing:-.01em}
+  .stage-purpose{color:var(--ink-soft);font-size:13.5px;margin-left:auto;text-align:right;max-width:44ch}
+
+  .lane{background:var(--surface);border:1px solid var(--line);border-left:3px solid var(--sc);
+    border-radius:var(--radius);padding:16px;box-shadow:var(--shadow);margin-bottom:22px}
+  .steps{display:grid;gap:11px}
+  @media(min-width:720px){.steps.cols-2{grid-template-columns:1fr 1fr}.steps.cols-3{grid-template-columns:1fr 1fr 1fr}}
+
+  .node{position:relative;text-align:left;width:100%;background:var(--surface-2);border:1px solid var(--line);
+    border-radius:var(--radius-sm);padding:13px 14px 12px;cursor:pointer;font-family:var(--sans);color:var(--ink);
+    transition:border-color .15s, transform .12s, box-shadow .15s;display:flex;flex-direction:column;gap:8px}
+  .node:hover{border-color:var(--accent);transform:translateY(-1px);box-shadow:var(--shadow)}
+  .node:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+  .node .nt{font-weight:700;font-size:14px;letter-spacing:-.01em;display:flex;align-items:center;gap:8px}
+  .node .nd{color:var(--ink-soft);font-size:12.8px;line-height:1.42}
+  .node .more{font-family:var(--mono);font-size:10.5px;color:var(--accent-ink);letter-spacing:.06em;
+    text-transform:uppercase;margin-top:2px;opacity:.85}
+  .node .more::after{content:" ›"}
+
+  .calls{display:flex;flex-wrap:wrap;gap:6px;margin-top:2px}
+  .call{font-family:var(--mono);font-size:11px;background:var(--surface-3);border:1px solid var(--line-soft);
+    color:var(--ink-soft);padding:2.5px 7px;border-radius:6px;letter-spacing:-.01em;white-space:nowrap}
+  .call.git{color:var(--s0)} .call.wh{color:var(--warn)}
+
+  .arrow{display:grid;place-items:center;color:var(--ink-faint);margin:-4px 0}
+  .arrow svg{width:16px;height:16px}
+
+  /* engine loop */
+  .engine{border:1px solid var(--accent);background:linear-gradient(180deg,var(--accent-soft),transparent 60%);
+    border-radius:var(--radius);padding:14px;margin-bottom:22px;position:relative;overflow:hidden}
+  .engine::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--accent)}
+  .engine .etitle{display:flex;align-items:center;gap:9px;font-weight:800;font-size:15px;margin-bottom:4px}
+  .engine .etitle .tag{font-family:var(--mono);font-size:10px;letter-spacing:.1em;text-transform:uppercase;
+    color:#fff;background:var(--accent);padding:3px 8px;border-radius:99px}
+  .engine .edesc{color:var(--ink-soft);font-size:13px;margin-bottom:12px;max-width:70ch}
+  .loopchain{display:flex;align-items:stretch;gap:8px;flex-wrap:wrap}
+  .lp{flex:1;min-width:120px;background:var(--surface);border:1px solid var(--line);border-radius:var(--radius-sm);
+    padding:10px 11px;font-size:12.4px;display:flex;flex-direction:column;gap:5px}
+  .lp b{font-size:12.7px}
+  .lp .mono{font-family:var(--mono);font-size:10.5px;color:var(--ink-faint)}
+  .loopback{display:flex;align-items:center;gap:8px;margin-top:11px;font-family:var(--mono);font-size:11.5px;
+    color:var(--accent-ink);background:var(--surface);border:1px dashed var(--accent);border-radius:99px;
+    padding:7px 13px;width:fit-content}
+  .exits{display:flex;gap:8px;flex-wrap:wrap;margin-top:11px}
+  .exit{font-family:var(--mono);font-size:11px;padding:4px 10px;border-radius:99px;border:1px solid}
+  .exit.ok{color:var(--ok);border-color:var(--ok);background:var(--ok-soft)}
+  .exit.stop{color:var(--warn);border-color:var(--warn);background:var(--warn-soft)}
+  .exit.fail{color:var(--crit);border-color:var(--crit);background:var(--crit-soft)}
+
+  /* resolve branch chips */
+  .branch{display:grid;gap:8px;grid-template-columns:1fr;margin-top:4px}
+  @media(min-width:640px){.branch{grid-template-columns:1fr 1fr}}
+  .kind{display:flex;gap:10px;align-items:flex-start;background:var(--surface-2);border:1px solid var(--line);
+    border-radius:var(--radius-sm);padding:10px 12px}
+  .kind .stripe{width:4px;align-self:stretch;border-radius:3px;flex-shrink:0}
+  .kind .kt{font-family:var(--mono);font-size:11.5px;font-weight:600}
+  .kind .kd{font-size:12px;color:var(--ink-soft);margin-top:2px}
+
+  /* side annotations */
+  .aside{display:flex;gap:10px;margin:0 0 22px;padding:12px 14px;background:var(--surface-2);
+    border:1px solid var(--line);border-left:3px solid var(--warn);border-radius:var(--radius-sm)}
+  .aside.git{border-left-color:var(--s0)}
+  .aside .at{font-weight:700;font-size:13.5px;margin-bottom:2px;cursor:pointer}
+  .aside .ad{font-size:12.7px;color:var(--ink-soft)}
+  .aside .calls{margin-top:7px}
+
+  /* merge sequence */
+  .seq{counter-reset:seq;display:grid;gap:9px}
+  .seq .row{display:flex;gap:12px;align-items:flex-start;background:var(--surface-2);border:1px solid var(--line);
+    border-radius:var(--radius-sm);padding:11px 13px}
+  .seq .row::before{counter-increment:seq;content:counter(seq);font-family:var(--mono);font-weight:700;
+    background:var(--s2);color:#fff;width:22px;height:22px;border-radius:6px;display:grid;place-items:center;
+    font-size:11.5px;flex-shrink:0;margin-top:1px}
+  .seq .row .rt{font-weight:650;font-size:13.3px}
+  .seq .row .rd{font-size:12.4px;color:var(--ink-soft)}
+  .seq .row.opt::before{background:var(--ink-faint)}
+  .seq .row .opttag{font-family:var(--mono);font-size:9.5px;letter-spacing:.08em;text-transform:uppercase;
+    color:var(--ink-faint);border:1px solid var(--line);border-radius:99px;padding:1px 7px;margin-left:6px}
+
+  /* ── Drawer ── */
+  .scrim{position:fixed;inset:0;background:rgba(8,14,22,.5);opacity:0;pointer-events:none;
+    transition:opacity .2s;z-index:40;backdrop-filter:blur(2px)}
+  .scrim.open{opacity:1;pointer-events:auto}
+  .drawer{position:fixed;top:0;right:0;height:100%;width:min(520px,94vw);background:var(--surface);
+    border-left:1px solid var(--line);box-shadow:var(--shadow-lg);z-index:50;transform:translateX(100%);
+    transition:transform .26s cubic-bezier(.4,0,.2,1);display:flex;flex-direction:column}
+  .drawer.open{transform:none}
+  .drawer .dh{display:flex;justify-content:space-between;align-items:flex-start;gap:14px;
+    padding:22px 24px 16px;border-bottom:1px solid var(--line)}
+  .drawer .badge{font-family:var(--mono);font-size:10.5px;letter-spacing:.12em;text-transform:uppercase;
+    color:#fff;padding:3px 9px;border-radius:99px;display:inline-block;margin-bottom:9px}
+  .drawer h2{font-size:20px;font-weight:800;letter-spacing:-.015em;margin:0;line-height:1.15}
+  .xbtn{border:1px solid var(--line);background:var(--surface-2);color:var(--ink-soft);border-radius:8px;
+    width:34px;height:34px;cursor:pointer;font-size:18px;flex-shrink:0;line-height:1}
+  .xbtn:hover{border-color:var(--accent);color:var(--ink)}
+  .dbody{padding:20px 24px 40px;overflow-y:auto}
+  .dbody h3{font-family:var(--mono);font-size:11px;letter-spacing:.12em;text-transform:uppercase;
+    color:var(--accent-ink);margin:22px 0 9px;font-weight:600}
+  .dbody h3:first-child{margin-top:0}
+  .dbody p{font-size:14px;color:var(--ink);margin:0 0 11px}
+  .dbody p.muted{color:var(--ink-soft);font-size:13.3px}
+  .dbody ul{margin:0 0 12px;padding-left:18px}
+  .dbody li{font-size:13.5px;margin-bottom:6px;color:var(--ink)}
+  .dbody code{font-family:var(--mono);font-size:12px;background:var(--surface-3);padding:1.5px 5px;
+    border-radius:5px;border:1px solid var(--line-soft)}
+  .dbody .callrow{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 14px}
+  .gotcha{background:var(--warn-soft);border:1px solid var(--warn);border-radius:var(--radius-sm);
+    padding:11px 13px;font-size:13px;margin:0 0 12px}
+  .gotcha b{color:var(--warn)}
+  .gotcha.crit{background:var(--crit-soft);border-color:var(--crit)} .gotcha.crit b{color:var(--crit)}
+
+  footer{margin-top:40px;padding-top:20px;border-top:1px solid var(--line);color:var(--ink-faint);
+    font-family:var(--mono);font-size:11.5px;display:flex;justify-content:space-between;flex-wrap:wrap;gap:10px}
+
+  @media (prefers-reduced-motion:reduce){*{transition:none!important}}
+  @media(max-width:560px){
+    .stage-purpose{display:none}.flow{padding-left:30px}.dot{left:-27.5px}
+    header.masthead{flex-direction:column}.controls{flex-direction:row;align-items:center}
+  }
+</style>
+
+<div class="wrap">
+  <header class="masthead">
+    <div>
+      <div class="eyebrow">ThoughtSpot · Git-Bridge Promotion</div>
+      <h1>Cross-Cluster Promotion Flow</h1>
+      <p class="sub">How content moves from a source ThoughtSpot cluster to a target — identity preserved,
+        data layer rebound, every import blocker discovered and resolved before it lands.
+        Click any step to drill into what happens and which API calls fire.</p>
+    </div>
+    <div class="controls">
+      <button class="toggle" id="themeBtn" aria-label="Toggle colour theme"><span id="themeIco">◐</span> <span id="themeLbl">Theme</span></button>
+      <div class="hint">Click a node → detail. Endpoint tags are always visible.</div>
+    </div>
+  </header>
+
+  <div class="legend" aria-label="Legend">
+    <div class="grp"><span class="swatch" style="background:var(--s0)"></span><span>Stage 0 · Select</span></div>
+    <div class="grp"><span class="swatch" style="background:var(--s1)"></span><span>Stage 1 · Align</span></div>
+    <div class="grp"><span class="swatch" style="background:var(--s2)"></span><span>Stage 2 · Git Ops</span></div>
+    <div class="grp"><span class="swatch" style="background:var(--s3)"></span><span>Stage 3 · Results</span></div>
+    <div class="grp" style="margin-left:auto"><span class="k">calls:</span><span class="call">REST v2</span><span class="call git">git</span><span class="call wh">warehouse</span></div>
+  </div>
+
+  <div class="flow">
+
+    <!-- SOURCE -->
+    <div class="endpoint"><div class="dot"></div>
+      <div class="cluster">
+        <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="var(--ink-soft)" stroke-width="1.6"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v14c0 1.7 3.6 3 8 3s8-1.3 8-3V5"/><path d="M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/></svg>
+        <div><b>Source cluster</b> &nbsp;<span>— where content is authored · <code style="font-family:var(--mono);font-size:11px">source_client()</code></span></div>
+      </div>
+    </div>
+    <div class="arrow"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 4v16M6 14l6 6 6-6"/></svg></div>
+
+    <!-- STAGE 0 -->
+    <section class="stage" style="--sc:var(--s0)"><div class="dot"></div>
+      <div class="stage-head"><span class="stage-idx">0</span><span class="stage-name">Select</span>
+        <span class="stage-purpose">Pick what to promote — then walk the dependency graph so the whole stack comes along.</span></div>
+      <div class="lane">
+        <div class="steps cols-2">
+          <button class="node" data-drill="s0-search">
+            <span class="nt">Search source assets</span>
+            <span class="nd">Find liveboards &amp; answers by tag / type. Empty tags → everything you can access.</span>
+            <span class="calls"><span class="call">metadata/search</span></span>
+            <span class="more">Detail</span>
+          </button>
+          <button class="node" data-drill="s0-resolve">
+            <span class="nt">Resolve dependency stack</span>
+            <span class="nd">Walk leaves → models → tables so a single liveboard pulls its entire promotable stack.</span>
+            <span class="calls"><span class="call">metadata/tml/export</span><span class="call">metadata/search</span></span>
+            <span class="more">Detail</span>
+          </button>
+        </div>
+      </div>
+    </section>
+    <div class="arrow"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 4v16M6 14l6 6 6-6"/></svg></div>
+
+    <!-- STAGE 1 -->
+    <section class="stage" style="--sc:var(--s1)"><div class="dot"></div>
+      <div class="stage-head"><span class="stage-idx">1</span><span class="stage-name">Align identity</span>
+        <span class="stage-purpose">Make the target object share <code style="font-family:var(--mono);font-size:11px">obj_id</code> with the source — so import updates in place, never duplicates.</span></div>
+      <div class="lane">
+        <div class="steps cols-3">
+          <button class="node" data-drill="s1-health">
+            <span class="nt">obj_id health check</span>
+            <span class="nd">Read each object's identity on both clusters. A null obj_id predates the feature.</span>
+            <span class="calls"><span class="call">metadata/search</span></span>
+            <span class="more">Detail</span>
+          </button>
+          <button class="node" data-drill="s1-align">
+            <span class="nt">Set / align obj_ids</span>
+            <span class="nd">Stamp the shared identity on source and/or target so the target updates in place.</span>
+            <span class="calls"><span class="call">metadata/update-obj-id</span></span>
+            <span class="more">Detail</span>
+          </button>
+          <button class="node" data-drill="s1-matcher">
+            <span class="nt">Table matcher</span>
+            <span class="nd">Pair renamed / drifted target tables by name + column signature, then align them.</span>
+            <span class="calls"><span class="call">match_tables</span></span>
+            <span class="more">Detail</span>
+          </button>
+        </div>
+      </div>
+    </section>
+    <div class="arrow"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 4v16M6 14l6 6 6-6"/></svg></div>
+
+    <!-- STAGE 2 -->
+    <section class="stage" style="--sc:var(--s2)"><div class="dot"></div>
+      <div class="stage-head"><span class="stage-idx">2</span><span class="stage-name">Git Operations</span>
+        <span class="stage-purpose">The engine room: export, rebind to the target data layer, discover &amp; resolve every blocker, then merge &amp; import.</span></div>
+
+      <!-- 2.1 export -->
+      <div class="lane">
+        <button class="node" data-drill="s2-export">
+          <span class="nt">① Export &amp; data-layer transform</span>
+          <span class="nd">Export TML with identity, then rebind connection · database · schema · warehouse column casing to the target. Optionally pull Spotter feedback.</span>
+          <span class="calls"><span class="call">metadata/tml/export</span><span class="call">export FEEDBACK</span><span class="call wh">connection/search · COLUMN</span></span>
+          <span class="more">Detail</span>
+        </button>
+      </div>
+
+      <!-- git bridge aside -->
+      <div class="aside git">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--s0)" stroke-width="1.7" style="flex-shrink:0;margin-top:1px"><circle cx="6" cy="6" r="2.5"/><circle cx="6" cy="18" r="2.5"/><circle cx="18" cy="12" r="2.5"/><path d="M6 8.5v7M8.4 6.6C13 7 15.6 9 15.6 12M8.4 17.4C13 17 15.6 15 15.6 12"/></svg>
+        <div><div class="at" data-drill="git-bridge">The GitHub bridge &nbsp;›</div>
+          <div class="ad">Every promotion is a <code style="font-family:var(--mono);font-size:11px">dev → main</code> squash-merge PR. The commit is the transaction; the merged <code style="font-family:var(--mono);font-size:11px">main</code> is what imports.</div>
+          <div class="calls"><span class="call git">commit_tml</span><span class="call git">create_pr</span><span class="call git">merge_pr</span></div>
+        </div>
+      </div>
+
+      <div class="arrow"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 4v16M6 14l6 6 6-6"/></svg></div>
+
+      <!-- 2.2 discover engine -->
+      <div class="engine">
+        <div class="etitle"><span class="tag">Engine</span> ② Discover all issues</div>
+        <div class="edesc">ThoughtSpot's validate stops at the <em>first</em> error per table. So we loop on a throwaway
+          copy — validate, classify, neutralise, re-validate — until the copy is clean. The real bundle is never touched.
+          Findings are unioned across passes, so you see the <em>complete</em> list up front, not one at a time.</div>
+        <div class="loopchain">
+          <button class="node lp" data-drill="s2-validate" style="cursor:pointer"><b>Validate</b><span class="mono">import · VALIDATE_ONLY</span><span style="font-size:11.5px;color:var(--ink-soft)">tables first, then models</span></button>
+          <div class="arrow" style="align-self:center"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="transform:rotate(-90deg)"><path d="M12 4v16M6 14l6 6 6-6"/></svg></div>
+          <button class="node lp" data-drill="s2-classify"><b>Classify</b><span class="mono">classify_import_errors</span><span style="font-size:11.5px;color:var(--ink-soft)">→ 6 finding kinds</span></button>
+          <div class="arrow" style="align-self:center"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="transform:rotate(-90deg)"><path d="M12 4v16M6 14l6 6 6-6"/></svg></div>
+          <button class="node lp" data-drill="s2-isolate"><b>Itemise if opaque</b><span class="mono">_isolate_failures</span><span style="font-size:11.5px;color:var(--ink-soft)">per-file, if blob error</span></button>
+          <div class="arrow" style="align-self:center"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="transform:rotate(-90deg)"><path d="M12 4v16M6 14l6 6 6-6"/></svg></div>
+          <button class="node lp" data-drill="s2-cascade"><b>Neutralise</b><span class="mono">drop_columns · drop_vizzes</span><span style="font-size:11.5px;color:var(--ink-soft)">cascade to fixpoint</span></button>
+        </div>
+        <div class="loopback"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12a9 9 0 1 0 3-6.7M3 3v4h4"/></svg> repeats until clean — or a pass can't neutralise anything</div>
+        <div class="exits">
+          <span class="exit ok">clean ✓ → resolve</span>
+          <span class="exit stop">no_progress → manual</span>
+          <span class="exit fail">request_failed → keep prior</span>
+        </div>
+      </div>
+
+      <div class="arrow"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 4v16M6 14l6 6 6-6"/></svg></div>
+
+      <!-- 2.3 resolve -->
+      <div class="lane">
+        <div class="node" style="cursor:default">
+          <span class="nt">③ Resolve findings — route each to a column-level action</span>
+          <span class="nd">Each discovered blocker maps to a reviewer choice. Dropping a column cascades its whole blast radius automatically, so imports never fail on dangling references.</span>
+        </div>
+        <div class="branch">
+          <div class="kind"><span class="stripe" style="background:var(--crit)"></span><div><span class="kt">missing_in_target_warehouse</span><div class="kd">Column not in the CDW (err 14536). Tick / Select all → drop, or add to warehouse.</div></div></div>
+          <div class="kind"><span class="stripe" style="background:var(--warn)"></span><div><span class="kt">type_mismatch</span><div class="kd">Declared type ≠ warehouse type. Retype, align warehouse, or drop.</div></div></div>
+          <div class="kind"><span class="stripe" style="background:var(--warn)"></span><div><span class="kt">invalid_formula_ids</span><div class="kd">Orphaned formula. Drop by name — takes its surfacing column too.</div></div></div>
+          <div class="kind"><span class="stripe" style="background:var(--crit)"></span><div><span class="kt">drop_blocked_by_dependents</span><div class="kd">Target column has dependents. Preserve it, or remove deps first.</div></div></div>
+          <div class="kind"><span class="stripe" style="background:var(--s2)"></span><div><span class="kt">viz_error</span><div class="kd">Viz won't load. Drop the viz; its layout tile is pruned with it.</div></div></div>
+          <div class="kind"><span class="stripe" style="background:var(--ink-faint)"></span><div><span class="kt">other &nbsp;·&nbsp; opaque</span><div class="kd">"Schema validation failed", no name. Isolate per-file to pin the culprit.</div></div></div>
+        </div>
+        <button class="node" data-drill="s2-cascade" style="margin-top:11px;background:var(--surface-3)">
+          <span class="nt">↳ The cascade drop</span>
+          <span class="nd">columns → formulas → formula-surfacing columns → joins → vizzes → layout tiles, re-scanning to a fixpoint.</span>
+          <span class="more">How the blast radius is computed</span>
+        </button>
+      </div>
+
+      <div class="arrow"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 4v16M6 14l6 6 6-6"/></svg></div>
+
+      <!-- 2.4 merge & import -->
+      <div class="lane">
+        <button class="node" data-drill="s2-merge" style="margin-bottom:13px">
+          <span class="nt">④ Merge &amp; Import to target</span>
+          <span class="nd">The ordered landing sequence. Ordering is load-bearing — several steps exist to route around platform behaviours.</span>
+          <span class="calls"><span class="call git">merge_pr</span><span class="call">metadata/tml/import</span></span>
+          <span class="more">Full choreography</span>
+        </button>
+        <div class="seq">
+          <div class="row"><div><span class="rt">Squash-merge the PR</span> <span class="rd">— dev → main. Already merged? re-commit, re-PR, re-validate, merge again.</span></div></div>
+          <div class="row opt"><div><span class="rt">Free target obj_ids</span><span class="opttag">replace mode</span> <span class="rd">— so a fresh model imports with clean feedback.</span></div></div>
+          <div class="row"><div><span class="rt">Import tables + models</span> <span class="rd">— core first, filtered to <em>this run's</em> files only.</span></div></div>
+          <div class="row"><div><span class="rt">Import feedback</span> <span class="rd">— a <em>separate</em> call after models commit (batching fails, err 14500).</span></div></div>
+          <div class="row opt"><div><span class="rt">Finalise replace / NL</span><span class="opttag">optional</span> <span class="rd">— repoint deps, delete old model; push Spotter instructions.</span></div></div>
+          <div class="row"><div><span class="rt">Validate then import leaves</span> <span class="rd">— liveboards/answers validated first, so viz errors surface here.</span></div></div>
+        </div>
+      </div>
+    </section>
+
+    <div class="arrow"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 4v16M6 14l6 6 6-6"/></svg></div>
+
+    <!-- STAGE 3 -->
+    <section class="stage" style="--sc:var(--s3)"><div class="dot"></div>
+      <div class="stage-head"><span class="stage-idx">3</span><span class="stage-name">Import results</span>
+        <span class="stage-purpose">Per object: created, updated-in-place, or duplicated. A duplicate means Stage-1 alignment missed.</span></div>
+      <div class="lane">
+        <button class="node" data-drill="s3-results">
+          <span class="nt">Created · Updated · Duplicate report</span>
+          <span class="nd">A pre-import name snapshot lets the tool classify each object's outcome and reconcile against the target.</span>
+          <span class="calls"><span class="call">metadata/search</span></span>
+          <span class="more">Detail</span>
+        </button>
+      </div>
+    </section>
+    <div class="arrow"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 4v16M6 14l6 6 6-6"/></svg></div>
+
+    <!-- TARGET -->
+    <div class="endpoint"><div class="dot" style="border-color:var(--s3)"></div>
+      <div class="cluster" style="border-style:solid;border-color:var(--s3)">
+        <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="var(--s3)" stroke-width="1.6"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v14c0 1.7 3.6 3 8 3s8-1.3 8-3V5"/><path d="M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/></svg>
+        <div><b>Target cluster</b> &nbsp;<span>— content lands; obj_id keeps it updated in place · <code style="font-family:var(--mono);font-size:11px">target_client()</code></span></div>
+      </div>
+      <div class="aside" style="margin-top:10px">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--warn)" stroke-width="1.7" style="flex-shrink:0;margin-top:1px"><rect x="3" y="4" width="18" height="5" rx="1"/><rect x="3" y="10" width="18" height="5" rx="1"/><rect x="3" y="16" width="18" height="4" rx="1"/></svg>
+        <div><div class="at" data-drill="cdw">Target CDW / warehouse &nbsp;›</div>
+          <div class="ad">The single source of truth for which columns actually exist. Read through ThoughtSpot's stored connection credential — the tool never holds a warehouse secret.</div>
+          <div class="calls"><span class="call wh">connection/search · COLUMN</span></div>
+        </div>
+      </div>
+    </div>
+
+  </div><!-- /flow -->
+
+  <footer>
+    <span>ts-cluster-promo-poc · architecture</span>
+    <span>identity = obj_id · truth = CDW · discovery = fixpoint</span>
+  </footer>
+</div>
+
+<!-- Drawer -->
+<div class="scrim" id="scrim"></div>
+<aside class="drawer" id="drawer" role="dialog" aria-modal="true" aria-labelledby="drawerTitle" tabindex="-1">
+  <div class="dh">
+    <div><span class="badge" id="drawerBadge">Stage</span><h2 id="drawerTitle">—</h2></div>
+    <button class="xbtn" id="xbtn" aria-label="Close">×</button>
+  </div>
+  <div class="dbody" id="drawerBody"></div>
+</aside>
+
+<script>
+(function(){
+  var root=document.documentElement;
+  // theme
+  var btn=document.getElementById('themeBtn'),lbl=document.getElementById('themeLbl'),ico=document.getElementById('themeIco');
+  function sysDark(){return window.matchMedia&&window.matchMedia('(prefers-color-scheme:dark)').matches;}
+  function apply(t){root.setAttribute('data-theme',t);lbl.textContent=t.charAt(0).toUpperCase()+t.slice(1);ico.textContent=t==='dark'?'☾':'☀';}
+  apply(sysDark()?'dark':'light');
+  btn.addEventListener('click',function(){apply(root.getAttribute('data-theme')==='dark'?'light':'dark');});
+
+  var C={sc0:'var(--s0)',sc1:'var(--s1)',sc2:'var(--s2)',sc3:'var(--s3)'};
+  function callrow(arr){return '<div class="callrow">'+arr.map(function(c){return '<span class="call'+(c.cls?' '+c.cls:'')+'">'+c.t+'</span>';}).join('')+'</div>';}
+
+  var DATA={
+    's0-search':{badge:'Stage 0 · Select',c:C.sc0,title:'Search source assets',body:
+      callrow([{t:'metadata/search'}])+
+      '<h3>What happens</h3><p>You search the source cluster for taggable leaf objects — liveboards and answers — by tag and type. Results are paged 200 at a time.</p>'+
+      '<ul><li>Non-empty tags → only objects carrying those tags.</li><li>Empty tags → <b>every</b> leaf you can access, so untaggable assets are still selectable.</li></ul>'+
+      '<p class="muted">You can pick any mix of leaves, models and bare tables as promotion roots — the next step resolves whatever each root needs.</p>'},
+
+    's0-resolve':{badge:'Stage 0 · Select',c:C.sc0,title:'Resolve the dependency stack',body:
+      callrow([{t:'metadata/tml/export'},{t:'metadata/search'}])+
+      '<h3>What happens</h3><p><code>resolve_promotion</code> walks the graph downward from mixed roots so the entire promotable stack is assembled:</p>'+
+      '<ul><li>Leaves → export TML → extract referenced <b>model</b> names → resolve to ids.</li><li>Models (selected + leaf-derived) → export → extract <b>table</b> names → resolve to ids.</li><li>Bare tables pass through as-is.</li></ul>'+
+      '<div class="gotcha"><b>Watch:</b> tables a model references but that can\'t be resolved come back as <code>missing_tables</code> — a warning, and a candidate for the "prune table from model" path in Stage 2.</div>'},
+
+    's1-health':{badge:'Stage 1 · Align',c:C.sc1,title:'obj_id health check',body:
+      callrow([{t:'metadata/search'}])+
+      '<h3>Why identity matters</h3><p><code>obj_id</code> is the cross-cluster primary key. Same obj_id on the target ⇒ import <b>updates in place</b>. Different or missing ⇒ import <b>creates a duplicate</b>. This whole stage exists to guarantee the former.</p>'+
+      '<h3>What happens</h3><p><code>search_obj_ids</code> maps each object name to <code>{guid, obj_id}</code> on both clusters.</p>'+
+      '<div class="gotcha"><b>Null obj_id</b> means the object predates obj_id being enabled — it needs stamping before it can align.</div>'},
+
+    's1-align':{badge:'Stage 1 · Align',c:C.sc1,title:'Set / align obj_ids',body:
+      callrow([{t:'metadata/update-obj-id'}])+
+      '<h3>What happens</h3><p><code>update_obj_ids</code> stamps the shared identity on the source and/or target so the target object updates in place on import.</p>'+
+      '<ul><li>Source missing obj_id → apply on source.</li><li>Target missing / mismatched → fix on target.</li></ul>'+
+      '<div class="gotcha"><b>Privilege:</b> requires <code>DATAMANAGEMENT</code> or <code>ADMINISTRATION</code> on the cluster being written.</div>'},
+
+    's1-matcher':{badge:'Stage 1 · Align',c:C.sc1,title:'Table matcher',body:
+      callrow([{t:'match_tables'},{t:'metadata/update-obj-id'}])+
+      '<h3>The problem it solves</h3><p>A target table that was renamed or drifted won\'t match by name, so a naïve import duplicates it. The matcher pairs source ↔ target by <b>name and column signature</b>.</p>'+
+      '<h3>What happens</h3><p>Once a pair is confirmed, a <b>shared obj_id</b> is stamped on both sides — turning a would-be duplicate into an update-in-place.</p>'},
+
+    's2-export':{badge:'Stage 2 · Git Ops',c:C.sc2,title:'Export & data-layer transform',body:
+      callrow([{t:'metadata/tml/export'},{t:'export FEEDBACK'},{t:'connection/search · COLUMN',cls:'wh'}])+
+      '<h3>What happens on page entry</h3>'+
+      '<ul><li><b>Export</b> with <code>include_obj_id</code> + <code>include_obj_id_ref</code>, so aligned identity travels with the TML.</li>'+
+      '<li><b>Feedback</b> (opt-in): pull each model\'s Spotter reference questions / business terms, per-model via <code>type=FEEDBACK</code>.</li>'+
+      '<li><b>Transform</b>: rebind connection, remap database &amp; schema, apply obj_ids, align warehouse column casing.</li>'+
+      '<li><b>Prune / skip</b>: <code>drop_tables</code> for excluded tables; <code>drop_columns</code> for skipped columns.</li></ul>'+
+      '<h3>Column casing — two tiers</h3>'+
+      '<p><b>Fast (on entry):</b> read casing from tables already modeled on the target — no warehouse round-trip.</p>'+
+      '<p><b>Authoritative (opt-in):</b> read straight from the warehouse via <code>connection/search</code> with <code>data_warehouse_object_type=COLUMN</code>.</p>'+
+      '<div class="gotcha"><b>Why the split:</b> COLUMN introspection can be very slow or time out on some warehouses (the GSK 504) — so it must never block the export.</div>'},
+
+    's2-validate':{badge:'Engine',c:'var(--accent)',title:'Validate (probe)',body:
+      callrow([{t:'metadata/tml/import · VALIDATE_ONLY'}])+
+      '<h3>What happens</h3><p>The probe validates a <b>throwaway copy</b> of the bundle — tables first (they surface missing-column / drop-blocked errors), then models (which catch the rest). The real promotion set is never mutated by discovery.</p>'+
+      '<div class="gotcha"><b>The core problem:</b> ThoughtSpot\'s VALIDATE_ONLY stops at the <b>first</b> missing column per table. Validate once and you see one error; fix it and the next appears — whack-a-mole. The loop exists to defeat exactly this.</div>'+
+      '<h3>Resilience</h3><p>VALIDATE_ONLY is read-only and safe to retry, so transient connection resets / timeouts (e.g. WinError 10054 from a gateway dropping a slow warehouse validate) auto-retry with backoff 3s · 8s · 20s.</p>'},
+
+    's2-classify':{badge:'Engine',c:'var(--accent)',title:'Classify errors',body:
+      callrow([{t:'classify_import_errors'}])+
+      '<h3>Six finding kinds</h3>'+
+      '<ul><li><code>missing_in_target_warehouse</code> — column not in the CDW (err 14536).</li>'+
+      '<li><code>type_mismatch</code> — declared type ≠ warehouse type.</li>'+
+      '<li><code>drop_blocked_by_dependents</code> — target column has dependents.</li>'+
+      '<li><code>invalid_formula_ids</code> — orphaned / broken formula.</li>'+
+      '<li><code>viz_error</code> — a visualization fails to load.</li>'+
+      '<li><code>other</code> — unrecognised (e.g. bare "Schema validation failed").</li></ul>'+
+      '<p class="muted">Findings are unioned across passes and deduped by <code>finding_key</code>, so the reviewer sees the complete set — never the same issue twice.</p>'},
+
+    's2-isolate':{badge:'Engine',c:'var(--accent)',title:'Itemise opaque errors',body:
+      callrow([{t:'_isolate_failures'},{t:'metadata/tml/import · VALIDATE_ONLY'}])+
+      '<h3>The escape hatch</h3><p>Sometimes the batch validate returns an unactionable blob — bare <code>"Schema validation failed"</code>, no object named. When <b>every</b> finding is <code>other</code>, the probe validates each file <b>on its own</b> and re-classifies.</p>'+
+      '<ul><li>Tables validated <b>alone</b> — no cross-file dependencies.</li><li>Models validated <b>with all tables present</b> — so table refs resolve and only the model varies.</li></ul>'+
+      '<p>A hidden missing column then surfaces as a proper column-level finding — a droppable column, not a whole-table skip.</p>'+
+      '<div class="gotcha crit"><b>Edge case being debugged live:</b> if no <em>single</em> file fails in isolation but the batch does, it\'s a batch-level <b>interaction</b>. That\'s what the raw-capture debug bundle (raw responses + leave-one-out) exists to pin down.</div>'},
+
+    's2-cascade':{badge:'Stage 2 · Git Ops',c:C.sc2,title:'The cascade drop',body:
+      callrow([{t:'drop_columns'},{t:'drop_vizzes'},{t:'column_drop_cascade (dry-run)'}])+
+      '<h3>Why cascade</h3><p>Drop a column and everything that depended on it must go too — or the import fails on dangling references. <code>drop_columns</code> cascades to a <b>fixpoint</b>:</p>'+
+      '<ul><li>Remove formulas that reference a removed name (or are themselves a target).</li>'+
+      '<li>Remove columns that surface a removed formula — by <code>column_id = formula_&lt;name&gt;</code> <b>or by name only</b> (null column_id).</li>'+
+      '<li>Re-scan: removing a surfacing column can orphan another formula.</li>'+
+      '<li>Drop joins whose <code>on</code> references a removed name.</li>'+
+      '<li>Drop liveboard vizzes referencing a removed name; prune their layout tiles.</li></ul>'+
+      '<div class="gotcha"><b>The subtle bug this fixed:</b> a formula-surfacing column with a <b>null</b> column_id links to its formula purely by name. Miss it and it dangles as an "invalid formula IDs" error on the next import.</div>'+
+      '<p class="muted"><code>column_drop_cascade</code> is the dry-run twin — same logic, mutates nothing — used to preview the blast radius before you confirm.</p>'},
+
+    's2-merge':{badge:'Stage 2 · Git Ops',c:C.sc2,title:'Merge & Import — full choreography',body:
+      callrow([{t:'merge_pr',cls:'git'},{t:'metadata/tml/import'},{t:'metadata/delete'},{t:'ai/instructions/set'}])+
+      '<h3>The ordered sequence</h3><p>Ordering is load-bearing — several steps route around platform behaviours.</p>'+
+      '<ul><li><b>Squash-merge</b> dev → main. If already merged: re-commit, re-PR, re-validate, merge again.</li>'+
+      '<li><b>Free obj_ids</b> (replace mode) — so the import creates a fresh model with clean feedback.</li>'+
+      '<li><b>Import tables + models</b> — filtered to this run\'s files only.</li>'+
+      '<li><b>Import feedback separately</b>, after models commit.</li>'+
+      '<li><b>Finalise replace</b> — repoint dependents to the fresh model, delete the old one; push NL instructions.</li>'+
+      '<li><b>Validate then import leaves</b> — liveboards/answers validated first.</li></ul>'+
+      '<div class="gotcha"><b>Why free the obj_id at all:</b> the platform has <b>no API to clear a model\'s feedback</b> entries. So replace renames the old model\'s obj_id (its guid is untouched), lets the import create a <b>fresh</b> model carrying the aligned obj_id + source feedback — clean — then re-points the old model\'s real dependents and deletes it.</div>'+
+      '<div class="gotcha"><b>Feedback separate call:</b> a first-time model+feedback in one batch fails (err 14500 — feedback can\'t resolve the not-yet-committed model) and under ALL_OR_NONE would roll the model back too.</div>'+
+      '<div class="gotcha"><b>This run\'s files only:</b> the team folder accumulates TML across promotions; an unfiltered import would re-import unrelated tables (the "10 tables for a 3-table model" bug).</div>'},
+
+    's3-results':{badge:'Stage 3 · Results',c:C.sc3,title:'Import results report',body:
+      callrow([{t:'metadata/search'}])+
+      '<h3>What happens</h3><p>A name-index snapshot taken <b>before</b> import lets the tool classify each object\'s outcome:</p>'+
+      '<ul><li><b>Created</b> — new on the target.</li><li><b>Updated in place</b> — obj_id matched an existing object (the goal).</li><li><b>Duplicate</b> — new guid, name already existed → alignment gap.</li></ul>'+
+      '<div class="gotcha"><b>A Duplicate verdict</b> is the signal to revisit Stage-1 alignment for that object.</div>'},
+
+    'git-bridge':{badge:'Transport',c:C.sc0,title:'The GitHub bridge',body:
+      callrow([{t:'commit_tml',cls:'git'},{t:'create_pr',cls:'git'},{t:'merge_pr',cls:'git'}])+
+      '<h3>Git as the promotion transaction</h3><p>TML is written to a disposable <code>dev</code> branch, force-pointed at the current <code>main</code> tip; a <code>dev → main</code> PR is opened and squash-merged. The merged <code>main</code> is what the target imports from.</p>'+
+      '<ul><li><code>dev</code> is disposable — each export re-bases on the fresh main tip, so a prior squash-merge can\'t leave it diverged.</li><li>Validation reads only <em>this run\'s</em> committed files, never the whole accumulated folder.</li></ul>'+
+      '<p class="muted">Implemented over PyGithub against <code>GITHUB_REPO</code>.</p>'},
+
+    'cdw':{badge:'Source of truth',c:'var(--warn)',title:'Target CDW / warehouse',body:
+      callrow([{t:'connection/search · COLUMN',cls:'wh'}])+
+      '<h3>Why the warehouse is authoritative</h3><p>Rather than discover missing columns one import-failure at a time, the tool reads the warehouse\'s real column set and diffs the whole promotion against it up front — no whack-a-mole.</p>'+
+      '<ul><li><b>Verified</b> — column absent from the CDW genuinely doesn\'t exist (this is what err 14536 reports).</li>'+
+      '<li><b>Fallback</b> — if the warehouse can\'t be read, diff against the target\'s <em>modeled</em> columns and flag each finding <code>verified=false</code> with a caveat.</li></ul>'+
+      '<div class="gotcha"><b>No secret held:</b> the warehouse is read through ThoughtSpot\'s stored connection credential — the tool infers the connection\'s auth type and never handles a warehouse password.</div>'}
+  };
+
+  var scrim=document.getElementById('scrim'),drawer=document.getElementById('drawer'),
+      dTitle=document.getElementById('drawerTitle'),dBadge=document.getElementById('drawerBadge'),
+      dBody=document.getElementById('drawerBody'),xbtn=document.getElementById('xbtn'),lastFocus=null;
+
+  function open(id){var d=DATA[id];if(!d)return;lastFocus=document.activeElement;
+    dTitle.textContent=d.title;dBadge.textContent=d.badge;dBadge.style.background=d.c;dBody.innerHTML=d.body;
+    scrim.classList.add('open');drawer.classList.add('open');drawer.focus();dBody.scrollTop=0;}
+  function close(){scrim.classList.remove('open');drawer.classList.remove('open');if(lastFocus)lastFocus.focus();}
+
+  document.querySelectorAll('[data-drill]').forEach(function(el){
+    el.addEventListener('click',function(){open(el.getAttribute('data-drill'));});
+  });
+  xbtn.addEventListener('click',close);
+  scrim.addEventListener('click',close);
+  document.addEventListener('keydown',function(e){if(e.key==='Escape'&&drawer.classList.contains('open'))close();});
+})();
+</script>
