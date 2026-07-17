@@ -1537,7 +1537,6 @@ elif step == 2:
             git commits; validates TML strings directly. Returns (union_findings, clean, passes,
             reason) where reason is 'clean' | 'no_progress' | 'request_failed'. The real promotion
             bundle is untouched — this only enumerates."""
-            import re as _re
             _tick = progress or (lambda *_a: None)
             work = [dict(it) for it in items]
             seen, passes, clean, reason = {}, 0, False, "no_progress"
@@ -1612,11 +1611,11 @@ elif step == 2:
                         drop_set.add(f["name"])   # drop the referrer (formula/column) by name
                     elif f["kind"] == "drop_table":
                         tbl_set.add(f["table"])   # empty / disconnected table -> prune whole
-                    elif f["kind"] == "other":
-                        for fm in _re.findall(r"<b>(.*?)</b>", f.get("error", "") or ""):
-                            fm = fm.strip()
-                            if fm and not fm.endswith(":"):
-                                drop_set.add(fm)
+                    # NOTE: deliberately NO <b>…</b> scrape for "other" errors anymore. It grabbed
+                    # garbage — ordinals like "1st" (from "translating 1st join") and bare table
+                    # names — and dropped them as if they were columns. The static detectors
+                    # (dangling refs, empty/disconnected tables) now resolve those opaque errors
+                    # precisely; an "other" with no static explanation is surfaced, not guessed at.
                 removed = 0
                 _m = {}
                 if drop_set:
