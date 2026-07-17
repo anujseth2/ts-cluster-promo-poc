@@ -408,23 +408,73 @@ def column_dependents(items, columns):
     return deps
 
 
-def drop_columns(items, columns):
-    """Remove the named columns from every model/table in the promotion set, and any
-    liveboard/answer viz that references them. columns may be display or db_column_name.
-    Returns (new_items, dropped_columns, dropped_vizs)."""
-    targets = {c.lower() for c in columns}
-    dropped_cols = dropped_vizs = 0
-    out = []
-    for item in items:
-        edoc = item.get("edoc", "{}")
-        doc = json.loads(edoc) if isinstance(edoc, str) else edoc
+def _refs_any(obj, removed):
+    """True if any [table::Col] / [Display] / [Formula Name] reference inside obj hits a
+    name in `removed` (all lowercased)."""
+    for expr in _iter_strings(obj):
+        for inner in _BRACKET_REF.findall(expr):
+            if inner.split("::")[-1].strip().lower() in removed or inner.strip().lower() in removed:
+                return True
+    return False
 
+
+def _viz_refs(viz, removed):
+    """A liveboard viz references a removed name via its answer_columns or any inner expr."""
+    for c in viz.get("answer", {}).get("answer_columns", []) or []:
+        if (c.get("name", "") or "").strip().lower() in removed:
+            return True
+    return _refs_any(viz, removed)
+
+
+def drop_columns(items, columns):
+    """Remove the named columns from every model/table AND cascade-remove everything that
+    depended on them — joins and formulas whose expression references a dropped column, then
+    (transitively) any formula/viz that referenced THOSE formulas, and any liveboard viz that
+    references a removed column/formula. Layout tiles for removed vizzes are pruned too.
+
+    columns may be display or db_column_name.
+    Returns (new_items, manifest) where manifest = {columns, joins, formulas:[names], vizzes}.
+    """
+    targets = {c.lower() for c in columns}
+    # A column dropped by physical name is referenced downstream by its model DISPLAY name, so
+    # seed the "removed reference names" with both.
+    all_docs = [_parse_edoc(it) for it in items]
+    removed = set(targets) | _resolve_display_names(all_docs, targets)
+
+    man = {"columns": 0, "joins": 0, "formulas": [], "vizzes": 0}
+    out = []
+    for item, doc in zip(items, all_docs):
         for key in ("model", "worksheet"):
             node = doc.get(key)
-            if node and node.get("columns") is not None:
+            if not node:
+                continue
+            # Cascade formulas to a fixpoint: removing a formula that used a dropped column can
+            # in turn orphan another formula that referenced it.
+            if node.get("formulas"):
+                changed = True
+                while changed:
+                    changed = False
+                    keep = []
+                    for fdef in node["formulas"]:
+                        if _refs_any(fdef, removed):
+                            man["formulas"].append(fdef.get("name", "?"))
+                            nm = (fdef.get("name", "") or "").strip().lower()
+                            if nm and nm not in removed:
+                                removed.add(nm); changed = True   # re-scan: downstream formulas
+                        else:
+                            keep.append(fdef)
+                    node["formulas"] = keep
+            # Joins whose `on` condition references a removed name.
+            for mt in (node.get("model_tables") or node.get("tables") or []):
+                if mt.get("joins"):
+                    before = len(mt["joins"])
+                    mt["joins"] = [j for j in mt["joins"] if not _refs_any(j, removed)]
+                    man["joins"] += before - len(mt["joins"])
+            # The columns themselves (physical target names).
+            if node.get("columns") is not None:
                 before = len(node["columns"])
                 node["columns"] = [c for c in node["columns"] if _col_name(c) not in targets]
-                dropped_cols += before - len(node["columns"])
+                man["columns"] += before - len(node["columns"])
 
         t = doc.get("table")
         if t and t.get("columns") is not None:
@@ -432,22 +482,40 @@ def drop_columns(items, columns):
             t["columns"] = [c for c in t["columns"]
                             if (c.get("name", "") or "").lower() not in targets
                             and (c.get("db_column_name", "") or "").lower() not in targets]
-            dropped_cols += before - len(t["columns"])
+            man["columns"] += before - len(t["columns"])
 
         lb = doc.get("liveboard")
         if lb and lb.get("visualizations") is not None:
-            kept = []
+            kept, kept_ids = [], set()
             for viz in lb["visualizations"]:
-                acols = [(c.get("name", "") or "").lower()
-                         for c in viz.get("answer", {}).get("answer_columns", [])]
-                if any(any(t_ in ac or ac in t_ for t_ in targets) for ac in acols):
-                    dropped_vizs += 1
+                if _viz_refs(viz, removed):
+                    man["vizzes"] += 1
                 else:
                     kept.append(viz)
+                    kept_ids.add(str(viz.get("id") or viz.get("viz_id") or ""))
             lb["visualizations"] = kept
+            layout = lb.get("layout") or {}
+
+            def _prune(tiles):
+                return [ti for ti in tiles if str(ti.get("visualization_id", "")) in kept_ids]
+            if isinstance(layout.get("tiles"), list):
+                layout["tiles"] = _prune(layout["tiles"])
+            if isinstance(layout.get("tabs"), list):
+                for tab in layout["tabs"]:
+                    if isinstance(tab.get("tiles"), list):
+                        tab["tiles"] = _prune(tab["tiles"])
 
         out.append({**item, "edoc": json.dumps(doc)})
-    return out, dropped_cols, dropped_vizs
+    return out, man
+
+
+def column_drop_cascade(items, columns):
+    """Dry-run: what drop_columns(items, columns) WOULD remove, for a pre-confirm preview.
+    Returns the same manifest dict without mutating anything."""
+    import copy
+    _clone = [{**it, "edoc": json.dumps(_parse_edoc(it))} for it in items]
+    _out, man = drop_columns(_clone, columns)
+    return man
 
 
 def drop_vizzes(items, viz_ids):

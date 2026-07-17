@@ -26,6 +26,7 @@ from services.tml_transformer import (
 from services.import_diagnostics import (
     classify_import_errors, drop_columns, silent_drop_findings, column_dependents, column_usage,
     drop_vizzes, table_drop_preview, drop_tables, warehouse_missing_findings, friendly_error,
+    column_drop_cascade,
 )
 from services.table_matcher import column_signature
 from services.feedback_replace import feedback_preview, replace_prep, replace_finalize
@@ -133,6 +134,16 @@ def _sno(df):
     out = df.copy()
     out.insert(0, "S.No", range(1, len(out) + 1))
     return out
+
+
+def _record_drop(man):
+    """Accumulate a drop_columns manifest (columns/vizzes/joins/formulas) into session counters
+    for the Import Results report."""
+    st.session_state.dropped_cols_count = st.session_state.get("dropped_cols_count", 0) + man.get("columns", 0)
+    st.session_state.dropped_vizs_count = st.session_state.get("dropped_vizs_count", 0) + man.get("vizzes", 0)
+    st.session_state.dropped_joins_count = st.session_state.get("dropped_joins_count", 0) + man.get("joins", 0)
+    if man.get("formulas"):
+        st.session_state.setdefault("dropped_formula_names", []).extend(man["formulas"])
 
 
 def _log_validate(files, results):
@@ -1280,9 +1291,8 @@ elif step == 2:
             # Skip individual columns the user chose to leave out (persisted across re-exports).
             skip_cols = st.session_state.get("skip_columns", set())
             if skip_cols:
-                transformed_items, _sc_n, _sv_n = drop_columns(transformed_items, skip_cols)
-                st.session_state.dropped_cols_count = st.session_state.get("dropped_cols_count", 0) + _sc_n
-                st.session_state.dropped_vizs_count = st.session_state.get("dropped_vizs_count", 0) + _sv_n
+                transformed_items, _man = drop_columns(transformed_items, skip_cols)
+                _record_drop(_man)
                 st.session_state.setdefault("dropped_col_names", set()).update(skip_cols)
             st.session_state.transformed_items = transformed_items
             st.session_state.warnings          = warnings
@@ -1741,10 +1751,9 @@ elif step == 2:
                                    "it removes only the column.")
                 if st.button("Apply choices, re-export & re-validate", type="primary"):
                     if drop_set:
-                        fixed, dc, dv = drop_columns(st.session_state.transformed_items, drop_set)
+                        fixed, _man = drop_columns(st.session_state.transformed_items, drop_set)
                         st.session_state.transformed_items = fixed
-                        st.session_state.dropped_cols_count = st.session_state.get("dropped_cols_count", 0) + dc
-                        st.session_state.dropped_vizs_count = st.session_state.get("dropped_vizs_count", 0) + dv
+                        _record_drop(_man)
                         st.session_state.setdefault("dropped_col_names", set()).update(drop_set)
                     filtered_fixed = [i for i in st.session_state.transformed_items
                                       if i.get("info", {}).get("name") not in skip_objects]
@@ -1778,7 +1787,8 @@ elif step == 2:
                     "These columns exist on both clusters but the **target warehouse**'s physical "
                     "type differs from dev's. **Dev is the source of truth**, so the fix is to align "
                     "the target warehouse to dev — not to alter the promoted content. Dropping is a "
-                    "last resort and is blocked here when a join or formula depends on the column.")
+                    "last resort; if a join/formula depends on the column, dropping cascade-removes "
+                    "those too (previewed before you confirm).")
 
                 tm_key = tuple(sorted((f["object"], f["column"]) for f in type_mismatch))
                 if st.session_state.get("_tm_key") != tm_key:
@@ -1831,21 +1841,27 @@ elif step == 2:
                                     f"Target-side impact: none of the {total} objects on the table use this "
                                     "column (only the table definition itself).")
 
-                    if deps["joins"] or deps["formulas"]:
-                        st.warning(
-                            f"`{f['column']}` feeds a join/formula — dropping it would break the model. "
-                            "Align the target warehouse, or remove those joins/formulas first.")
-                    elif st.checkbox(
-                            f"Drop `{f['column']}` from this promotion (fallback — loses any viz above)",
+                    # Aligning the target warehouse type is still the recommended fix. But dropping is
+                    # no longer BLOCKED when a join/formula depends — drop_columns cascade-removes
+                    # them. Preview exactly what the drop would take with it.
+                    _casc = column_drop_cascade(st.session_state.transformed_items, [f["column"]])
+                    if _casc["joins"] or _casc["formulas"] or _casc["vizzes"]:
+                        _bits = []
+                        if _casc["joins"]:    _bits.append(f"{_casc['joins']} join(s)")
+                        if _casc["formulas"]: _bits.append("formulas: " + ", ".join(_casc["formulas"]))
+                        if _casc["vizzes"]:   _bits.append(f"{_casc['vizzes']} viz(es)")
+                        st.caption("↳ dropping also cascade-removes — " + "  ·  ".join(_bits)
+                                   + ".  Prefer aligning the target warehouse type instead.")
+                    if st.checkbox(
+                            f"Drop `{f['column']}` from this promotion (cascades the above)",
                             value=False, key=f"droptm_{f['object']}_{f['column']}"):
                         tm_drop.add(f["column"])
 
                 if st.button("Apply drops, re-export & re-validate", key="tm_apply"):
                     if tm_drop:
-                        fixed, dc, dv = drop_columns(st.session_state.transformed_items, tm_drop)
+                        fixed, _man = drop_columns(st.session_state.transformed_items, tm_drop)
                         st.session_state.transformed_items  = fixed
-                        st.session_state.dropped_cols_count = st.session_state.get("dropped_cols_count", 0) + dc
-                        st.session_state.dropped_vizs_count = st.session_state.get("dropped_vizs_count", 0) + dv
+                        _record_drop(_man)
                         st.session_state.setdefault("dropped_col_names", set()).update(tm_drop)
                     filtered_fixed = [i for i in st.session_state.transformed_items
                                       if i.get("info", {}).get("name") not in skip_objects]
