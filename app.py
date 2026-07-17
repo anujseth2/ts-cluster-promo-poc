@@ -1326,6 +1326,10 @@ elif step == 2:
             # issue the (slow) connection read without re-exporting.
             st.session_state._promoted_coords = promoted
             st.session_state._promoted_tgt_conn = tgt_conn
+            # Stash the RAW source export (pre-transform, pre-drop) so a debug bundle carries the
+            # original model+tables — the true joins/columns before any remap or cascade. Captured
+            # here, as it happens; edocs are strings so a shallow per-item copy is enough.
+            st.session_state._source_raw_items = [dict(it) for it in items]
             st.write("③ Applying the data-layer transform (connection remap, obj_ids, column casing)…")
             transformed_items, warnings = transform_items(
                 items,
@@ -2307,7 +2311,8 @@ elif step == 2:
                         try:
                             _fn, _bytes, _sm = capture_zip_bytes(
                                 filtered_items, target_client(), _ts, deep=_deep,
-                                target_connection=teams[team_name].get("target_connection", ""))
+                                target_connection=teams[team_name].get("target_connection", ""),
+                                source_items=st.session_state.get("_source_raw_items"))
                             st.session_state._dbg_bundle = (_fn, _bytes)
                             st.session_state._dbg_summary = _sm
                             _cul = (f"; leave-one-out culprits: {_sm.get('leave_one_out_culprits')}"

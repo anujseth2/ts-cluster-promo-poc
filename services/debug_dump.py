@@ -92,7 +92,7 @@ def _split(files):
 
 
 def capture(items, client, out_root, timestamp, target_host="", target_connection="",
-            deep=False):
+            deep=False, source_items=None):
     """Write a full validation-debug bundle for `items` (the promotion set) and zip it.
 
     items           : the transformed promotion bundle (session_state.transformed_items or the
@@ -121,6 +121,19 @@ def capture(items, client, out_root, timestamp, target_host="", target_connectio
 
     summary = {"files": len(files), "tables": len(tables), "models": len(models),
                "leaves": len(leaves), "deep": bool(deep)}
+
+    # ── raw SOURCE export (pre-transform, pre-drop) — the original model+tables, so the true
+    # joins/columns can be reconstructed and the cascade reproduced offline ──
+    if source_items:
+        try:
+            src_files = items_to_files(source_items)
+            os.makedirs(os.path.join(run_dir, "source"), exist_ok=True)
+            for path, content in src_files.items():
+                with open(os.path.join(run_dir, "source", path.replace("/", "__")), "w") as fh:
+                    fh.write(content)
+            summary["source_files"] = len(src_files)
+        except Exception as e:
+            summary["source_capture_error"] = str(e)[:200]
 
     # Default (fast): package the as-you-go logs + current TML only — NO live validation. The raw
     # error responses and per-pass drop history are already captured on disk while the tool ran, so
