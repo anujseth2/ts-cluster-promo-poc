@@ -146,6 +146,15 @@ def classify_import_errors(results):
                              "vizzes": [v.strip() for v in viz_ids],
                              "formulas": [f.strip() for f in _FORMULA.findall(msg)],
                              "error": msg.strip()})
+        if re.search(r"invalid formula IDs", msg, re.I):
+            matched = True
+            # The <b>…</b> entries are the formula display names whose `formula_<name>` column_id
+            # no longer resolves (orphaned/broken). Dropping those columns (by formula name)
+            # resolves it — that's the reviewer action offered in the UI.
+            fnames = [b.strip() for b in _BOLD.findall(msg)
+                      if b.strip() and not b.strip().endswith(":")]
+            findings.append({"kind": "invalid_formula_ids",
+                             "object": r.get("name"), "formulas": fnames, "error": msg.strip()})
         if not matched:
             findings.append({"kind": "other", "object": r.get("name"), "error": msg.strip()})
     return findings
@@ -161,6 +170,8 @@ def finding_key(f):
         return (k, obj, tuple(sorted((c or "").lower() for c in f.get("columns", []))))
     if k == "viz_error":
         return (k, obj, tuple(sorted(str(v) for v in f.get("vizzes", []))))
+    if k == "invalid_formula_ids":
+        return (k, obj, tuple(sorted((x or "").lower() for x in f.get("formulas", []))))
     return (k, obj, (f.get("error") or "")[:200])
 
 
@@ -472,9 +483,12 @@ def drop_columns(items, columns):
                 if node.get("formulas"):
                     keep = []
                     for fdef in node["formulas"]:
-                        if _refs_any(fdef, removed):
+                        nm = (fdef.get("name", "") or "").strip().lower()
+                        # Remove a formula if it references a removed column OR is itself a target
+                        # (so dropping an invalid/orphaned formula by name works and takes its
+                        # surfacing `formula_<name>` column with it).
+                        if _refs_any(fdef, removed) or nm in removed:
                             man["formulas"].append(fdef.get("name", "?"))
-                            nm = (fdef.get("name", "") or "").strip().lower()
                             if nm and nm not in removed:
                                 removed.add(nm); changed = True
                         else:

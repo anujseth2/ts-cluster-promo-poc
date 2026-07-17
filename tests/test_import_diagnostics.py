@@ -49,6 +49,28 @@ def test_classify_drop_blocked_by_dependents():
     assert "Revenue" in f[0]["columns"] and "Revenue by Brand" in f[0]["dependents"]
 
 
+def test_classify_invalid_formula_ids():
+    err = ("Model/Worksheet columns use invalid formula IDs.<br/>- <b>Bio Pen (COPD)</b>"
+           "<ul><li>* formula_Bio Pen (COPD)</li></ul>- <b>Nucala Target Count (HCP)</b>"
+           "<ul><li>* formula_Nucala Target Count (HCP)</li></ul><b>SOLUTION:</b> fix them.")
+    f = classify_import_errors([{"name": "M", "status": "ERROR", "error": err}])
+    assert len(f) == 1 and f[0]["kind"] == "invalid_formula_ids"
+    assert set(f[0]["formulas"]) == {"Bio Pen (COPD)", "Nucala Target Count (HCP)"}
+
+
+def test_drop_columns_by_formula_name_removes_formula_and_column():
+    doc = {"model": {"name": "M",
+                     "columns": [{"name": "Bio Pen (COPD)", "column_id": "formula_Bio Pen (COPD)"},
+                                 {"name": "Region", "column_id": "t::Region"}],
+                     "formulas": [{"name": "Bio Pen (COPD)", "expr": "sum([x])"}]}}
+    item = {"edoc": json.dumps(doc), "info": {"name": "M"}}
+    fixed, man = drop_columns([item], {"Bio Pen (COPD)"})   # drop by formula name
+    out = json.loads(fixed[0]["edoc"])["model"]
+    assert {c["name"] for c in out["columns"]} == {"Region"}   # surfacing column gone
+    assert out["formulas"] == []                                # formula gone
+    assert "Bio Pen (COPD)" in man["formulas"]
+
+
 def test_classify_unrecognised_is_other():
     f = classify_import_errors([{"name": "x", "status": "ERROR", "error": "kaboom"}])
     assert f[0]["kind"] == "other" and f[0]["error"] == "kaboom"

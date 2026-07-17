@@ -1520,7 +1520,9 @@ elif step == 2:
                         drop_set.update(f.get("columns", []))
                     elif f["kind"] == "viz_error":
                         viz_set.update(f.get("vizzes", []))
-                    elif f["kind"] == "other":     # e.g. invalid formula IDs -> drop those columns
+                    elif f["kind"] == "invalid_formula_ids":
+                        drop_set.update(f.get("formulas", []))   # drop by formula name
+                    elif f["kind"] == "other":
                         for fm in _re.findall(r"<b>(.*?)</b>", f.get("error", "") or ""):
                             fm = fm.strip()
                             if fm and not fm.endswith(":"):
@@ -1734,6 +1736,7 @@ elif step == 2:
             wh_missing   = [f for f in findings if f["kind"] == "missing_in_target_warehouse"]
             dep_blocked  = [f for f in findings if f["kind"] == "drop_blocked_by_dependents"]
             type_mismatch = [f for f in findings if f["kind"] == "type_mismatch"]
+            invalid_formula = [f for f in findings if f["kind"] == "invalid_formula_ids"]
             other        = [f for f in findings if f["kind"] == "other"]
 
             # VALIDATE_ONLY reports only the FIRST missing column per table, so the reviewer
@@ -1986,6 +1989,37 @@ elif step == 2:
                     if _res:
                         st.rerun()
 
+            # ── invalid formula IDs: model columns pointing at formulas that don't resolve ──
+            fml_drop = set()
+            if invalid_formula:
+                st.markdown("#### Invalid formula references")
+                _all_fml = sorted({fm for f in invalid_formula for fm in f.get("formulas", [])})
+                st.caption("These model/worksheet columns reference formulas that no longer resolve "
+                           "(orphaned or broken in the source). Import can't proceed while they're "
+                           "present. Tick to **drop** the column + its formula from the promotion.")
+                for _fm in _all_fml:
+                    if st.checkbox(f"Drop invalid-formula column  `{_fm}`",
+                                   value=True, key=f"dropfml_{_fm}"):
+                        fml_drop.add(_fm)
+                if not _discovered and st.button("Drop these & re-validate", key="fml_apply"):
+                    if fml_drop:
+                        fixed, _man = drop_columns(st.session_state.transformed_items, fml_drop)
+                        st.session_state.transformed_items = fixed
+                        _record_drop(_man)
+                        st.session_state.setdefault("dropped_col_names", set()).update(fml_drop)
+                    filtered_fixed = [i for i in st.session_state.transformed_items
+                                      if i.get("info", {}).get("name") not in skip_objects]
+                    with st.spinner("Re-committing and re-validating…"):
+                        _res = _safe_validate(filtered_fixed)
+                        if _res:
+                            pr_url, err, ok = _res
+                            st.session_state.pr_url            = pr_url
+                            st.session_state.validation_errors = err
+                            st.session_state.validation_ok     = ok
+                            st.session_state.pop("silent_drops", None)
+                    if _res:
+                        st.rerun()
+
             # ── anything unrecognised ──
             if other:
                 st.markdown("#### Other validation errors")
@@ -2006,7 +2040,7 @@ elif step == 2:
 
             # ── single "Apply all" — only after discovery produced the complete set ──
             if _discovered:
-                _all_drop = set()
+                _all_drop = set(fml_drop)   # ticked invalid-formula columns (dropped by name)
                 for f in wh_missing + type_mismatch:
                     _pre = "dropwh_" if f["kind"] == "missing_in_target_warehouse" else "droptm_"
                     if st.session_state.get(f"{_pre}{f['object']}_{f['column']}"):
