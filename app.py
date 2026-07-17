@@ -1657,18 +1657,26 @@ elif step == 2:
                             f"{mark}Drop  `{f['column']}`   ·   table `{tbl}`   ·   {f['connection']}",
                             value=False, key=f"dropwh_{f['object']}_{f['column']}"):
                         drop_set.add(f["column"])
-                    # Blast radius: what in the promotion (models, answers, liveboards) uses this
-                    # column and would be pruned along with it. Source-side (the TML being promoted).
+                    # Blast radius. Distinguish a real cascade (a join / formula / viz that would
+                    # BREAK) from the trivial case where a model just exposes the column 1:1 (where
+                    # is only "column") — the latter is expected propagation, not extra loss, so it
+                    # reads as a calm one-liner instead of an alarming expander.
                     usage = column_usage(_promo_items, f["column"])
-                    if usage:
+                    breaking   = [u for u in usage if any(w != "column" for w in u["where"])]
+                    model_maps = [u for u in usage if u not in breaking]
+                    if breaking:
                         kinds = {}
-                        for u in usage:
+                        for u in breaking:
                             kinds[u["kind"]] = kinds.get(u["kind"], 0) + 1
                         summ = ", ".join(f"{n} {k}{'' if n == 1 else 's'}" for k, n in kinds.items())
-                        with st.expander(f"↳ dropping `{f['column']}` removes {len(usage)} dependent(s) "
+                        with st.expander(f"↳ dropping `{f['column']}` breaks {len(breaking)} dependent(s) "
                                          f"on the source — {summ}"):
-                            for u in usage:
+                            for u in breaking:
                                 st.markdown(f"- **{u['kind']}** · {u['name']} — {', '.join(u['where'])}")
+                    elif model_maps:
+                        _nm = ", ".join(u["name"] for u in model_maps)
+                        st.caption(f"↳ dropping `{f['column']}` removes the column (and its mapping in "
+                                   f"{len(model_maps)} model(s): {_nm}); no join/formula/viz depends on it.")
                     else:
                         st.caption(f"↳ `{f['column']}` has no dependents in the promotion — dropping "
                                    "it removes only the column.")
