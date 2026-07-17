@@ -1565,13 +1565,22 @@ elif step == 2:
                     clean = True; reason = "clean"
                     break
                 found = classify_import_errors(errs)
-                # Opaque batch error (e.g. bare "Schema validation failed", unnamed): the batch
-                # hid the real per-object errors. Itemize by validating each file on its own and
-                # classify THOSE, so missing columns / type drift surface as column-level findings
-                # up front — not an unactionable blob that forces a whole-table skip later.
-                if found and all(f["kind"] == "other" for f in found):
-                    _tick(f"Pass {passes} · opaque error — isolating which of {len(work)} file(s) "
-                          f"fails, one at a time…", 0.60)
+                opaque = bool(found) and all(f["kind"] == "other" for f in found)
+                # STATIC detectors first — no server calls. These explain most "opaque" failures:
+                # dangling [formula_<name>] refs, and tables emptied/disconnected by earlier drops.
+                # ThoughtSpot reports all three only as an unnamed "Schema validation failed".
+                _static = dangling_reference_findings(work) + table_cleanup_findings(work)
+                if opaque and _static:
+                    # Static detection explains the opaque error — use it and SKIP the slow per-file
+                    # isolation (which fires one warehouse validate per table).
+                    _tick(f"Pass {passes} · opaque error explained statically "
+                          f"({len(_static)} issue(s)) — skipping per-file isolation", 0.60)
+                    found = _static
+                elif opaque:
+                    # Nothing static explains it — fall back to per-file isolation (slow: one
+                    # validate per file) to name the culprit.
+                    _tick(f"Pass {passes} · opaque error, nothing static — isolating each of "
+                          f"{len(work)} file(s), one at a time…", 0.60)
                     _itemized = []
                     for _r in _isolate_failures(work, progress=lambda _m: _tick(f"Pass {passes} · {_m}", 0.65)):
                         for _f in classify_import_errors(
@@ -1580,19 +1589,16 @@ elif step == 2:
                             _itemized.append(_f)
                     if _itemized:
                         found = _itemized
-                # Static, high-precision catch for dangling [formula_<name>] references — the class
-                # the platform reports ONLY as an opaque, unnamed "Schema validation failed". Merge
-                # them in so they surface AND get neutralized even when the API named nothing.
-                _dang = dangling_reference_findings(work)
-                if _dang:
+                else:
+                    # Named errors present — merge static findings alongside them (additively).
                     _fk = {finding_key(x) for x in found}
-                    found = found + [d for d in _dang if finding_key(d) not in _fk]
+                    found = found + [d for d in _static if finding_key(d) not in _fk]
                 for f in found:
                     seen.setdefault(finding_key(f), f)
                 _tick(f"Pass {passes} · {len(errs)} error(s) → {len(found)} finding(s) this pass, "
                       f"{len(seen)} unique so far; resolving on a copy…", 0.80)
                 # Neutralize this pass's issues on the copy so the NEXT ones surface.
-                drop_set, viz_set = set(), set()
+                drop_set, viz_set, tbl_set = set(), set(), set()
                 for f in found:
                     if f["kind"] in ("missing_in_target_warehouse", "type_mismatch"):
                         drop_set.add(f["column"])
@@ -1604,6 +1610,8 @@ elif step == 2:
                         drop_set.update(f.get("formulas", []))   # drop by formula name
                     elif f["kind"] == "dangling_ref":
                         drop_set.add(f["name"])   # drop the referrer (formula/column) by name
+                    elif f["kind"] == "drop_table":
+                        tbl_set.add(f["table"])   # empty / disconnected table -> prune whole
                     elif f["kind"] == "other":
                         for fm in _re.findall(r"<b>(.*?)</b>", f.get("error", "") or ""):
                             fm = fm.strip()
@@ -1619,13 +1627,14 @@ elif step == 2:
                     removed += _dv
                 # Tables emptied (0 columns left) or orphaned (join key dropped -> unreachable) by
                 # those column drops must be pruned WHOLE — else they fail import as "0 columns" /
-                # "No matches found for table". Detect statically and drop them on the copy so the
-                # probe converges instead of dead-ending on the opaque error.
+                # "No matches found for table". Combine any drop_table findings above with a fresh
+                # post-drop scan, so the probe converges instead of dead-ending on the opaque error.
                 _tf = table_cleanup_findings(work)
-                if _tf:
-                    for f in _tf:
-                        seen.setdefault(finding_key(f), f)
-                    work, _ts = _prune_tables_whole(work, {f["table"] for f in _tf})
+                for f in _tf:
+                    seen.setdefault(finding_key(f), f)
+                    tbl_set.add(f["table"])
+                if tbl_set:
+                    work, _ts = _prune_tables_whole(work, tbl_set)
                     removed += (_ts["tables"] + _ts["columns"] + _ts["joins"]
                                 + _ts["formulas"] + _ts["vizzes"])
                 _log_discovery_pass(passes, errs, found, drop_set, viz_set, _m, removed)
