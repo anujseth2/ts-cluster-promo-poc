@@ -71,6 +71,35 @@ def test_drop_columns_by_formula_name_removes_formula_and_column():
     assert "Bio Pen (COPD)" in man["formulas"]
 
 
+def test_drop_cascades_formula_that_references_a_dropped_formula():
+    # A formula that references ANOTHER formula does so by its `formula_<name>` id form:
+    #   "Nucala Target Reach (HCP)"  ->  [formula_Nucala Target Count (HCP)]
+    # Dropping the referenced formula must also drop the referencing one (and its surfacing
+    # column), else it dangles as a "Schema validation failed" on import. Regression for the
+    # GSK Respbio model: _refs_any matched bare names but not the `formula_` prefix. (grounded)
+    doc = {"model": {"name": "M",
+        "columns": [
+            {"name": "Nucala Target Count (HCP)", "column_id": "formula_Nucala Target Count (HCP)"},
+            {"name": "Nucala Target Reach (HCP)", "column_id": "formula_Nucala Target Reach (HCP)"},
+            {"name": "Region", "column_id": "t::Region"},
+        ],
+        "formulas": [
+            {"id": "formula_Nucala Target Count (HCP)", "name": "Nucala Target Count (HCP)",
+             "expr": "count([t::HCP])"},
+            {"id": "formula_Nucala Target Reach (HCP)", "name": "Nucala Target Reach (HCP)",
+             "expr": "[formula_Nucala Target Count Called on (HCP)] / [formula_Nucala Target Count (HCP)]"},
+        ]}}
+    item = {"edoc": json.dumps(doc), "info": {"name": "M"}}
+    fixed, man = drop_columns([item], {"Nucala Target Count (HCP)"})   # drop the referenced formula
+    out = json.loads(fixed[0]["edoc"])["model"]
+    fnames = {f["name"] for f in out["formulas"]}
+    cnames = {c["name"] for c in out["columns"]}
+    assert "Nucala Target Count (HCP)" not in fnames         # the dropped formula
+    assert "Nucala Target Reach (HCP)" not in fnames         # references it via formula_ id -> cascaded
+    assert "Nucala Target Reach (HCP)" not in cnames         # its surfacing column too
+    assert "Region" in cnames                                 # unrelated column kept
+
+
 def test_classify_unrecognised_is_other():
     f = classify_import_errors([{"name": "x", "status": "ERROR", "error": "kaboom"}])
     assert f[0]["kind"] == "other" and f[0]["error"] == "kaboom"

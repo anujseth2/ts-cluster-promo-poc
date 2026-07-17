@@ -304,12 +304,19 @@ def _iter_strings(obj):
 
 
 def _expr_refs(obj, targets, display_targets):
-    """True if any `[table::Col]` / `[Display Name]` reference inside obj hits a target."""
+    """True if any `[table::Col]` / `[Display Name]` / `[formula_<Name>]` reference inside obj hits
+    a target. Formula-to-formula refs carry a `formula_` id prefix, so also match after stripping
+    it (see _refs_any)."""
     for expr in _iter_strings(obj):
         for inner in _BRACKET_REF.findall(expr):
             tail = inner.split("::")[-1].strip().lower()
-            if tail in targets or inner.strip().lower() in display_targets:
+            whole = inner.strip().lower()
+            if tail in targets or whole in display_targets:
                 return True
+            for cand in (tail, whole):
+                if cand.startswith("formula_") and (cand[len("formula_"):] in targets
+                                                     or cand[len("formula_"):] in display_targets):
+                    return True
     return False
 
 
@@ -437,12 +444,20 @@ def column_dependents(items, columns):
 
 
 def _refs_any(obj, removed):
-    """True if any [table::Col] / [Display] / [Formula Name] reference inside obj hits a
-    name in `removed` (all lowercased)."""
+    """True if any [table::Col] / [Display] / [Formula Name] / [formula_<Name>] reference inside
+    obj hits a name in `removed` (all lowercased).
+
+    Formula-to-formula references carry the `formula_` id prefix — `[formula_Call Count]` — while
+    `removed` holds the bare formula NAME (`call count`). So a ref must also match after stripping a
+    leading `formula_`; otherwise a formula that references a dropped formula survives and dangles
+    as a "Schema validation failed" / invalid-formula error on import."""
     for expr in _iter_strings(obj):
         for inner in _BRACKET_REF.findall(expr):
-            if inner.split("::")[-1].strip().lower() in removed or inner.strip().lower() in removed:
-                return True
+            for cand in (inner.split("::")[-1].strip().lower(), inner.strip().lower()):
+                if cand in removed:
+                    return True
+                if cand.startswith("formula_") and cand[len("formula_"):] in removed:
+                    return True
     return False
 
 
