@@ -1589,6 +1589,29 @@ elif step == 2:
                         failures.append({"name": nm, "type": "model", "error": f"request failed: {str(e)[:200]}"})
             return failures
 
+        def _run_discover(items, status_ctx):
+            """Run the discovery probe and store results; shared by the primary and re-discover
+            buttons. A failed request that finds nothing keeps a good prior discovery."""
+            _found, _clean, _passes, _reason = _discover_all_issues(items, progress=st.write)
+            if _reason == "request_failed" and not _found and st.session_state.get("discovered_findings"):
+                status_ctx.update(label="Couldn't reach the target — kept the previous discovery.",
+                                  state="error", expanded=False)
+                return
+            st.session_state.discovered_findings = _found
+            st.session_state.discovered_meta = {"clean": _clean, "passes": _passes, "reason": _reason}
+            if _found:
+                if not st.session_state.get("validation_errors"):
+                    st.session_state.validation_errors = [{"name": "(probe)", "status": "ERROR", "error": ""}]
+            else:
+                st.session_state.validation_errors = []   # clean -> Stage-2 hidden, "passed" shows
+                st.session_state.validation_ok = ["(discovered clean)"]
+            _tail = {"clean": " — validated clean.",
+                     "no_progress": " — stopped; remaining errors can't be auto-resolved.",
+                     "request_failed": " — stopped: the target connection failed."}[_reason]
+            status_ctx.update(label=f"Found {len(_found)} issue(s) over {_passes} pass(es)" + _tail,
+                              state=("complete" if _reason != "request_failed" else "error"),
+                              expanded=False)
+
         def _safe_validate(items, step=None):
             """_run_validation, but a hard connection failure (e.g. 10054 after the client's
             auto-retries) becomes a friendly message + a logged run — not a raw traceback.
@@ -1698,69 +1721,35 @@ elif step == 2:
             obj = f.get("object")
             return obj if obj and obj != "unknown" else (db_table or obj)
 
-        # ── Stage 1: Export & validate ─────────────────────────────────────
-        if "pr_url" not in st.session_state:
-            if st.button("Export & Validate", type="primary", disabled=not filtered_items):
-                with st.status("Committing & validating…", expanded=True) as _val_status:
-                    _res = _safe_validate(filtered_items, step=st.write)
-                    if _res:
-                        pr_url, err, ok = _res
-                        st.session_state.pr_url            = pr_url
-                        st.session_state.validation_errors = err
-                        st.session_state.validation_ok     = ok
-                        st.session_state.pop("silent_drops", None)
-                        _val_status.update(
-                            label=(f"Validation found {len(err)} issue(s)." if err
-                                   else "Validation passed."),
-                            state=("error" if err else "complete"), expanded=False)
-                    else:
-                        _val_status.update(label="Validation couldn't reach the target.",
-                                           state="error", expanded=False)
-                if _res:
-                    st.rerun()
-        else:
+        # ── Stage 1: Export → commit/PR → discover ALL issues in one action ─────
+        # No separate single-validate step: the primary button commits the TML + opens the PR,
+        # then loops VALIDATE_ONLY (on a throwaway copy) until clean, surfacing every issue at
+        # once. It never touches the connection/search COLUMN path that 504s.
+        _dm = st.session_state.get("discovered_meta")
+        _lbl = "🔎 Re-discover all issues" if _dm else "🔎 Export & discover all issues"
+        if st.button(_lbl, type="primary", disabled=not filtered_items,
+                     help="Commits the TML + opens the PR, then validates a throwaway copy "
+                          "repeatedly until clean — surfacing every issue at once."):
+            with st.status("Committing & discovering all issues…", expanded=True) as _disc:
+                try:
+                    st.write("Committing TML + opening the PR…")
+                    _gc = git_client()
+                    _sha = _gc.commit_tml(team_name, items_to_files(filtered_items))
+                    st.session_state.pr_url = _gc.create_pr(team_name, _sha)
+                except Exception as _e:
+                    _disc.update(label=f"Couldn't open the PR: {str(_e)[:150]}",
+                                 state="error", expanded=False)
+                    st.stop()
+                _run_discover(filtered_items, _disc)
+            st.rerun()
+        if "pr_url" in st.session_state:
             st.markdown(f"**PR:** [{st.session_state.pr_url}]({st.session_state.pr_url})")
-
-        # Discover ALL issues up front: loop VALIDATE_ONLY (on a throwaway copy) until it validates
-        # clean, so every missing column / type drift surfaces at once and you resolve them in ONE
-        # decision — instead of one column-per-table per manual re-validate. Slower, but it never
-        # touches the connection/search COLUMN path that 504s; it reuses import VALIDATE_ONLY.
-        if "pr_url" in st.session_state and filtered_items:
-            _dm = st.session_state.get("discovered_meta")
-            _lbl = "🔎 Discover all issues (validate repeatedly until clean)"
-            if _dm:
-                _lbl = ("🔎 Re-discover all issues" if _dm.get("clean")
-                        else "🔎 Re-discover (last run stopped before clean)")
-            if st.button(_lbl, help="Validates a throwaway copy repeatedly, neutralizing each pass's "
-                         "issues until it validates clean. The real bundle is untouched."):
-                with st.status("Discovering all issues…", expanded=True) as _disc:
-                    _found, _clean, _passes, _reason = _discover_all_issues(
-                        filtered_items, progress=st.write)
-                    # A failed request must NOT wipe a good prior discovery — keep the previous
-                    # findings if this attempt died on the connection and found nothing.
-                    if _reason == "request_failed" and not _found and st.session_state.get("discovered_findings"):
-                        _disc.update(label="Couldn't reach the target — kept the previous discovery.",
-                                     state="error", expanded=False)
-                    else:
-                        st.session_state.discovered_findings = _found
-                        st.session_state.discovered_meta = {"clean": _clean, "passes": _passes,
-                                                            "reason": _reason}
-                        if _found and not st.session_state.get("validation_errors"):
-                            st.session_state.validation_errors = [
-                                {"name": "(probe)", "status": "ERROR", "error": ""}]
-                        _tail = {"clean": " — copy then validated clean.",
-                                 "no_progress": " — stopped; remaining errors can't be auto-resolved.",
-                                 "request_failed": " — stopped: the target connection failed."}[_reason]
-                        _disc.update(label=f"Found {len(_found)} issue(s) over {_passes} pass(es)" + _tail,
-                                     state=("complete" if _reason != "request_failed" else "error"),
-                                     expanded=False)
-                st.rerun()
-            if _dm:
-                _rtail = {"clean": " · copy validated clean",
-                          "no_progress": " · stopped before clean (remaining errors can't be auto-resolved)",
-                          "request_failed": " · stopped: connection to the target failed — warm the warehouse and retry"}
-                st.caption(f"Discovery: {len(st.session_state.get('discovered_findings', []))} issue(s) "
-                           f"over {_dm['passes']} pass(es)" + _rtail.get(_dm.get("reason", ""), ""))
+        if _dm:
+            _rtail = {"clean": " · validated clean",
+                      "no_progress": " · stopped before clean (remaining errors can't be auto-resolved)",
+                      "request_failed": " · stopped: connection to the target failed — warm the warehouse and retry"}
+            st.caption(f"Discovery: {len(st.session_state.get('discovered_findings', []))} issue(s) "
+                       f"over {_dm['passes']} pass(es)" + _rtail.get(_dm.get("reason", ""), ""))
 
         # Raw validation run log — so consecutive runs are diffable (which files were validated,
         # each file's status/error). Full history appended to logs/validate_runs.jsonl.
@@ -1876,6 +1865,13 @@ elif step == 2:
                                "read; they are inferred from the target's modeled columns and may "
                                "include a column that actually exists in the warehouse. Verify before "
                                "dropping.")
+                # Select-all: tick/untick every missing-column drop at once.
+                def _toggle_all_wh():
+                    _v = st.session_state.get("selall_wh", False)
+                    for _f in wh_missing:
+                        st.session_state[f"dropwh_{_f['object']}_{_f['column']}"] = _v
+                st.checkbox(f"**Select all** {len(wh_missing)} column(s) to drop",
+                            key="selall_wh", on_change=_toggle_all_wh)
                 drop_set = set()
                 _promo_items = st.session_state.get("transformed_items", [])
                 for f in wh_missing:
