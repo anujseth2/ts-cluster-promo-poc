@@ -1509,11 +1509,25 @@ elif step == 2:
                 if not errs:
                     clean = True; reason = "clean"
                     break
-                for f in classify_import_errors(errs):
+                found = classify_import_errors(errs)
+                # Opaque batch error (e.g. bare "Schema validation failed", unnamed): the batch
+                # hid the real per-object errors. Itemize by validating each file on its own and
+                # classify THOSE, so missing columns / type drift surface as column-level findings
+                # up front — not an unactionable blob that forces a whole-table skip later.
+                if found and all(f["kind"] == "other" for f in found):
+                    _itemized = []
+                    for _r in _isolate_failures(work):
+                        for _f in classify_import_errors(
+                                [{"name": _r["name"], "status": "ERROR", "error": _r["error"]}]):
+                            _f["object"] = _r["name"]
+                            _itemized.append(_f)
+                    if _itemized:
+                        found = _itemized
+                for f in found:
                     seen.setdefault(finding_key(f), f)
                 # Neutralize this pass's issues on the copy so the NEXT ones surface.
                 drop_set, viz_set = set(), set()
-                for f in classify_import_errors(errs):
+                for f in found:
                     if f["kind"] in ("missing_in_target_warehouse", "type_mismatch"):
                         drop_set.add(f["column"])
                     elif f["kind"] == "drop_blocked_by_dependents":
@@ -2085,21 +2099,41 @@ elif step == 2:
                                 st.markdown(f"- {line}")
 
                 # These errors are often unattributed (name "unknown"). Validate each file on its
-                # own to name the culprit, then let the reviewer skip that object.
+                # own to name the culprit AND itemize its real error — a missing column becomes a
+                # column drop (not a whole-table skip); only genuinely unclassifiable failures fall
+                # back to skip-object.
                 st.caption("ThoughtSpot didn't say which object failed. Isolate it:")
                 if st.button("🔬 Find which object fails (validate each file on its own)",
                              key="isolate_btn"):
                     with st.status("Isolating…", expanded=True) as _iso:
                         _fails = _isolate_failures(filtered_items, progress=st.write)
-                        st.session_state.isolation = _fails
-                        _iso.update(label=(f"{len(_fails)} object(s) fail on their own"
-                                           if _fails else "No single object failed in isolation "
-                                           "(the error may be cross-object)."),
+                        _routed, _opaque = [], []
+                        for _r in _fails:
+                            _cls = classify_import_errors(
+                                [{"name": _r["name"], "status": "ERROR", "error": _r["error"]}])
+                            _real = [f for f in _cls if f["kind"] != "other"]
+                            if _real:
+                                for f in _real:
+                                    f["object"] = _r["name"]
+                                _routed.extend(_real)
+                            else:
+                                _opaque.append(_r)
+                        # Route classified findings (missing cols / type drift / formulas) back into
+                        # the normal column-level resolution so the user drops COLUMNS, not tables.
+                        if _routed:
+                            _ex = st.session_state.get("discovered_findings", []) or []
+                            _seen = {finding_key(f) for f in _ex}
+                            _ex = _ex + [f for f in _routed if finding_key(f) not in _seen]
+                            st.session_state.discovered_findings = _ex
+                        st.session_state.isolation = _opaque   # only unclassifiable -> skip-object
+                        _iso.update(label=(f"Itemized {len(_routed)} column-level issue(s)"
+                                           + (f", {len(_opaque)} unclassifiable" if _opaque else "")
+                                           if (_routed or _opaque) else "No single object failed."),
                                     state="complete", expanded=False)
                     st.rerun()
                 _iso_res = st.session_state.get("isolation")
                 if _iso_res:
-                    st.markdown("**Objects that fail schema/validation on their own:**")
+                    st.markdown("**Objects that fail with an unclassifiable error (skip to proceed):**")
                     _skip_pick = set()
                     for r in _iso_res:
                         if st.checkbox(f"Skip **{r['type']} `{r['name']}`** from this promotion",
