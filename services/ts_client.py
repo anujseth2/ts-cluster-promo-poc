@@ -7,11 +7,19 @@ client, each with its own host + credentials.
 """
 
 import json
+import time
 import yaml
 from datetime import datetime
 
 import requests
 from typing import List, Dict, Optional
+
+# Transient network failures worth retrying — e.g. WinError 10054 (connection reset by a
+# gateway/proxy) or a read timeout while a slow warehouse-validate is in flight.
+_TRANSIENT = (requests.exceptions.ConnectionError,
+              requests.exceptions.Timeout,
+              requests.exceptions.ChunkedEncodingError)
+_RETRY_BACKOFF = (3, 8, 20)   # seconds between attempts
 
 from services.tml_transformer import extract_model_refs, extract_table_refs
 
@@ -634,6 +642,22 @@ class TSClient:
 
     # ── TML import ────────────────────────────────────────────────────────────
 
+    def _retry_post(self, url, payload, timeout, tries=3):
+        """POST with retry + backoff on transient connection resets/timeouts (e.g. WinError 10054
+        from a gateway/proxy dropping a slow warehouse-validate). Only use for IDEMPOTENT calls
+        (VALIDATE_ONLY, or obj_id-keyed update-in-place imports); a bare RST means the request
+        almost certainly never completed server-side, so a retry is safe. Re-raises the last
+        transient error if every attempt fails."""
+        last = None
+        for attempt in range(tries):
+            try:
+                return self._session.post(url, json=payload, timeout=timeout)
+            except _TRANSIENT as e:
+                last = e
+                if attempt < tries - 1:
+                    time.sleep(_RETRY_BACKOFF[min(attempt, len(_RETRY_BACKOFF) - 1)])
+        raise last
+
     def import_tml(self, tml_strings: List[str],
                    policy: str = "PARTIAL") -> List[Dict]:
         """
@@ -645,18 +669,14 @@ class TSClient:
             "metadata_tmls": tml_strings,
             "import_policy": policy,
         }
-        resp = self._session.post(
-            f"{self.host}/api/rest/2.0/metadata/tml/import",
-            json=payload,
-            timeout=120,
-        )
+        url = f"{self.host}/api/rest/2.0/metadata/tml/import"
+        # Retry transient resets: VALIDATE_ONLY is read-only, and real imports are obj_id-keyed
+        # update-in-place, so a retry after a bare connection reset is safe. Longer read window
+        # (180s) for slow server-side warehouse validation.
+        resp = self._retry_post(url, payload, timeout=180)
         if resp.status_code == 401 and self._username and self._password:
             self._session_login()
-            resp = self._session.post(
-                f"{self.host}/api/rest/2.0/metadata/tml/import",
-                json=payload,
-                timeout=120,
-            )
+            resp = self._retry_post(url, payload, timeout=180)
         data = resp.json()
 
         # Normalise — API may return list or {"object": [...]}

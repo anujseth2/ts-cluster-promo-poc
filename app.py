@@ -1467,6 +1467,23 @@ elif step == 2:
             err = [r for r in results if r["status"] != "OK"]
             return pr_url, err, ok
 
+        def _safe_validate(items, step=None):
+            """_run_validation, but a hard connection failure (e.g. 10054 after the client's
+            auto-retries) becomes a friendly message + a logged run — not a raw traceback.
+            Returns (pr_url, err, ok) on success, or None on failure (caller should stop)."""
+            try:
+                return _run_validation(items, step=step)
+            except Exception as _e:
+                _msg = str(_e)
+                st.session_state._last_validate = {
+                    "ts": "(request failed)", "files": [],
+                    "results": [{"name": "(validation request)", "status": "ERROR",
+                                 "error": _msg[:1500]}]}
+                _h, _a, _ = friendly_error(_msg)
+                st.error("Validation couldn't reach the target — " + (_h or "the connection failed."))
+                st.caption("→ " + (_a or "Try again; the client auto-retries transient resets."))
+                return None
+
         def _detect_silent_drops(items):
             """Target columns absent from the source -> dropped on import, SILENTLY when
             they have no dependents (the platform raises no error). Diff source tables
@@ -1563,16 +1580,22 @@ elif step == 2:
         if "pr_url" not in st.session_state:
             if st.button("Export & Validate", type="primary", disabled=not filtered_items):
                 with st.status("Committing & validating…", expanded=True) as _val_status:
-                    pr_url, err, ok = _run_validation(filtered_items, step=st.write)
-                    st.session_state.pr_url            = pr_url
-                    st.session_state.validation_errors = err
-                    st.session_state.validation_ok     = ok
-                    st.session_state.pop("silent_drops", None)
-                    _val_status.update(
-                        label=(f"Validation found {len(err)} issue(s)." if err
-                               else "Validation passed."),
-                        state=("error" if err else "complete"), expanded=False)
-                st.rerun()
+                    _res = _safe_validate(filtered_items, step=st.write)
+                    if _res:
+                        pr_url, err, ok = _res
+                        st.session_state.pr_url            = pr_url
+                        st.session_state.validation_errors = err
+                        st.session_state.validation_ok     = ok
+                        st.session_state.pop("silent_drops", None)
+                        _val_status.update(
+                            label=(f"Validation found {len(err)} issue(s)." if err
+                                   else "Validation passed."),
+                            state=("error" if err else "complete"), expanded=False)
+                    else:
+                        _val_status.update(label="Validation couldn't reach the target.",
+                                           state="error", expanded=False)
+                if _res:
+                    st.rerun()
         else:
             st.markdown(f"**PR:** [{st.session_state.pr_url}]({st.session_state.pr_url})")
 
@@ -1726,12 +1749,15 @@ elif step == 2:
                     filtered_fixed = [i for i in st.session_state.transformed_items
                                       if i.get("info", {}).get("name") not in skip_objects]
                     with st.spinner("Re-committing and re-validating…"):
-                        pr_url, err, ok = _run_validation(filtered_fixed)
-                        st.session_state.pr_url            = pr_url
-                        st.session_state.validation_errors = err
-                        st.session_state.validation_ok     = ok
-                        st.session_state.pop("silent_drops", None)
-                    st.rerun()
+                        _res = _safe_validate(filtered_fixed)
+                        if _res:
+                            pr_url, err, ok = _res
+                            st.session_state.pr_url            = pr_url
+                            st.session_state.validation_errors = err
+                            st.session_state.validation_ok     = ok
+                            st.session_state.pop("silent_drops", None)
+                    if _res:
+                        st.rerun()
 
             # ── target-extra with dependents: the drop is blocked on the target ──
             if dep_blocked:
@@ -1824,13 +1850,16 @@ elif step == 2:
                     filtered_fixed = [i for i in st.session_state.transformed_items
                                       if i.get("info", {}).get("name") not in skip_objects]
                     with st.spinner("Re-committing and re-validating…"):
-                        pr_url, err, ok = _run_validation(filtered_fixed)
-                        st.session_state.pr_url            = pr_url
-                        st.session_state.validation_errors = err
-                        st.session_state.validation_ok     = ok
-                        st.session_state.pop("silent_drops", None)
-                        st.session_state.pop("_tm_key", None)
-                    st.rerun()
+                        _res = _safe_validate(filtered_fixed)
+                        if _res:
+                            pr_url, err, ok = _res
+                            st.session_state.pr_url            = pr_url
+                            st.session_state.validation_errors = err
+                            st.session_state.validation_ok     = ok
+                            st.session_state.pop("silent_drops", None)
+                            st.session_state.pop("_tm_key", None)
+                    if _res:
+                        st.rerun()
 
             # ── anything unrecognised ──
             if other:
@@ -1976,7 +2005,10 @@ elif step == 2:
                         merged = gc.merge_pr()
                         if not merged:
                             # PR was already merged — re-commit and open a fresh PR
-                            pr_url, err, ok = _run_validation(filtered_items)
+                            _res = _safe_validate(filtered_items)
+                            if not _res:
+                                st.stop()
+                            pr_url, err, ok = _res
                             st.session_state.pr_url = pr_url
                             if err:
                                 st.session_state.validation_errors = err

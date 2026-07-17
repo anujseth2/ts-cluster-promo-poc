@@ -81,6 +81,11 @@ _ERROR_RULES = [
      lambda m: ("The request to the warehouse timed out.",
                 "A cold warehouse can exceed the gateway limit — warm it (run a quick query) and "
                 "re-run; if it persists it's the connection's column-introspection latency.")),
+    (re.compile(r"10054|connection (?:reset|aborted)|forcibly closed|Max retries", re.I),
+     lambda m: ("The connection to the target was reset before the request finished.",
+                "Usually a slow server-side warehouse validation dropped by a gateway/proxy. The "
+                "client already auto-retries transient resets; if it persists, warm the warehouse "
+                "(run a quick query) and try again.")),
 ]
 
 
