@@ -8,8 +8,42 @@ import json
 from services.import_diagnostics import (
     classify_import_errors, warehouse_missing_findings, friendly_error,
     drop_columns, drop_vizzes, drop_tables, column_usage, column_dependents,
-    column_drop_cascade,
+    column_drop_cascade, dangling_reference_findings,
 )
+
+
+def test_dangling_reference_findings_flags_formula_pointing_at_removed_formula():
+    # "Reach" references [formula_Target Count] which is NOT among the model's formulas — the exact
+    # class ThoughtSpot reports only as opaque "Schema validation failed". Detector must name it.
+    doc = {"model": {"name": "M",
+        "columns": [{"name": "Reach", "column_id": "formula_Reach"},
+                    {"name": "Region", "column_id": "t::Region"}],
+        "formulas": [{"id": "formula_Reach", "name": "Reach",
+                      "expr": "[formula_Called On] / [formula_Target Count]"},
+                     {"id": "formula_Called On", "name": "Called On", "expr": "count([t::HCP])"}]}}
+    item = {"edoc": json.dumps(doc), "info": {"name": "M"}}
+    found = dangling_reference_findings([item])
+    assert len(found) == 1
+    f = found[0]
+    assert f["kind"] == "dangling_ref" and f["name"] == "Reach"
+    assert "formula_Target Count" in f["missing"]
+
+
+def test_dangling_reference_findings_conservative_ignores_non_formula_refs():
+    # A bare [Display] ref (no formula_ prefix) resolves to a column/parameter we don't enumerate —
+    # must NOT be flagged, or we'd wrongly drop valid objects.
+    doc = {"model": {"name": "M", "columns": [],
+        "formulas": [{"id": "formula_A", "name": "A", "expr": "[Some Display Column] * 2"}]}}
+    item = {"edoc": json.dumps(doc), "info": {"name": "M"}}
+    assert dangling_reference_findings([item]) == []
+
+
+def test_dangling_reference_findings_clean_when_all_resolve():
+    doc = {"model": {"name": "M", "columns": [],
+        "formulas": [{"id": "formula_A", "name": "A", "expr": "sum([t::x])"},
+                     {"id": "formula_B", "name": "B", "expr": "[formula_A] + 1"}]}}
+    item = {"edoc": json.dumps(doc), "info": {"name": "M"}}
+    assert dangling_reference_findings([item]) == []
 
 # ── classify_import_errors ─────────────────────────────────────────────────────
 

@@ -26,7 +26,7 @@ from services.tml_transformer import (
 from services.import_diagnostics import (
     classify_import_errors, drop_columns, silent_drop_findings, column_dependents, column_usage,
     drop_vizzes, table_drop_preview, drop_tables, warehouse_missing_findings, friendly_error,
-    column_drop_cascade, finding_key,
+    column_drop_cascade, finding_key, dangling_reference_findings,
 )
 from services.table_matcher import column_signature
 from services.feedback_replace import feedback_preview, replace_prep, replace_finalize
@@ -1501,7 +1501,9 @@ elif step == 2:
                 if not strings:
                     clean = True; reason = "clean"
                     break
-                _tick(f"Pass {passes}: validating {len(strings)} file(s)…")
+                _tick(f"Pass {passes} · preparing {len(work)} object(s)…", 0.10)
+                _tick(f"Pass {passes} · validating {len(strings)} table/model file(s) against the "
+                      f"warehouse — the slow step; a cold warehouse can take a minute…", 0.45)
                 try:
                     results = target_client().import_tml(strings, policy="VALIDATE_ONLY")
                 except Exception as _e:
@@ -1519,16 +1521,27 @@ elif step == 2:
                 # classify THOSE, so missing columns / type drift surface as column-level findings
                 # up front — not an unactionable blob that forces a whole-table skip later.
                 if found and all(f["kind"] == "other" for f in found):
+                    _tick(f"Pass {passes} · opaque error — isolating which of {len(work)} file(s) "
+                          f"fails, one at a time…", 0.60)
                     _itemized = []
-                    for _r in _isolate_failures(work):
+                    for _r in _isolate_failures(work, progress=lambda _m: _tick(f"Pass {passes} · {_m}", 0.65)):
                         for _f in classify_import_errors(
                                 [{"name": _r["name"], "status": "ERROR", "error": _r["error"]}]):
                             _f["object"] = _r["name"]
                             _itemized.append(_f)
                     if _itemized:
                         found = _itemized
+                # Static, high-precision catch for dangling [formula_<name>] references — the class
+                # the platform reports ONLY as an opaque, unnamed "Schema validation failed". Merge
+                # them in so they surface AND get neutralized even when the API named nothing.
+                _dang = dangling_reference_findings(work)
+                if _dang:
+                    _fk = {finding_key(x) for x in found}
+                    found = found + [d for d in _dang if finding_key(d) not in _fk]
                 for f in found:
                     seen.setdefault(finding_key(f), f)
+                _tick(f"Pass {passes} · {len(errs)} error(s) → {len(found)} finding(s) this pass, "
+                      f"{len(seen)} unique so far; resolving on a copy…", 0.80)
                 # Neutralize this pass's issues on the copy so the NEXT ones surface.
                 drop_set, viz_set = set(), set()
                 for f in found:
@@ -1540,6 +1553,8 @@ elif step == 2:
                         viz_set.update(f.get("vizzes", []))
                     elif f["kind"] == "invalid_formula_ids":
                         drop_set.update(f.get("formulas", []))   # drop by formula name
+                    elif f["kind"] == "dangling_ref":
+                        drop_set.add(f["name"])   # drop the referrer (formula/column) by name
                     elif f["kind"] == "other":
                         for fm in _re.findall(r"<b>(.*?)</b>", f.get("error", "") or ""):
                             fm = fm.strip()
@@ -1552,6 +1567,8 @@ elif step == 2:
                 if viz_set:
                     work, _dv = drop_vizzes(work, viz_set)
                     removed += _dv
+                _tick(f"Pass {passes} · dropped {removed} dependent item(s) on the copy; "
+                      f"re-validating…", 0.95)
                 if removed == 0:
                     reason = "no_progress"
                     break   # nothing could be neutralized -> no progress, stop
@@ -1610,7 +1627,22 @@ elif step == 2:
         def _run_discover(items, status_ctx):
             """Run the discovery probe and store results; shared by the primary and re-discover
             buttons. A failed request that finds nothing keeps a good prior discovery."""
-            _found, _clean, _passes, _reason = _discover_all_issues(items, progress=st.write)
+            # Progress: a bar that shows the sub-phase WITHIN each pass (prepare → validate →
+            # isolate → resolve), plus the running log line. The validate itself is one blocking
+            # warehouse call, so the bar parks mid-pass while that runs — the label says so.
+            _bar = st.progress(0.0, text="Starting discovery…")
+            def _prog(msg, frac=None):
+                st.write(msg)
+                if frac is not None:
+                    try:
+                        _bar.progress(min(max(float(frac), 0.0), 1.0), text=msg)
+                    except Exception:
+                        pass
+            _found, _clean, _passes, _reason = _discover_all_issues(items, progress=_prog)
+            try:
+                _bar.empty()
+            except Exception:
+                pass
             if _reason == "request_failed" and not _found and st.session_state.get("discovered_findings"):
                 status_ctx.update(label="Couldn't reach the target — kept the previous discovery.",
                                   state="error", expanded=False)
@@ -1794,6 +1826,7 @@ elif step == 2:
             dep_blocked  = [f for f in findings if f["kind"] == "drop_blocked_by_dependents"]
             type_mismatch = [f for f in findings if f["kind"] == "type_mismatch"]
             invalid_formula = [f for f in findings if f["kind"] == "invalid_formula_ids"]
+            dangling     = [f for f in findings if f["kind"] == "dangling_ref"]
             other        = [f for f in findings if f["kind"] == "other"]
 
             # VALIDATE_ONLY reports only the FIRST missing column per table, so the reviewer
@@ -2084,6 +2117,25 @@ elif step == 2:
                     if _res:
                         st.rerun()
 
+            # ── dangling references: a formula/column points at a formula that was removed ──
+            # This is the class ThoughtSpot reports ONLY as an opaque "Schema validation failed"
+            # (it never names the object), so the tool detects it statically. Dropping the referrer
+            # + its dependents is what clears the dead-end.
+            dang_drop = set()
+            if dangling:
+                st.markdown("#### Broken references (point to something already removed)")
+                st.caption("Detected by the tool — ThoughtSpot reports these only as an unnamed "
+                           "“Schema validation failed”. Each references a formula that no longer "
+                           "exists in the model (usually dropped as invalid earlier). Import can't "
+                           "proceed while they're present.")
+                for f in dangling:
+                    _nm = f.get("name", "?")
+                    _miss = ", ".join(f.get("missing", []))
+                    _kindlbl = "formula" if f.get("ref_type") == "formula" else "column"
+                    if st.checkbox(f"Drop {_kindlbl}  `{_nm}`  — references `{_miss}` (gone)",
+                                   value=True, key=f"dropdang_{f.get('object','')}_{_nm}"):
+                        dang_drop.add(_nm)
+
             # ── anything unrecognised ──
             if other:
                 st.markdown("#### Other validation errors")
@@ -2207,7 +2259,7 @@ elif step == 2:
 
             # ── single "Apply all" — only after discovery produced the complete set ──
             if _discovered:
-                _all_drop = set(fml_drop)   # ticked invalid-formula columns (dropped by name)
+                _all_drop = set(fml_drop) | set(dang_drop)   # invalid-formula cols + dangling refs (by name)
                 for f in wh_missing + type_mismatch:
                     _pre = "dropwh_" if f["kind"] == "missing_in_target_warehouse" else "droptm_"
                     if st.session_state.get(f"{_pre}{f['object']}_{f['column']}"):

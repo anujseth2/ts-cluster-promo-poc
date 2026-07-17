@@ -176,7 +176,75 @@ def finding_key(f):
         return (k, obj, tuple(sorted(str(v) for v in f.get("vizzes", []))))
     if k == "invalid_formula_ids":
         return (k, obj, tuple(sorted((x or "").lower() for x in f.get("formulas", []))))
+    if k == "dangling_ref":
+        return (k, obj, (f.get("name") or "").strip().lower())
     return (k, obj, (f.get("error") or "")[:200])
+
+
+def dangling_reference_findings(items):
+    """Static, HIGH-PRECISION scan for `[formula_<Name>]` references that resolve to no formula in
+    the same model.
+
+    This is the class of break ThoughtSpot reports ONLY as an opaque, unnamed "Schema validation
+    failed" — e.g. a formula that references another formula which was dropped (as invalid), so the
+    referrer now dangles. The platform never names it, so we detect it ourselves and drop the
+    referrer (cascading its dependents).
+
+    Deliberately CONSERVATIVE: only the unambiguous `formula_` id form is checked. Bare `[Display]`
+    and `[table::col]` references are NOT flagged — they can resolve to parameters, model columns,
+    or physical columns we don't fully enumerate here, and a false positive would wrongly drop a
+    valid object. Returns findings of kind 'dangling_ref' naming the referrer to drop.
+    """
+    out = []
+    for item in items:
+        try:
+            doc = _parse_edoc(item)
+        except Exception:
+            continue
+        for key in ("model", "worksheet"):
+            node = doc.get(key)
+            if not node:
+                continue
+            mname = node.get("name") or ""
+            forms = node.get("formulas") or []
+            # Every way a formula can be addressed: its explicit id, and the `formula_<name>` form.
+            known = set()
+            for f in forms:
+                fid = (f.get("id") or "").strip().lower()
+                nm = (f.get("name") or "").strip().lower()
+                if fid:
+                    known.add(fid)
+                if nm:
+                    known.add("formula_" + nm)
+            def _missing(expr):
+                miss = []
+                for inner in _BRACKET_REF.findall(expr or ""):
+                    w = inner.strip().lower()
+                    if w.startswith("formula_") and w not in known:
+                        miss.append(inner.strip())
+                return sorted(set(miss))
+            # (a) a formula whose expression references a formula that no longer exists
+            for f in forms:
+                miss = _missing(f.get("expr", ""))
+                if miss:
+                    out.append({"kind": "dangling_ref", "object": mname,
+                                "name": f.get("name", "?"), "ref_type": "formula",
+                                "missing": miss,
+                                "error": (f"Formula '{f.get('name','?')}' references "
+                                          f"{', '.join(miss)} — which no longer exists in the "
+                                          f"model. It would fail import as an opaque 'Schema "
+                                          f"validation failed'. Dropping it (and anything that "
+                                          f"depends on it) resolves it.")})
+            # (b) a column whose formula id points at a formula that no longer exists
+            for c in node.get("columns", []) or []:
+                w = (c.get("formula_id") or c.get("column_id") or "").strip().lower()
+                if w.startswith("formula_") and w not in known:
+                    out.append({"kind": "dangling_ref", "object": mname,
+                                "name": c.get("name", "?"), "ref_type": "column",
+                                "missing": [w],
+                                "error": (f"Column '{c.get('name','?')}' surfaces {w} — a formula "
+                                          f"that no longer exists. Dropping the column resolves it.")})
+    return out
 
 
 def warehouse_missing_findings(items, cdw_map, fallback_map=None, connection=""):
