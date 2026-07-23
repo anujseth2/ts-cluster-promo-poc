@@ -217,6 +217,52 @@ def _log_discovery_pass(passes, errs, found, drop_set, viz_set, man, removed):
     return rec
 
 
+def _log_apply_detail(tag, drop_set, man, pruned, items):
+    """Append a detailed record of a manual drop/apply to logs/apply_detail.jsonl: what was
+    targeted, what drop_columns ACTUALLY removed (columns + joins by name), what tables were
+    pruned, and the FULL post-drop state — every table's remaining columns and every model's
+    remaining joins (with ON conditions). Lets us see, from the log, whether a dropped column and
+    its join actually left the bundle — no guessing. Never raises."""
+    import datetime
+    post = {}
+    for it in items or []:
+        try:
+            d = _parse_edoc(it.get("edoc", "{}"))
+        except Exception:
+            continue
+        t = d.get("table")
+        if t and t.get("name"):
+            post["table:" + t["name"]] = [
+                (c.get("db_column_name") or c.get("name")) for c in (t.get("columns") or [])]
+        mn = d.get("model") or d.get("worksheet")
+        if mn:
+            js = []
+            for mt in (mn.get("model_tables") or mn.get("tables") or []):
+                for j in (mt.get("joins") or []):
+                    js.append(f"{mt.get('name')} -> {j.get('with')} ON {j.get('on')}")
+            post["model:" + (mn.get("name") or "?")] = js
+    rec = {
+        "ts": datetime.datetime.now().isoformat(timespec="seconds"),
+        "tag": tag,
+        "drop_set": sorted(drop_set or []),
+        "removed": {
+            "columns": (man or {}).get("column_names", []),
+            "joins":   (man or {}).get("join_names", []),
+            "formulas": (man or {}).get("formulas", []),
+        },
+        "pruned": sorted(pruned or []),
+        "post_state": post,
+    }
+    try:
+        logdir = Path(__file__).parent / "logs"
+        logdir.mkdir(exist_ok=True)
+        with open(logdir / "apply_detail.jsonl", "a") as fh:
+            fh.write(json.dumps(rec, default=str) + "\n")
+    except Exception:
+        pass
+    return rec
+
+
 def _name_slug(name: str) -> str:
     """A stable obj_id slug derived from an object's name (used to pre-fill obj_id suggestions
     for objects that have none). Non-alphanumerics become underscores, repeats collapse."""
@@ -1319,6 +1365,28 @@ elif step == 2:
                 column_case_map = target_client().table_column_cases(names)
             except Exception:
                 column_case_map = {}
+            # Hive_metastore casing (authoritative, direct). ThoughtSpot's connection/search 504s on
+            # hive_metastore because it introspects columns via <catalog>.information_schema, which
+            # hive lacks. So for a hive target we read the true casing straight from Databricks via
+            # SHOW COLUMNS (works on hive AND Unity Catalog). Gated on target DBX creds in .env; when
+            # present this fills/overrides the map for tables the fast path can't see (not yet on the
+            # target) — e.g. a promoted model whose `CID` must bind to the warehouse's `cid`.
+            _dbx_host = opt_env("TS_TARGET_DBX_HOST")
+            _dbx_wh   = opt_env("TS_TARGET_DBX_WAREHOUSE")
+            _dbx_tok  = opt_env("TS_TARGET_DBX_TOKEN")
+            if _dbx_host and _dbx_wh and _dbx_tok:
+                st.write("②b Reading hive_metastore casing directly from Databricks…")
+                try:
+                    from services.databricks_direct import hive_column_cases
+                    _dbg = []
+                    _hive = hive_column_cases(_dbx_host, _dbx_wh, _dbx_tok, promoted,
+                                              opt_env("TS_PROXY"), debug=_dbg)
+                    for _t, _cols in _hive.items():
+                        column_case_map.setdefault(_t, {}).update(_cols)
+                    _ok = sum(1 for d in _dbg if d.get("state") == "SUCCEEDED")
+                    st.write(f"   warehouse casing resolved for {_ok}/{len(_dbg)} table(s).")
+                except Exception as _e:
+                    st.write(f"   ⚠ direct warehouse casing skipped: {str(_e)[:150]}")
             # A fresh export resets any prior warehouse (CDW) read — re-verify on demand below.
             st.session_state._column_case_map = column_case_map
             st.session_state._warehouse_col_map = {}
@@ -2010,7 +2078,12 @@ elif step == 2:
                     if st.checkbox(
                             f"{mark}Drop  `{f['column']}`   ·   table `{tbl}`   ·   {f['connection']}",
                             value=False, key=f"dropwh_{f['object']}_{f['column']}"):
-                        drop_set.add(f["column"])
+                        # QUALIFIED drop: scope to THIS table's column (obj::col). A bare column
+                        # name drops that column from EVERY table that has it and cascade-removes
+                        # every join keyed on it — e.g. dropping the flagged dim_cid_targets::CID as
+                        # bare "CID" also strips fact_subnational_cid_bridge::CID and collapses all
+                        # six CID joins, gutting the model. Scoping keeps the drop to the one column.
+                        drop_set.add(f"{f['object']}::{f['column']}" if f.get("object") else f["column"])
                     # Blast radius. Distinguish a real cascade (a join / formula / viz that would
                     # BREAK) from the trivial case where a model just exposes the column 1:1 (where
                     # is only "column") — the latter is expected propagation, not extra loss, so it
@@ -2039,9 +2112,18 @@ elif step == 2:
                 if not _discovered and st.button("Apply choices, re-export & re-validate", type="primary"):
                     if drop_set:
                         fixed, _man = drop_columns(st.session_state.transformed_items, drop_set)
-                        st.session_state.transformed_items = fixed
                         _record_drop(_man)
                         st.session_state.setdefault("dropped_col_names", set()).update(drop_set)
+                        # A drop that leaves a table with 0 columns (or orphans it) must prune the
+                        # WHOLE table + cascade its refs, or import hard-fails "0 columns" /
+                        # "No matches found for table". The discovery loop already does this on its
+                        # copy; the manual-apply path must too, else the emptied table ships as-is.
+                        _emptied = {f["table"] for f in table_cleanup_findings(fixed)}
+                        if _emptied:
+                            fixed, _ts = _prune_tables_whole(fixed, _emptied)
+                            st.session_state.setdefault("prune_tables", set()).update(_emptied)
+                        st.session_state.transformed_items = fixed
+                        _log_apply_detail("manual_apply", drop_set, _man, _emptied, fixed)
                     filtered_fixed = [i for i in st.session_state.transformed_items
                                       if i.get("info", {}).get("name") not in skip_objects]
                     with st.spinner("Re-committing and re-validating…"):
