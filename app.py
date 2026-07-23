@@ -1397,6 +1397,23 @@ elif step == 2:
             # Stash the RAW source export (pre-transform, pre-drop) so a debug bundle carries the
             # original model+tables — the true joins/columns before any remap or cascade. Captured
             # here, as it happens; edocs are strings so a shallow per-item copy is enough.
+            # Record the physical columns the transform will recase to the warehouse casing, so the
+            # Import Results report can show it (the recase is otherwise silent). Mirrors the
+            # transformer rule: db_column_name is recased when it differs from the map's casing.
+            _recase_events = []
+            for _it in items:
+                _rt = (_parse_edoc(_it.get("edoc", "{}")).get("table") or {})
+                _rtn = _rt.get("name")
+                _rcc = column_case_map.get((_rtn or "").strip().lower()) if _rtn else None
+                if not _rcc:
+                    continue
+                for _rcol in (_rt.get("columns") or []):
+                    _rdbn = _rcol.get("db_column_name")
+                    if _rdbn:
+                        _rtgt = _rcc.get(_rdbn.strip().lower())
+                        if _rtgt and _rtgt != _rdbn:
+                            _recase_events.append({"table": _rtn, "from": _rdbn, "to": _rtgt})
+            st.session_state._recase_events = _recase_events
             st.session_state._source_raw_items = [dict(it) for it in items]
             st.write("③ Applying the data-layer transform (connection remap, obj_ids, column casing)…")
             transformed_items, warnings = transform_items(
@@ -2914,6 +2931,17 @@ elif step == 3:
                 if dropped_vizs:
                     st.markdown(f"**Visualizations dropped:** {dropped_vizs}")
 
+        # What the promotion recased to match the target warehouse (otherwise a silent change).
+        _recases = st.session_state.get("_recase_events") or []
+        if _recases:
+            with st.expander(f"Recased to match the target warehouse ({len(_recases)} column(s))",
+                             expanded=True):
+                st.caption("Physical column names auto-adjusted to the warehouse's exact casing so "
+                           "the TML binds on import. Logical column names are unchanged.")
+                _rc = pd.DataFrame([{"Table": r["table"], "From": r["from"], "To": r["to"]}
+                                    for r in _recases])
+                st.dataframe(_sno(_rc), use_container_width=True, hide_index=True)
+
         # Feedback Replace report (only when Replace mode rebuilt a model).
         fb_rep = st.session_state.get("fb_replace_report")
         if fb_rep:
@@ -2944,9 +2972,36 @@ elif step == 3:
 
         if not success.empty:
             st.markdown("**Succeeded**")
-            _succ = success[["name", "type", "change", "detail", "obj_id", "new_id"]].rename(columns={
+            # Columns (source → warehouse): proves the promoted columns line up with the target
+            # warehouse. Source = raw source export; warehouse = read directly at export (the hive /
+            # CDW casing read). "warehouse not read" = the target couldn't be introspected.
+            _src_cols = {}
+            for _it in st.session_state.get("_source_raw_items", []):
+                _dt = (_parse_edoc(_it.get("edoc", "{}")).get("table") or {})
+                if _dt.get("name"):
+                    _src_cols[_dt["name"]] = [(_c.get("db_column_name") or "").strip().lower()
+                                              for _c in (_dt.get("columns") or []) if _c.get("db_column_name")]
+            _col_map = st.session_state.get("_column_case_map") or {}
+
+            def _shape2(row):
+                base = detail_by_name.get(row["name"], {}).get("detail", "")
+                if row["type"] != "Table":
+                    return base
+                src = _src_cols.get(row["name"])
+                if src is None:
+                    return base
+                wh = _col_map.get(row["name"].strip().lower())
+                if not wh:
+                    return f"{len(src)} cols → warehouse not read"
+                missing = [c for c in src if c not in wh]
+                return f"{len(src)} → {len(wh)} cols " + ("✓" if not missing else f"⚠ {len(missing)} missing")
+
+            success = success.copy()
+            success["shape2"] = success.apply(_shape2, axis=1)
+            _succ = success[["name", "type", "change", "shape2", "obj_id", "new_id"]].rename(columns={
                 "name": "Object", "type": "Type", "change": "State on target (from → to)",
-                "detail": "Shape", "obj_id": "obj_id (shared identity)", "new_id": "target GUID"})
+                "shape2": "Columns (source → warehouse)", "obj_id": "obj_id (shared identity)",
+                "new_id": "target GUID"})
             st.dataframe(_sno(_succ), use_container_width=True, hide_index=True)
 
         if not failed.empty:
