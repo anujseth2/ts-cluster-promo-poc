@@ -42,7 +42,8 @@ TEAMS_FILE = Path(__file__).parent / "config" / "teams.json"
 
 STEPS = [
     "1 · Select Assets",
-    "2 · obj_id Setup",
+    "2a · obj_id Setup",
+    "2b · TML Validation",
     "3 · Git Operations",
     "4 · Import Results",
 ]
@@ -117,6 +118,75 @@ def _nl_models(items) -> list:
                             "source_guid": (it.get("info") or {}).get("id", "")})
                 break
     return out
+
+
+# ── Validation + import helpers (module-level so BOTH step 2b and step 3 can call them) ──
+def _run_validation(items, step=None):
+    """Commit items to dev, create/update PR, validate models from dev. Returns (pr_url, errors, ok).
+    step: optional callable(str) to report progress to the UI."""
+    _tick = step or (lambda _m: None)
+    # Any re-export invalidates a partial import in progress — reset the import phase.
+    for _k in ("import_phase", "import_core_results", "import_leaf_files", "import_leaf_errors"):
+        st.session_state.pop(_k, None)
+    _tick("① Writing TML files to the dev branch…")
+    files  = items_to_files(items)
+    gc     = git_client()
+    sha    = gc.commit_tml(team_name, files)
+    _tick("② Opening / updating the pull request…")
+    pr_url = gc.create_pr(team_name, sha)
+    # Validate ONLY this run's files (tables first, then models) — the team folder accumulates
+    # TML across promotions, and reading the whole folder would re-validate unrelated tables.
+    val_strings = ([c for p, c in files.items() if p.startswith("tables/")]
+                   + [c for p, c in files.items() if p.startswith("models/")])
+    if not val_strings:
+        return pr_url, [], []
+    _tick(f"③ Validating {len(val_strings)} table/model file(s) against the target…")
+    results = target_client().import_tml(val_strings, policy="VALIDATE_ONLY")
+    st.session_state._last_validate = _log_validate(files, results)
+    ok  = [r for r in results if r["status"] == "OK"]
+    err = [r for r in results if r["status"] != "OK"]
+    return pr_url, err, ok
+
+
+def _safe_validate(items, step=None):
+    """_run_validation, but a hard connection failure becomes a friendly message + a logged run —
+    not a raw traceback. Returns (pr_url, err, ok) on success, or None on failure (caller stops)."""
+    try:
+        return _run_validation(items, step=step)
+    except Exception as _e:
+        _msg = str(_e)
+        st.session_state._last_validate = {
+            "ts": "(request failed)", "files": [],
+            "results": [{"name": "(validation request)", "status": "ERROR",
+                         "error": _msg[:1500]}]}
+        _h, _a, _ = friendly_error(_msg)
+        st.error("Validation couldn't reach the target — " + (_h or "the connection failed."))
+        st.caption("→ " + (_a or "Try again; the client auto-retries transient resets."))
+        return None
+
+
+def _detect_silent_drops(items):
+    """Target columns absent from the source -> dropped on import, SILENTLY when they have no
+    dependents. Diff source tables against their current target versions before the final import."""
+    tgt = target_client()
+    src_docs, names = [], []
+    for i in items:
+        d = _parse_edoc(i.get("edoc", "{}"))
+        if "table" in d and d["table"].get("name"):
+            src_docs.append(d)
+            names.append(d["table"]["name"])
+    if not names:
+        return []
+    name_to_id = tgt._resolve_names_to_ids(names, "LOGICAL_TABLE")
+    target_docs = {}
+    if name_to_id:
+        raw    = tgt.export_tml(list(name_to_id.values()))
+        titems = raw if isinstance(raw, list) else raw.get("object", [])
+        for it in titems:
+            td = _parse_edoc(it.get("edoc", "{}"))
+            if "table" in td and td["table"].get("name"):
+                target_docs[td["table"]["name"]] = td
+    return silent_drop_findings(src_docs, target_docs)
 
 
 def _humanize(msg: str) -> str:
@@ -1279,11 +1349,11 @@ elif step == 1:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STEP 2 — Git Operations
+# STEP 2b — TML Validation
 # ══════════════════════════════════════════════════════════════════════════════
 
 elif step == 2:
-    st.subheader("Git Operations")
+    st.subheader("TML Validation")
 
     selected_ids = st.session_state.get("selected_ids", [])
 
@@ -2526,8 +2596,25 @@ elif step == 2:
                 msg += f" {leaves} liveboard/answer(s) will import after."
             st.success(msg)
 
-        # ── Stage 3: Merge & Import (only when validation passed) ──────────
-        validation_passed = "pr_url" in st.session_state and not val_errors
+    _nav(2, can_next="pr_url" in st.session_state,
+          next_hint="Validate & stage the PR to continue")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 3 — Git Operations (merge & promote)
+# ══════════════════════════════════════════════════════════════════════════════
+elif step == 3:
+    transformed_items = st.session_state.get("transformed_items")
+    skip_objects   = st.session_state.get("skip_objects", set())
+    filtered_items = [i for i in (transformed_items or [])
+                      if i.get("info", {}).get("name") not in skip_objects]
+    if "pr_url" not in st.session_state or not transformed_items:
+        st.info("Finish Step 2b (TML Validation) first — validate and stage the PR, "
+                "then return here to merge & promote.")
+    else:
+        st.subheader("Git Operations")
+        st.markdown(f"**PR:** [{st.session_state.pr_url}]({st.session_state.pr_url})")
+        validation_passed = "pr_url" in st.session_state
         if validation_passed:
             st.divider()
             import_phase = st.session_state.get("import_phase")
@@ -2727,14 +2814,14 @@ elif step == 2:
 
     # No next_hint on Git Operations: the page's own buttons (Export & Validate, Merge &
     # Import) are the guidance, and a persistent ⛔ caption through the whole flow just nags.
-    _nav(2, can_next="import_results" in st.session_state)
+    _nav(3, can_next="import_results" in st.session_state)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STEP 3 — Import Results
+# STEP 4 — Import Results
 # ══════════════════════════════════════════════════════════════════════════════
 
-elif step == 3:
+elif step == 4:
     st.subheader("Import Results")
 
     results = st.session_state.get("import_results")
@@ -3015,4 +3102,4 @@ elif step == 3:
                 "status": "Status", "error": "Error"})
             st.dataframe(_sno(_fail), use_container_width=True, hide_index=True)
 
-    _nav(3)
+    _nav(4)
