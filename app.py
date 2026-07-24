@@ -1532,6 +1532,7 @@ elif step == 2:
         # warehouse actually has. A gap on either side is what drives adds (source>target) or
         # silent drops (target>source), so surface it up front.
         _wh = st.session_state.get("_warehouse_col_map") or {}
+        _cm = st.session_state.get("_column_case_map") or {}   # ②b direct-hive / fast-path casing
         _shape_rows = []
         for i in filtered_items:
             d = _parse_edoc(i.get("edoc", "{}"))
@@ -1539,7 +1540,10 @@ elif step == 2:
             if not t or not t.get("name"):
                 continue
             src_n = len(t.get("columns", []) or [])
-            wh    = _wh.get(t["name"].strip().lower())
+            _key  = t["name"].strip().lower()
+            wh    = _wh.get(_key)
+            if wh is None:
+                wh = _cm.get(_key)   # fall back to the warehouse casing read at export (hive/CDW)
             tgt_n = len(wh) if wh is not None else None
             _shape_rows.append({
                 "Table": t["name"],
@@ -2873,17 +2877,22 @@ elif step == 3:
         col1.metric("Succeeded",  len(success))
         col2.metric("Failed",     len(failed))
         col3.metric("Duplicates", dup_ct)
-        # From → To rollup: how each succeeded object landed on the target.
+        # One roll-up line: how each succeeded object landed on the target + what kinds shifted.
         if not success.empty:
             _created = int((success["change"] == "created").sum())
             _updated = int((success["change"] == "updated in place").sum())
             _present = int(success["change"].isin(["present", "synced", "rebuilt (Replace)"]).sum())
             _bits = []
-            if _created: _bits.append(f"**{_created}** created (new on target)")
-            if _updated: _bits.append(f"**{_updated}** updated in place (same obj_id)")
-            if _present: _bits.append(f"**{_present}** already present / synced")
-            if _bits:
-                st.caption("State on target: " + "  ·  ".join(_bits))
+            if _created: _bits.append(f"**{_created}** created")
+            if _updated: _bits.append(f"**{_updated}** updated in place")
+            if _present: _bits.append(f"**{_present}** already present")
+            _by_type = success["type"].value_counts().to_dict()
+            _types = ", ".join(f"{v} {k.lower()}(s)" for k, v in _by_type.items() if k)
+            _line = "  ·  ".join(_bits)
+            if _types:
+                _line = f"{_line}  —  {_types}" if _line else _types
+            if _line:
+                st.caption("On target: " + _line)
 
         # Loud banner for duplicates — in-place update is the whole point of obj_id.
         if dup_ct:
@@ -2905,11 +2914,6 @@ elif step == 3:
         with st.expander("Verification detail (re-queried from the target)"):
             for r in recon:
                 st.markdown(f"- {'✅' if r['ok'] else '⚠️'} `{r['object']}` · {r['type']} — {r['verified']}")
-
-        # What kinds of assets shifted.
-        if not success.empty:
-            by_type = success["type"].value_counts().to_dict()
-            st.caption("Shifted: " + ", ".join(f"{v} {k.lower()}(s)" for k, v in by_type.items() if k))
 
         # What the promotion dropped / pruned, by name.
         ps           = st.session_state.get("prune_summary") or {}
