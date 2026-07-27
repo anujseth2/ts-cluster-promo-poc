@@ -7,11 +7,19 @@ client, each with its own host + credentials.
 """
 
 import json
+import time
 import yaml
 from datetime import datetime
 
 import requests
 from typing import List, Dict, Optional
+
+# Transient network failures worth retrying — e.g. WinError 10054 (connection reset by a
+# gateway/proxy) or a read timeout while a slow warehouse-validate is in flight.
+_TRANSIENT = (requests.exceptions.ConnectionError,
+              requests.exceptions.Timeout,
+              requests.exceptions.ChunkedEncodingError)
+_RETRY_BACKOFF = (3, 8, 20)   # seconds between attempts
 
 from services.tml_transformer import extract_model_refs, extract_table_refs
 
@@ -46,6 +54,12 @@ class TSClient:
             self._session_login()
         elif token:
             self._session.headers["Authorization"] = f"Bearer {token}"
+        # Debug breadcrumbs (opt-in): the raw JSON of the most recent import/validate, and an
+        # optional rolling log path. When set, import_tml appends the FULL raw response of any
+        # call that comes back with an error — so a failure is already captured as it happens,
+        # no expensive one-shot re-capture needed. Never carries auth.
+        self.last_raw_import = None
+        self.debug_raw_log = None
 
     def _session_login(self):
         """Login via session cookie — correctly scopes to org_id."""
@@ -345,7 +359,7 @@ class TSClient:
         return cid, auth
 
     def connection_column_cases(self, connection_identifier: str, tables,
-                                 debug=None) -> Dict[str, Dict[str, str]]:
+                                 debug=None, timeout: int = 600) -> Dict[str, Dict[str, str]]:
         """Read the WAREHOUSE's true column casing straight from the connection (no logical table
         needed, no warehouse secret — ThoughtSpot uses the connection's stored credential).
 
@@ -355,7 +369,11 @@ class TSClient:
 
         debug: optional list. If given, one record per auth-type attempt is appended, capturing the
         HTTP status, whether data_warehouse_objects came back, columns found, and any API error —
-        so a run can show whether the fetch is erroring (privilege) or genuinely returning empty."""
+        so a run can show whether the fetch is erroring (privilege) or genuinely returning empty.
+
+        timeout: per-attempt read timeout in seconds. A cold Databricks SQL warehouse can take
+        minutes to wake and enumerate columns, so this is generous by default; warm the warehouse
+        first for a fast response."""
         out: Dict[str, Dict[str, str]] = {}
         dwos = [{"database": t.get("database", ""), "schema": t.get("schema", ""),
                  "table": t.get("table", "")} for t in tables if t.get("table")]
@@ -376,7 +394,7 @@ class TSClient:
                     "record_size": -1, "record_offset": 0}
             try:
                 resp = self._session.post(f"{self.host}/api/rest/2.0/connection/search",
-                                          json=body, timeout=120)
+                                          json=body, timeout=timeout)
                 rec["status"] = resp.status_code
                 data = resp.json()
             except (ValueError, requests.RequestException) as e:
@@ -630,6 +648,51 @@ class TSClient:
 
     # ── TML import ────────────────────────────────────────────────────────────
 
+    def _retry_post(self, url, payload, timeout, tries=3):
+        """POST with retry + backoff on transient connection resets/timeouts (e.g. WinError 10054
+        from a gateway/proxy dropping a slow warehouse-validate). Only use for IDEMPOTENT calls
+        (VALIDATE_ONLY, or obj_id-keyed update-in-place imports); a bare RST means the request
+        almost certainly never completed server-side, so a retry is safe. Re-raises the last
+        transient error if every attempt fails."""
+        last = None
+        for attempt in range(tries):
+            try:
+                return self._session.post(url, json=payload, timeout=timeout)
+            except _TRANSIENT as e:
+                last = e
+                if attempt < tries - 1:
+                    time.sleep(_RETRY_BACKOFF[min(attempt, len(_RETRY_BACKOFF) - 1)])
+        raise last
+
+    @staticmethod
+    def _raw_has_error(data) -> bool:
+        """True if any object in a raw import/validate response is non-OK (ignoring the benign
+        'Existing guid … will be used' update notice)."""
+        rows = data if isinstance(data, list) else (data.get("object", []) if isinstance(data, dict) else [])
+        for item in rows:
+            if not isinstance(item, dict):
+                continue
+            status = (item.get("response", item).get("status") or {})
+            code = status.get("status_code", "OK")
+            if code and code != "OK" and "will be used" not in (status.get("error_message") or ""):
+                return True
+        return False
+
+    def _append_raw_log(self, policy, count, status_code, data):
+        """Append the FULL raw response to debug_raw_log when it carries an error. Best-effort:
+        logging must never break a validate/import. No auth is written."""
+        try:
+            if not self._raw_has_error(data):
+                return
+            rec = {"ts": datetime.now().isoformat(timespec="seconds"), "host": self.host,
+                   "policy": policy, "tml_count": count, "http_status": status_code, "raw": data}
+            import os
+            os.makedirs(os.path.dirname(self.debug_raw_log) or ".", exist_ok=True)
+            with open(self.debug_raw_log, "a") as fh:
+                fh.write(json.dumps(rec, default=str) + "\n")
+        except Exception:
+            pass
+
     def import_tml(self, tml_strings: List[str],
                    policy: str = "PARTIAL") -> List[Dict]:
         """
@@ -641,19 +704,20 @@ class TSClient:
             "metadata_tmls": tml_strings,
             "import_policy": policy,
         }
-        resp = self._session.post(
-            f"{self.host}/api/rest/2.0/metadata/tml/import",
-            json=payload,
-            timeout=120,
-        )
+        url = f"{self.host}/api/rest/2.0/metadata/tml/import"
+        # Retry transient resets: VALIDATE_ONLY is read-only, and real imports are obj_id-keyed
+        # update-in-place, so a retry after a bare connection reset is safe. Longer read window
+        # (180s) for slow server-side warehouse validation.
+        resp = self._retry_post(url, payload, timeout=180)
         if resp.status_code == 401 and self._username and self._password:
             self._session_login()
-            resp = self._session.post(
-                f"{self.host}/api/rest/2.0/metadata/tml/import",
-                json=payload,
-                timeout=120,
-            )
+            resp = self._retry_post(url, payload, timeout=180)
         data = resp.json()
+        # Breadcrumb the raw response as we go — so an opaque failure is already captured the
+        # moment it happens (no need to re-run every validate in a one-shot capture later).
+        self.last_raw_import = data
+        if self.debug_raw_log:
+            self._append_raw_log(policy, len(tml_strings), resp.status_code, data)
 
         # Normalise — API may return list or {"object": [...]}
         if isinstance(data, list):
