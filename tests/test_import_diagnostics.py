@@ -99,11 +99,25 @@ def test_classify_type_mismatch():
     assert f[0]["column"] == "Quantity"
 
 
-def test_classify_drop_blocked_by_dependents():
-    err = ("Deleted columns have dependents.<br/>- <b>Revenue</b><ul><li>Revenue by Brand</li></ul>")
-    f = classify_import_errors([{"name": "commerce", "status": "ERROR", "error": err}])
-    assert f[0]["kind"] == "drop_blocked_by_dependents"
-    assert "Revenue" in f[0]["columns"] and "Revenue by Brand" in f[0]["dependents"]
+def test_classify_drop_blocked_names_the_table_not_columns():
+    # Real platform format (error 14544): names only the blocked TABLE, never the column/dependent.
+    err = ("Unable to import tml due to following errors:<br/>- "
+           "<b>fact_time_out_details_respbio_br</b>: Deleted columns have dependents.<br/><br/>"
+           "<b>SOLUTION:</b><br/>Either fix the error objects or remove those objects.<br/>")
+    f = classify_import_errors([{"name": "unknown", "status": "ERROR", "error": err}])
+    blocked = [x for x in f if x["kind"] == "drop_blocked_by_dependents"]
+    assert len(blocked) == 1
+    assert blocked[0]["object"] == "fact_time_out_details_respbio_br"
+    assert blocked[0]["columns"] == [] and blocked[0]["dependents"] == []
+
+
+def test_classify_drop_blocked_multiple_tables():
+    err = ("Unable to import tml due to following errors:<br/>"
+           "- <b>tbl_a</b>: Deleted columns have dependents.<br/>"
+           "- <b>tbl_b</b>: Deleted columns have dependents.<br/><b>SOLUTION:</b> fix.")
+    f = classify_import_errors([{"name": "unknown", "status": "ERROR", "error": err}])
+    tables = sorted(x["object"] for x in f if x["kind"] == "drop_blocked_by_dependents")
+    assert tables == ["tbl_a", "tbl_b"]
 
 
 def test_classify_invalid_formula_ids():

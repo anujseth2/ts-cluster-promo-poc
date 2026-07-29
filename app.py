@@ -2252,21 +2252,26 @@ elif step == 2:
 
             # ── target-extra with dependents: the drop is blocked on the target ──
             if dep_blocked:
-                st.markdown("#### Target columns with dependents (drop blocked)")
-                st.caption("Importing these tables would remove columns that already exist on the "
-                           "target and are still in use, so the platform blocks the import. The "
-                           "promoted table simply carries fewer columns than the one on the target.")
-                for f in dep_blocked:
-                    _cols = ", ".join(f"`{c}`" for c in f.get("columns", []) if c) \
-                        or "_(columns not named by the platform)_"
-                    _deps = [d for d in f.get("dependents", []) if d]
-                    _line = f"Importing would remove target column(s) {_cols}"
-                    if _deps:
-                        _line += " — still used by: " + ", ".join(f"**{d}**" for d in _deps)
-                    _line += "."
-                    st.warning(_line + "\n\nResolve by **preserving** the column(s) (carry them "
-                               "through from the target) or by **removing those dependents** on the "
-                               "target, then re-run.")
+                st.markdown("#### Tables blocked — import would delete a column that has dependents")
+                st.caption("Importing these tables would remove target columns that still have "
+                           "dependents, so the platform blocks the whole import (error 14544). "
+                           "ThoughtSpot names only the **table** — not the column or the dependent. "
+                           "The columns at issue are the missing / type-mismatched ones flagged "
+                           "above for the same table; remove those dependents on the target (or fix "
+                           "the columns), then re-run.")
+                # Cross-reference the flagged missing/type columns to each blocked table so the
+                # operator knows which column drove the block.
+                _flagged_by_tbl = {}
+                for _f in (wh_missing + type_mismatch):
+                    _flagged_by_tbl.setdefault((_f.get("object") or "").strip().lower(), []) \
+                        .append(_f.get("column"))
+                for f in sorted(dep_blocked, key=lambda x: (x.get("object") or "").lower()):
+                    _tbl  = f.get("object") or "(table not named)"
+                    _cols = [c for c in _flagged_by_tbl.get(_tbl.strip().lower(), []) if c]
+                    _line = f"**`{_tbl}`** is blocked"
+                    if _cols:
+                        _line += " — likely from column(s): " + ", ".join(f"`{c}`" for c in _cols)
+                    st.warning(_line + ".")
 
             # ── type drift: column exists on both sides, types differ ──
             if type_mismatch:

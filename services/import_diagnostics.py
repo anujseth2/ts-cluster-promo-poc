@@ -137,11 +137,17 @@ def classify_import_errors(results):
                              "connection": conn.strip()})
         if _DEP_HEADER.search(msg):
             matched = True
-            cols = [b.strip() for b in _BOLD.findall(msg)
-                    if b.strip() and not b.strip().endswith(":")]
-            deps = [d.strip() for d in _LI.findall(msg) if d.strip()]
-            findings.append({"kind": "drop_blocked_by_dependents",
-                             "object": r.get("name"), "columns": cols, "dependents": deps})
+            # Real format (error 14544): "Unable to import tml due to following errors:<br/>
+            #   - <b>TABLE</b>: Deleted columns have dependents.<br/>…<b>SOLUTION:</b>…".
+            # The platform names ONLY the blocked TABLE(s) — never the column or the dependent. So
+            # surface the table; the offending columns are the missing/type findings for the same
+            # table, and the dependents live on the target (the operator removes them there).
+            blocked = [t.strip() for t in
+                       re.findall(r"<b>([^<]+)</b>\s*:\s*Deleted columns have dependents", msg)
+                       if t.strip()]
+            for tbl in (blocked or [r.get("name")]):
+                findings.append({"kind": "drop_blocked_by_dependents", "object": tbl,
+                                 "columns": [], "dependents": []})
         viz_ids = _VIZ_ERR.findall(msg)
         if viz_ids:
             matched = True
