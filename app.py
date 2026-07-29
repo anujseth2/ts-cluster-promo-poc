@@ -42,7 +42,8 @@ TEAMS_FILE = Path(__file__).parent / "config" / "teams.json"
 
 STEPS = [
     "1 · Select Assets",
-    "2 · obj_id Setup",
+    "2a · obj_id Setup",
+    "2b · TML Validation",
     "3 · Git Operations",
     "4 · Import Results",
 ]
@@ -117,6 +118,75 @@ def _nl_models(items) -> list:
                             "source_guid": (it.get("info") or {}).get("id", "")})
                 break
     return out
+
+
+# ── Validation + import helpers (module-level so BOTH step 2b and step 3 can call them) ──
+def _run_validation(items, step=None):
+    """Commit items to dev, create/update PR, validate models from dev. Returns (pr_url, errors, ok).
+    step: optional callable(str) to report progress to the UI."""
+    _tick = step or (lambda _m: None)
+    # Any re-export invalidates a partial import in progress — reset the import phase.
+    for _k in ("import_phase", "import_core_results", "import_leaf_files", "import_leaf_errors"):
+        st.session_state.pop(_k, None)
+    _tick("① Writing TML files to the dev branch…")
+    files  = items_to_files(items)
+    gc     = git_client()
+    sha    = gc.commit_tml(team_name, files)
+    _tick("② Opening / updating the pull request…")
+    pr_url = gc.create_pr(team_name, sha)
+    # Validate ONLY this run's files (tables first, then models) — the team folder accumulates
+    # TML across promotions, and reading the whole folder would re-validate unrelated tables.
+    val_strings = ([c for p, c in files.items() if p.startswith("tables/")]
+                   + [c for p, c in files.items() if p.startswith("models/")])
+    if not val_strings:
+        return pr_url, [], []
+    _tick(f"③ Validating {len(val_strings)} table/model file(s) against the target…")
+    results = target_client().import_tml(val_strings, policy="VALIDATE_ONLY")
+    st.session_state._last_validate = _log_validate(files, results)
+    ok  = [r for r in results if r["status"] == "OK"]
+    err = [r for r in results if r["status"] != "OK"]
+    return pr_url, err, ok
+
+
+def _safe_validate(items, step=None):
+    """_run_validation, but a hard connection failure becomes a friendly message + a logged run —
+    not a raw traceback. Returns (pr_url, err, ok) on success, or None on failure (caller stops)."""
+    try:
+        return _run_validation(items, step=step)
+    except Exception as _e:
+        _msg = str(_e)
+        st.session_state._last_validate = {
+            "ts": "(request failed)", "files": [],
+            "results": [{"name": "(validation request)", "status": "ERROR",
+                         "error": _msg[:1500]}]}
+        _h, _a, _ = friendly_error(_msg)
+        st.error("Validation couldn't reach the target — " + (_h or "the connection failed."))
+        st.caption("→ " + (_a or "Try again; the client auto-retries transient resets."))
+        return None
+
+
+def _detect_silent_drops(items):
+    """Target columns absent from the source -> dropped on import, SILENTLY when they have no
+    dependents. Diff source tables against their current target versions before the final import."""
+    tgt = target_client()
+    src_docs, names = [], []
+    for i in items:
+        d = _parse_edoc(i.get("edoc", "{}"))
+        if "table" in d and d["table"].get("name"):
+            src_docs.append(d)
+            names.append(d["table"]["name"])
+    if not names:
+        return []
+    name_to_id = tgt._resolve_names_to_ids(names, "LOGICAL_TABLE")
+    target_docs = {}
+    if name_to_id:
+        raw    = tgt.export_tml(list(name_to_id.values()))
+        titems = raw if isinstance(raw, list) else raw.get("object", [])
+        for it in titems:
+            td = _parse_edoc(it.get("edoc", "{}"))
+            if "table" in td and td["table"].get("name"):
+                target_docs[td["table"]["name"]] = td
+    return silent_drop_findings(src_docs, target_docs)
 
 
 def _humanize(msg: str) -> str:
@@ -1279,11 +1349,11 @@ elif step == 1:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STEP 2 — Git Operations
+# STEP 2b — TML Validation
 # ══════════════════════════════════════════════════════════════════════════════
 
 elif step == 2:
-    st.subheader("Git Operations")
+    st.subheader("TML Validation")
 
     selected_ids = st.session_state.get("selected_ids", [])
 
@@ -1310,7 +1380,18 @@ elif step == 2:
                 st.session_state.pop(_k, None)
         with st.status("Preparing the promotion bundle…", expanded=True) as _exp_status:
             st.write("① Exporting TML from the source cluster…")
-            raw   = source_client().export_tml(selected_ids)
+            try:
+                raw = source_client().export_tml(selected_ids)
+            except Exception as _ex:
+                _exp_status.update(label="Export failed — source connection reset", state="error")
+                _h, _a, _ = friendly_error(str(_ex))
+                st.error("Couldn't export from the source cluster — "
+                         + (_h or "the connection was reset by the remote host (WinError 10054)."))
+                st.caption("→ " + (_a or "A transient network reset (proxy/gateway), not related to "
+                           "dropping columns — the client already retried with backoff. Retry below."))
+                if st.button("↻ Retry export"):
+                    st.rerun()
+                st.stop()
             items = raw if isinstance(raw, list) else raw.get("object", [])
             # Opt-in: also pull each model's Spotter feedback (reference questions + business
             # terms) and promote it alongside the model.
@@ -1698,7 +1779,13 @@ elif step == 2:
                         _obj = (f.get("object") or "").strip()
                         drop_set.add(f"{_obj}::{f['column']}" if _obj else f["column"])
                     elif f["kind"] == "drop_blocked_by_dependents":
-                        drop_set.update(f.get("columns", []))
+                        # NEVER add these to the drop set. The platform blocks the drop (the column
+                        # has dependents) AND the 14544 error names only the TABLE, no column — so
+                        # this historically added BARE column names that drop_columns then stripped
+                        # off EVERY table, severing shared join keys (HCP_ID/CID) and cascading whole
+                        # tables into "drop_table" (one column → seven dropped tables). Surface the
+                        # blocked table for manual resolution instead; don't auto-drop anything.
+                        pass
                     elif f["kind"] == "viz_error":
                         viz_set.update(f.get("vizzes", []))
                     elif f["kind"] == "invalid_formula_ids":
@@ -2004,8 +2091,12 @@ elif step == 2:
             # the one-per-round validation findings for those tables (no duplicate rows). For a
             # table the warehouse couldn't answer for, we keep the validation-confirmed finding and
             # fall back to the org-modeled column set (flagged 'unverified').
-            # Skip the CDW merge when the discovery probe already produced the complete union.
-            if not _discovered:
+            # ALWAYS diff against the warehouse for missing columns: it returns the COMPLETE set in
+            # one pass with REAL table names (object = the table). VALIDATE_ONLY does neither — it
+            # reports one missing column per table per round AND names them "unknown", so the drop
+            # key becomes `unknown::col`, which matches no table (the drop never clears, discovery
+            # stalls) and can't be grouped. The warehouse diff replaces those unknown-named findings.
+            if True:
                 cdw_map = st.session_state.get("_warehouse_col_map") or {}
                 org_map = st.session_state.get("_column_case_map") or {}
                 diff_findings = warehouse_missing_findings(
@@ -2092,12 +2183,19 @@ elif step == 2:
                             key="selall_wh", on_change=_toggle_all_wh)
                 drop_set = set()
                 _promo_items = st.session_state.get("transformed_items", [])
-                for f in wh_missing:
-                    parts = (f.get("column_fqn") or "").split(".")
-                    tbl   = parts[-2] if len(parts) >= 2 else f.get("object", "")
+                # Group by table: sort by (table, column) and print a table header when it changes,
+                # so every missing column for a table sits together. `object` is now the real table
+                # name (from the warehouse diff), not "unknown".
+                _last_tbl = None
+                for f in sorted(wh_missing, key=lambda x: ((x.get("object") or "").lower(),
+                                                           (x.get("column") or "").lower())):
+                    _tbl = f.get("object") or "(unresolved table)"
+                    if _tbl != _last_tbl:
+                        st.markdown(f"**`{_tbl}`**")
+                        _last_tbl = _tbl
                     mark  = "" if f.get("verified") else "⚠︎ unverified · "
                     if st.checkbox(
-                            f"{mark}Drop  `{f['column']}`   ·   table `{tbl}`   ·   {f['connection']}",
+                            f"{mark}Drop  `{f['column']}`   ·   {f['connection']}",
                             value=False, key=f"dropwh_{f['object']}_{f['column']}"):
                         # QUALIFIED drop: scope to THIS table's column (obj::col). A bare column
                         # name drops that column from EVERY table that has it and cascade-removes
@@ -2160,15 +2258,29 @@ elif step == 2:
 
             # ── target-extra with dependents: the drop is blocked on the target ──
             if dep_blocked:
-                st.markdown("#### Target columns with dependents (drop blocked)")
-                for f in dep_blocked:
-                    st.warning(
-                        f"Promoting **{f['object']}** would remove target column(s) "
-                        + ", ".join(f"`{c}`" for c in f["columns"])
-                        + " that the target still uses: "
-                        + ", ".join(f"**{d}**" for d in f["dependents"]) + ".\n\n"
-                        "Resolve by **preserving** the column (add it back to the source) or by "
-                        "**removing those dependents** on the target, then re-run.")
+                st.markdown("#### Tables blocked — import would delete a column that has dependents")
+                st.caption("Importing these tables would remove target columns that still have "
+                           "dependents, so the platform blocks the whole import (error 14544). "
+                           "ThoughtSpot names only the **table** — not the column or the dependent. "
+                           "The columns at issue are the missing / type-mismatched ones flagged "
+                           "above for the same table; remove those dependents on the target (or fix "
+                           "the columns), then re-run.")
+                # Cross-reference the flagged missing/type columns to each blocked table so the
+                # operator knows which column drove the block.
+                _flagged_by_tbl = {}
+                for _f in (wh_missing + type_mismatch):
+                    _flagged_by_tbl.setdefault((_f.get("object") or "").strip().lower(), []) \
+                        .append(_f.get("column"))
+                # Dedup: the same blocked table appears across many error rows (60+), so collapse
+                # to unique table names.
+                _blocked_tables = sorted({(f.get("object") or "(table not named)") for f in dep_blocked},
+                                         key=str.lower)
+                for _tbl in _blocked_tables:
+                    _cols = [c for c in _flagged_by_tbl.get(_tbl.strip().lower(), []) if c]
+                    _line = f"**`{_tbl}`** is blocked"
+                    if _cols:
+                        _line += " — likely from column(s): " + ", ".join(f"`{c}`" for c in _cols)
+                    st.warning(_line + ".")
 
             # ── type drift: column exists on both sides, types differ ──
             if type_mismatch:
@@ -2526,8 +2638,25 @@ elif step == 2:
                 msg += f" {leaves} liveboard/answer(s) will import after."
             st.success(msg)
 
-        # ── Stage 3: Merge & Import (only when validation passed) ──────────
-        validation_passed = "pr_url" in st.session_state and not val_errors
+    _nav(2, can_next="pr_url" in st.session_state,
+          next_hint="Validate & stage the PR to continue")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 3 — Git Operations (merge & promote)
+# ══════════════════════════════════════════════════════════════════════════════
+elif step == 3:
+    transformed_items = st.session_state.get("transformed_items")
+    skip_objects   = st.session_state.get("skip_objects", set())
+    filtered_items = [i for i in (transformed_items or [])
+                      if i.get("info", {}).get("name") not in skip_objects]
+    if "pr_url" not in st.session_state or not transformed_items:
+        st.info("Finish Step 2b (TML Validation) first — validate and stage the PR, "
+                "then return here to merge & promote.")
+    else:
+        st.subheader("Git Operations")
+        st.markdown(f"**PR:** [{st.session_state.pr_url}]({st.session_state.pr_url})")
+        validation_passed = "pr_url" in st.session_state
         if validation_passed:
             st.divider()
             import_phase = st.session_state.get("import_phase")
@@ -2727,14 +2856,14 @@ elif step == 2:
 
     # No next_hint on Git Operations: the page's own buttons (Export & Validate, Merge &
     # Import) are the guidance, and a persistent ⛔ caption through the whole flow just nags.
-    _nav(2, can_next="import_results" in st.session_state)
+    _nav(3, can_next="import_results" in st.session_state)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STEP 3 — Import Results
+# STEP 4 — Import Results
 # ══════════════════════════════════════════════════════════════════════════════
 
-elif step == 3:
+elif step == 4:
     st.subheader("Import Results")
 
     results = st.session_state.get("import_results")
@@ -3015,4 +3144,4 @@ elif step == 3:
                 "status": "Status", "error": "Error"})
             st.dataframe(_sno(_fail), use_container_width=True, hide_index=True)
 
-    _nav(3)
+    _nav(4)
