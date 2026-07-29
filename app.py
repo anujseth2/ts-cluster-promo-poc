@@ -2271,8 +2271,11 @@ elif step == 2:
                 for _f in (wh_missing + type_mismatch):
                     _flagged_by_tbl.setdefault((_f.get("object") or "").strip().lower(), []) \
                         .append(_f.get("column"))
-                for f in sorted(dep_blocked, key=lambda x: (x.get("object") or "").lower()):
-                    _tbl  = f.get("object") or "(table not named)"
+                # Dedup: the same blocked table appears across many error rows (60+), so collapse
+                # to unique table names.
+                _blocked_tables = sorted({(f.get("object") or "(table not named)") for f in dep_blocked},
+                                         key=str.lower)
+                for _tbl in _blocked_tables:
                     _cols = [c for c in _flagged_by_tbl.get(_tbl.strip().lower(), []) if c]
                     _line = f"**`{_tbl}`** is blocked"
                     if _cols:

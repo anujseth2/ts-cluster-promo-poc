@@ -122,16 +122,22 @@ def classify_import_errors(results):
         matched = False
         for col_fqn, conn in _MISSING_WH.findall(msg):
             matched = True
+            _p = [x for x in col_fqn.split(".") if x]
             findings.append({"kind": "missing_in_target_warehouse",
-                             "object": r.get("name"),
-                             "column": col_fqn.split(".")[-1],
+                             # The validate header is often "unknown", but the error FQN
+                             # (db.schema.db_table.col) names the real table — use it so the drop
+                             # scopes to <table>::<col>. "unknown::col" matched nothing, which is
+                             # why these columns never cleared.
+                             "object": _p[-2] if len(_p) >= 2 else r.get("name"),
+                             "column": _p[-1] if _p else col_fqn,
                              "column_fqn": col_fqn,
                              "connection": conn.strip()})
         for src_type, col_fqn, conn in _TYPE_MISMATCH.findall(msg):
             matched = True
+            _p = [x for x in col_fqn.split(".") if x]
             findings.append({"kind": "type_mismatch",
-                             "object": r.get("name"),
-                             "column": col_fqn.split(".")[-1],
+                             "object": _p[-2] if len(_p) >= 2 else r.get("name"),
+                             "column": _p[-1] if _p else col_fqn,
                              "column_fqn": col_fqn,
                              "source_type": src_type.strip(),
                              "connection": conn.strip()})

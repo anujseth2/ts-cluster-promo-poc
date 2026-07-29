@@ -80,6 +80,7 @@ def test_classify_missing_in_warehouse_14536():
     f = classify_import_errors([{"name": "commerce", "status": "ERROR", "error": err}])
     assert len(f) == 1 and f[0]["kind"] == "missing_in_target_warehouse"
     assert f[0]["column"] == "Ghost"
+    assert f[0]["object"] == "commerce"   # table resolved from the FQN, not the "unknown" header
     assert f[0]["connection"] == "Sisense Migration - Databricks"
 
 
