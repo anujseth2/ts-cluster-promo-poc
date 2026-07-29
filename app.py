@@ -2295,8 +2295,19 @@ elif step == 2:
                 tm_key = tuple(sorted((f["object"], f["column"]) for f in type_mismatch))
                 if st.session_state.get("_tm_key") != tm_key:
                     with st.spinner("Reading target types and scanning dependents for this column…"):
-                        st.session_state._tm_types = _target_col_types(type_mismatch)
-                        st.session_state._tm_usage = _target_col_usage(type_mismatch)
+                        # Optional enrichment (target types + what-uses-this-column). It reads/exports
+                        # target objects, which can fail if the caller can't SEE them (ThoughtSpot
+                        # returns 404 for objects the user has no access to) or the connection is
+                        # unreachable. Never let it crash the page — degrade to no detail.
+                        try:
+                            st.session_state._tm_types = _target_col_types(type_mismatch)
+                            st.session_state._tm_usage = _target_col_usage(type_mismatch)
+                        except Exception as _e:
+                            st.session_state._tm_types = {}
+                            st.session_state._tm_usage = {}
+                            st.caption("⚠ Couldn't read target column types / dependents "
+                                       f"({str(_e)[:120]}). Showing the mismatch without target "
+                                       "detail — often means your user can't see those target objects.")
                         st.session_state._tm_key    = tm_key
                 tgt_types = st.session_state.get("_tm_types", {})
                 tgt_usage = st.session_state.get("_tm_usage", {})
