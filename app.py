@@ -2074,8 +2074,12 @@ elif step == 2:
             # the one-per-round validation findings for those tables (no duplicate rows). For a
             # table the warehouse couldn't answer for, we keep the validation-confirmed finding and
             # fall back to the org-modeled column set (flagged 'unverified').
-            # Skip the CDW merge when the discovery probe already produced the complete union.
-            if not _discovered:
+            # ALWAYS diff against the warehouse for missing columns: it returns the COMPLETE set in
+            # one pass with REAL table names (object = the table). VALIDATE_ONLY does neither — it
+            # reports one missing column per table per round AND names them "unknown", so the drop
+            # key becomes `unknown::col`, which matches no table (the drop never clears, discovery
+            # stalls) and can't be grouped. The warehouse diff replaces those unknown-named findings.
+            if True:
                 cdw_map = st.session_state.get("_warehouse_col_map") or {}
                 org_map = st.session_state.get("_column_case_map") or {}
                 diff_findings = warehouse_missing_findings(
@@ -2162,12 +2166,19 @@ elif step == 2:
                             key="selall_wh", on_change=_toggle_all_wh)
                 drop_set = set()
                 _promo_items = st.session_state.get("transformed_items", [])
-                for f in wh_missing:
-                    parts = (f.get("column_fqn") or "").split(".")
-                    tbl   = parts[-2] if len(parts) >= 2 else f.get("object", "")
+                # Group by table: sort by (table, column) and print a table header when it changes,
+                # so every missing column for a table sits together. `object` is now the real table
+                # name (from the warehouse diff), not "unknown".
+                _last_tbl = None
+                for f in sorted(wh_missing, key=lambda x: ((x.get("object") or "").lower(),
+                                                           (x.get("column") or "").lower())):
+                    _tbl = f.get("object") or "(unresolved table)"
+                    if _tbl != _last_tbl:
+                        st.markdown(f"**`{_tbl}`**")
+                        _last_tbl = _tbl
                     mark  = "" if f.get("verified") else "⚠︎ unverified · "
                     if st.checkbox(
-                            f"{mark}Drop  `{f['column']}`   ·   table `{tbl}`   ·   {f['connection']}",
+                            f"{mark}Drop  `{f['column']}`   ·   {f['connection']}",
                             value=False, key=f"dropwh_{f['object']}_{f['column']}"):
                         # QUALIFIED drop: scope to THIS table's column (obj::col). A bare column
                         # name drops that column from EVERY table that has it and cascade-removes
