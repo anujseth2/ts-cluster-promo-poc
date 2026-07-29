@@ -1380,7 +1380,18 @@ elif step == 2:
                 st.session_state.pop(_k, None)
         with st.status("Preparing the promotion bundle…", expanded=True) as _exp_status:
             st.write("① Exporting TML from the source cluster…")
-            raw   = source_client().export_tml(selected_ids)
+            try:
+                raw = source_client().export_tml(selected_ids)
+            except Exception as _ex:
+                _exp_status.update(label="Export failed — source connection reset", state="error")
+                _h, _a, _ = friendly_error(str(_ex))
+                st.error("Couldn't export from the source cluster — "
+                         + (_h or "the connection was reset by the remote host (WinError 10054)."))
+                st.caption("→ " + (_a or "A transient network reset (proxy/gateway), not related to "
+                           "dropping columns — the client already retried with backoff. Retry below."))
+                if st.button("↻ Retry export"):
+                    st.rerun()
+                st.stop()
             items = raw if isinstance(raw, list) else raw.get("object", [])
             # Opt-in: also pull each model's Spotter feedback (reference questions + business
             # terms) and promote it alongside the model.

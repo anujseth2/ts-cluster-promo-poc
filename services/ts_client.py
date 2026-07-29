@@ -82,12 +82,26 @@ class TSClient:
             self._session_login()
 
     def _post(self, path: str, payload: dict) -> dict:
-        resp = self._session.post(f"{self.host}{path}", json=payload, timeout=60)
-        if resp.status_code == 401 and self._username and self._password:
-            self._session_login()
-            resp = self._session.post(f"{self.host}{path}", json=payload, timeout=60)
-        resp.raise_for_status()
-        return resp.json()
+        # Retry transient connection resets (WinError 10054 from a proxy/gateway dropping the
+        # connection) with backoff — a bare RST means the request almost certainly never reached
+        # the server, so a retry is safe. HTTP errors (raise_for_status) are NOT retried.
+        url  = f"{self.host}{path}"
+        last = None
+        for attempt in range(3):
+            try:
+                resp = self._session.post(url, json=payload, timeout=60)
+                if resp.status_code == 401 and self._username and self._password:
+                    self._session_login()
+                    resp = self._session.post(url, json=payload, timeout=60)
+                resp.raise_for_status()
+                return resp.json()
+            except _TRANSIENT as e:
+                last = e
+                if attempt < 2:
+                    time.sleep(_RETRY_BACKOFF[min(attempt, len(_RETRY_BACKOFF) - 1)])
+                    continue
+                raise
+        raise last
 
     # ── Metadata search by tag ──────────────────────────────────────────────────
 
