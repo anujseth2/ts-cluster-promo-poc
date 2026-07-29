@@ -1779,7 +1779,13 @@ elif step == 2:
                         _obj = (f.get("object") or "").strip()
                         drop_set.add(f"{_obj}::{f['column']}" if _obj else f["column"])
                     elif f["kind"] == "drop_blocked_by_dependents":
-                        drop_set.update(f.get("columns", []))
+                        # NEVER add these to the drop set. The platform blocks the drop (the column
+                        # has dependents) AND the 14544 error names only the TABLE, no column — so
+                        # this historically added BARE column names that drop_columns then stripped
+                        # off EVERY table, severing shared join keys (HCP_ID/CID) and cascading whole
+                        # tables into "drop_table" (one column → seven dropped tables). Surface the
+                        # blocked table for manual resolution instead; don't auto-drop anything.
+                        pass
                     elif f["kind"] == "viz_error":
                         viz_set.update(f.get("vizzes", []))
                     elif f["kind"] == "invalid_formula_ids":
