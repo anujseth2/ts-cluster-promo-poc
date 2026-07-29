@@ -2253,14 +2253,20 @@ elif step == 2:
             # ── target-extra with dependents: the drop is blocked on the target ──
             if dep_blocked:
                 st.markdown("#### Target columns with dependents (drop blocked)")
+                st.caption("Importing these tables would remove columns that already exist on the "
+                           "target and are still in use, so the platform blocks the import. The "
+                           "promoted table simply carries fewer columns than the one on the target.")
                 for f in dep_blocked:
-                    st.warning(
-                        f"Promoting **{f['object']}** would remove target column(s) "
-                        + ", ".join(f"`{c}`" for c in f["columns"])
-                        + " that the target still uses: "
-                        + ", ".join(f"**{d}**" for d in f["dependents"]) + ".\n\n"
-                        "Resolve by **preserving** the column (add it back to the source) or by "
-                        "**removing those dependents** on the target, then re-run.")
+                    _cols = ", ".join(f"`{c}`" for c in f.get("columns", []) if c) \
+                        or "_(columns not named by the platform)_"
+                    _deps = [d for d in f.get("dependents", []) if d]
+                    _line = f"Importing would remove target column(s) {_cols}"
+                    if _deps:
+                        _line += " — still used by: " + ", ".join(f"**{d}**" for d in _deps)
+                    _line += "."
+                    st.warning(_line + "\n\nResolve by **preserving** the column(s) (carry them "
+                               "through from the target) or by **removing those dependents** on the "
+                               "target, then re-run.")
 
             # ── type drift: column exists on both sides, types differ ──
             if type_mismatch:
