@@ -121,6 +121,17 @@ def test_classify_drop_blocked_multiple_tables():
     assert tables == ["tbl_a", "tbl_b"]
 
 
+def test_classify_drop_blocked_column_level_names_column_and_deps():
+    # Format B (also 14544): names the deleted COLUMN and its dependent object(s).
+    err = ("Deleted columns have dependents.<br/>- <b>NUCALA_POTENTIAL</b></br>"
+           "<ul><li>Respbio Subnational Performance </li></ul><br/><b>SOLUTION:</b> fix.")
+    f = classify_import_errors([{"name": "unknown", "status": "ERROR", "error": err}])
+    blocked = [x for x in f if x["kind"] == "drop_blocked_by_dependents"]
+    assert len(blocked) == 1
+    assert blocked[0].get("column") == "NUCALA_POTENTIAL"
+    assert blocked[0]["dependents"] == ["Respbio Subnational Performance"]
+
+
 def test_classify_invalid_formula_ids():
     err = ("Model/Worksheet columns use invalid formula IDs.<br/>- <b>Bio Pen (COPD)</b>"
            "<ul><li>* formula_Bio Pen (COPD)</li></ul>- <b>Nucala Target Count (HCP)</b>"

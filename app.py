@@ -2258,26 +2258,34 @@ elif step == 2:
 
             # ── target-extra with dependents: the drop is blocked on the target ──
             if dep_blocked:
-                st.markdown("#### Tables blocked — import would delete a column that has dependents")
-                st.caption("Importing these tables would remove target columns that still have "
-                           "dependents, so the platform blocks the whole import (error 14544). "
-                           "ThoughtSpot names only the **table** — not the column or the dependent. "
-                           "The columns at issue are the missing / type-mismatched ones flagged "
-                           "above for the same table; remove those dependents on the target (or fix "
-                           "the columns), then re-run.")
+                st.markdown("#### Blocked — import would delete a column that still has dependents")
+                st.caption("Removing these on the target would break something still using them, so "
+                           "the platform blocks the whole import (error 14544). Remove the "
+                           "dependent(s) on the target (or fix the column), then re-run.")
                 # Cross-reference the flagged missing/type columns to each blocked table so the
-                # operator knows which column drove the block.
+                # operator knows which column drove a table-only block.
                 _flagged_by_tbl = {}
                 for _f in (wh_missing + type_mismatch):
                     _flagged_by_tbl.setdefault((_f.get("object") or "").strip().lower(), []) \
                         .append(_f.get("column"))
-                # Dedup: the same blocked table appears across many error rows (60+), so collapse
-                # to unique table names.
-                _blocked_tables = sorted({(f.get("object") or "(table not named)") for f in dep_blocked},
-                                         key=str.lower)
-                for _tbl in _blocked_tables:
+                # Two shapes, deduped: column-level (platform named the column + its dependents) and
+                # table-only (platform named just the table). The same block repeats across 60+ rows.
+                _col_deps, _tbl_only = {}, set()
+                for f in dep_blocked:
+                    if f.get("column"):
+                        _col_deps.setdefault(f["column"], set()).update(
+                            d for d in f.get("dependents", []) if d)
+                    else:
+                        _tbl_only.add(f.get("object") or "(table not named)")
+                for _col in sorted(_col_deps, key=str.lower):
+                    _deps = sorted(_col_deps[_col])
+                    _line = f"Column **`{_col}`** is blocked"
+                    if _deps:
+                        _line += " — used by: " + ", ".join(f"**{d}**" for d in _deps)
+                    st.warning(_line + ".")
+                for _tbl in sorted(_tbl_only, key=str.lower):
                     _cols = [c for c in _flagged_by_tbl.get(_tbl.strip().lower(), []) if c]
-                    _line = f"**`{_tbl}`** is blocked"
+                    _line = f"Table **`{_tbl}`** is blocked"
                     if _cols:
                         _line += " — likely from column(s): " + ", ".join(f"`{c}`" for c in _cols)
                     st.warning(_line + ".")

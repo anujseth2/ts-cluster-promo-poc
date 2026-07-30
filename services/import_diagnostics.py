@@ -143,16 +143,28 @@ def classify_import_errors(results):
                              "connection": conn.strip()})
         if _DEP_HEADER.search(msg):
             matched = True
-            # Real format (error 14544): "Unable to import tml due to following errors:<br/>
-            #   - <b>TABLE</b>: Deleted columns have dependents.<br/>…<b>SOLUTION:</b>…".
-            # The platform names ONLY the blocked TABLE(s) — never the column or the dependent. So
-            # surface the table; the offending columns are the missing/type findings for the same
-            # table, and the dependents live on the target (the operator removes them there).
-            blocked = [t.strip() for t in
-                       re.findall(r"<b>([^<]+)</b>\s*:\s*Deleted columns have dependents", msg)
-                       if t.strip()]
-            for tbl in (blocked or [r.get("name")]):
-                findings.append({"kind": "drop_blocked_by_dependents", "object": tbl,
+            made = False
+            # Format A (14544): "…- <b>TABLE</b>: Deleted columns have dependents." — names ONLY the
+            # blocked table (no column/dependent). Offending columns = the missing/type findings for
+            # the same table; dependents live on the target (operator removes them there).
+            for tbl in re.findall(r"<b>([^<]+)</b>\s*:\s*Deleted columns have dependents", msg):
+                if tbl.strip():
+                    findings.append({"kind": "drop_blocked_by_dependents", "object": tbl.strip(),
+                                     "columns": [], "dependents": []})
+                    made = True
+            # Format B: "Deleted columns have dependents.<br/>- <b>COLUMN</b><ul><li>DEP</li>…</ul>"
+            # — names the deleted COLUMN and its dependent object(s). Far more actionable.
+            for m in re.finditer(
+                    r"Deleted columns have dependents\.\s*<br/?>\s*-\s*<b>([^<]+)</b>(.*?)</ul>",
+                    msg, re.S):
+                col  = m.group(1).strip()
+                deps = [d.strip() for d in re.findall(r"<li>([^<]+)</li>", m.group(2)) if d.strip()]
+                if col:
+                    findings.append({"kind": "drop_blocked_by_dependents", "object": r.get("name"),
+                                     "column": col, "columns": [col], "dependents": deps})
+                    made = True
+            if not made:
+                findings.append({"kind": "drop_blocked_by_dependents", "object": r.get("name"),
                                  "columns": [], "dependents": []})
         viz_ids = _VIZ_ERR.findall(msg)
         if viz_ids:
