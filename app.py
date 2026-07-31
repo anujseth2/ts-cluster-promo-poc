@@ -489,7 +489,7 @@ for i, (col, label) in enumerate(zip(cols, STEPS)):
     with col:
         if i == step:
             st.markdown(
-                f"<div style='text-align:center;padding:6px 0;border-bottom:3px solid #ff4b4b;"
+                f"<div style='text-align:center;padding:6px 0;border-bottom:3px solid #4a6fa5;"
                 f"font-weight:700;font-size:13px'>{label}</div>",
                 unsafe_allow_html=True,
             )
@@ -2081,6 +2081,7 @@ elif step == 2:
             invalid_formula = [f for f in findings if f["kind"] == "invalid_formula_ids"]
             dangling     = [f for f in findings if f["kind"] == "dangling_ref"]
             drop_table_find = [f for f in findings if f["kind"] == "drop_table"]
+            join_unres   = [f for f in findings if f["kind"] == "join_unresolved"]
             other        = [f for f in findings if f["kind"] == "other"]
 
             # VALIDATE_ONLY reports only the FIRST missing column per table, so the reviewer
@@ -2464,6 +2465,18 @@ elif step == 2:
                         tbl_drop.add(_tn)
                     if f.get("reason") == "disconnected":
                         st.caption(f"   ↳ keep it instead by restoring its join-key column in the target warehouse")
+
+            # ── join cascade: a model join lost the column/table it referenced (downstream) ──
+            if join_unres:
+                st.markdown("#### Model joins to re-resolve (downstream of the drops)")
+                st.caption("These aren't separate problems — a join references a column/table that's "
+                           "being dropped, so it can't translate yet. They clear once the drops "
+                           "above are applied and the model re-validates.")
+                _jt = sorted({t for f in join_unres for t in (f.get("tables") or [])})
+                if _jt:
+                    st.markdown("Affected join(s) on: " + ", ".join(f"`{t}`" for t in _jt))
+                else:
+                    st.caption("(ThoughtSpot didn't name the table — apply the drops and re-validate.)")
 
             # ── anything unrecognised ──
             if other:

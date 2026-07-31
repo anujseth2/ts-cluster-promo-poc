@@ -132,6 +132,14 @@ def test_classify_drop_blocked_column_level_names_column_and_deps():
     assert blocked[0]["dependents"] == ["Respbio Subnational Performance"]
 
 
+def test_classify_join_unresolved_14540_named_table_not_other():
+    err = ("Error while translating <b>1st</b> join of <b>dim_cid_targets_respbio_br</b>. "
+           "<br/>No matches found for table dim_cid_targets_respbio_br.<br/>")
+    f = classify_import_errors([{"name": "unknown", "status": "ERROR", "error": err}])
+    assert [x["kind"] for x in f] == ["join_unresolved"]           # not "other"
+    assert "dim_cid_targets_respbio_br" in f[0]["tables"]
+
+
 def test_classify_invalid_formula_ids():
     err = ("Model/Worksheet columns use invalid formula IDs.<br/>- <b>Bio Pen (COPD)</b>"
            "<ul><li>* formula_Bio Pen (COPD)</li></ul>- <b>Nucala Target Count (HCP)</b>"

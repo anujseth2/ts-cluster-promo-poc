@@ -183,6 +183,17 @@ def classify_import_errors(results):
                       if b.strip() and not b.strip().endswith(":")]
             findings.append({"kind": "invalid_formula_ids",
                              "object": r.get("name"), "formulas": fnames, "error": msg.strip()})
+        if not matched and re.search(r"Error while translating .*? join|No matches found for table",
+                                     msg, re.I):
+            matched = True
+            # 14540: a model join can't resolve because a table/column it references was dropped
+            # (or is otherwise unavailable) — downstream of the missing-column drops. Name the
+            # table(s) whose join broke instead of dumping it into an anonymous "other"/unknown.
+            tbls = sorted({t.strip() for t in
+                           re.findall(r"translating\s+<b>[^<]*</b>\s+join of\s+<b>([^<]+)</b>",
+                                      msg, re.I) if t.strip()})
+            findings.append({"kind": "join_unresolved", "object": r.get("name"),
+                             "tables": tbls, "error": msg.strip()})
         if not matched:
             findings.append({"kind": "other", "object": r.get("name"), "error": msg.strip()})
     return findings

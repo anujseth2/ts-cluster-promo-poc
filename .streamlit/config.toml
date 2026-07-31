@@ -1,0 +1,4 @@
+[theme]
+# Calmer primary than Streamlit's default red (#ff4b4b) — a muted slate-blue.
+# Recolors all primary buttons (Re-discover, Merge & Import, etc.) and accents.
+primaryColor = "#4a6fa5"
