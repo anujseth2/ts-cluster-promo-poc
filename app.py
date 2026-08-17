@@ -540,7 +540,8 @@ if step == 0:
         with st.spinner("Searching the source cluster…"):
             st.session_state.assets = source_client().search_by_tags(
                 team_tags, types=["LIVEBOARD", "ANSWER", "LOGICAL_TABLE"])
-            for key in ("picks", "selected_ids", "dep_info", "_resolved_key", "excluded",
+            for key in ("picks", "selected_ids", "selected_asset_ids", "dep_info",
+                        "_resolved_key", "excluded",
                         "_promo_id2name", "_promo_present", "obj_id_status",
                         "table_alignment", "transformed_items", "import_results", "recon_report",
                         "pre_import_index", "dropped_col_names", "dropped_cols_count",
@@ -576,7 +577,28 @@ if step == 0:
             df = df[df["type"] == type_sel]
 
         st.caption(f"{len(df)} object(s) — click any column header to sort.")
-        df.insert(0, "select", False)
+
+        # Persistent selection across filters (#9): this set is the source of truth. It's seeded
+        # into the checkbox column each rerun and reconciled from the VISIBLE rows, so narrowing the
+        # filter never loses a tick and Clear reliably unticks. Covers EVERY listed type — tables,
+        # models, liveboards, answers — since the list holds all of them.
+        _asel = st.session_state.setdefault("selected_asset_ids", set())
+        _ids_shown = df["id"].tolist()
+        _sa, _sc, _sac, _ = st.columns([1, 1, 1, 3])
+        with _sa:
+            if st.button(f"Select all shown ({len(_ids_shown)})", use_container_width=True,
+                         disabled=not _ids_shown):
+                _asel.update(_ids_shown); st.rerun()
+        with _sc:
+            if st.button("Clear shown", use_container_width=True, disabled=not _ids_shown):
+                for _i in _ids_shown:
+                    _asel.discard(_i)
+                st.rerun()
+        with _sac:
+            if st.button("Clear all", use_container_width=True, disabled=not _asel):
+                _asel.clear(); st.rerun()
+
+        df.insert(0, "select", df["id"].isin(list(_asel)))
         df.insert(0, "S.No", range(1, len(df) + 1))
 
         edited = st.data_editor(
@@ -596,9 +618,27 @@ if step == 0:
             disabled=["S.No", "name", "type", "author", "modified", "created", "tags", "obj_id", "id"],
             use_container_width=True,
             hide_index=True,
+            # Query-scoped key: a fresh editor per filtered view (seeded from _asel) so a stored
+            # edit-delta can't mis-apply to a shifted row after the filter changes.
+            key=f"asset_editor::{flt}::{type_sel}",
         )
 
-        picks       = edited[edited["select"] == True]["id"].tolist()
+        # Reconcile ONLY the visible rows into the persistent set; the selection is the whole set
+        # across filters (not just what's currently shown).
+        for _i in df.index:
+            _rid = df.at[_i, "id"]
+            if bool(edited.at[_i, "select"]):
+                _asel.add(_rid)
+            else:
+                _asel.discard(_rid)
+        picks = sorted(_asel)
+        _sel_shown = sum(1 for i in _ids_shown if i in _asel)
+        _hidden = len(_asel) - _sel_shown
+        if _asel:
+            _cap = f"**{len(_asel)}** object(s) selected"
+            if _hidden > 0:
+                _cap += f" · {_hidden} not shown under the current filter"
+            st.caption(_cap + ".")
         type_by_id  = {a["id"]: a["type"] for a in assets}
         name_by_id  = {a["id"]: a["name"] for a in assets}
         leaf_picks  = [i for i in picks if type_by_id.get(i) in ("LIVEBOARD", "ANSWER")]
