@@ -206,6 +206,21 @@ def _sno(df):
     return out
 
 
+def _display_cols(t):
+    """Columns of a table AS THE OPERATOR SEES THEM: the display name (falling back to the
+    physical db_column_name), named-only, de-duplicated, order-preserved. Used for BOTH the
+    'Source cols' count and the skip/drop lists so the two can never disagree — the historical
+    24-vs-25 mismatch came from counting raw `columns` in one place and a filtered/deduped set
+    in the other."""
+    out, seen = [], set()
+    for c in (t.get("columns") or []):
+        nm = (c.get("name") or c.get("db_column_name") or "").strip()
+        if nm and nm.lower() not in seen:
+            seen.add(nm.lower())
+            out.append(nm)
+    return out
+
+
 def _record_drop(man):
     """Accumulate a drop_columns manifest (columns/vizzes/joins/formulas) into session counters
     for the Import Results report."""
@@ -1620,7 +1635,7 @@ elif step == 2:
             t = d.get("table")
             if not t or not t.get("name"):
                 continue
-            src_n = len(t.get("columns", []) or [])
+            src_n = len(_display_cols(t))   # SAME set the skip/drop lists use → counts always agree
             _key  = t["name"].strip().lower()
             wh    = _wh.get(_key)
             if wh is None:
@@ -1632,6 +1647,10 @@ elif step == 2:
                 "Target warehouse cols": tgt_n if tgt_n is not None else "— (not read)",
                 "Δ": (src_n - tgt_n) if tgt_n is not None else "",
             })
+        # Per-table serial number, in the SAME order _sno() numbers the count table below, so the
+        # dropper and the skip dialog can prefix each table with the number the operator sees here.
+        _tbl_serial = {(r["Table"] or "").strip().lower(): idx + 1
+                       for idx, r in enumerate(_shape_rows)}
         if _shape_rows:
             with st.expander(f"Table column counts — source vs target warehouse ({len(_shape_rows)} table(s))",
                              expanded=False):
@@ -1642,23 +1661,27 @@ elif step == 2:
                 st.dataframe(_sno(pd.DataFrame(_shape_rows)), use_container_width=True, hide_index=True)
 
         # ── Skip specific columns (leave a column out without touching the rest) ──
-        _tbl_cols = {}   # table name -> [column display names]
+        _tbl_cols = {}   # table name -> [column display names]  (shared _display_cols → counts match)
         for i in filtered_items:
             d = _parse_edoc(i.get("edoc", "{}"))
             t = d.get("table")
             if t and t.get("name"):
-                _tbl_cols[t["name"]] = [(c.get("name") or c.get("db_column_name") or "")
-                                        for c in (t.get("columns") or []) if (c.get("name") or c.get("db_column_name"))]
+                _tbl_cols[t["name"]] = _display_cols(t)
         if _tbl_cols:
             _skip_now = st.session_state.get("skip_columns", set())
             with st.expander("Skip specific columns (optional) — leave a column out, keep the rest",
                              expanded=bool(_skip_now)):
                 st.caption("Pick columns to exclude from this promotion. The rest of the table "
-                           "promotes normally; any viz that uses a skipped column is dropped too.")
+                           "promotes normally; any viz that uses a skipped column is dropped too. "
+                           "The number by each table matches its S.No in the count table above.")
                 _picked = set()
-                for _tn, _cols in _tbl_cols.items():
+                # Order tables by their count-table serial so the two views line up row-for-row.
+                for _tn in sorted(_tbl_cols, key=lambda n: _tbl_serial.get(n.strip().lower(), 1e9)):
+                    _cols = _tbl_cols[_tn]
+                    _sn = _tbl_serial.get(_tn.strip().lower())
+                    _lbl = f"{_sn}. `{_tn}` — columns to skip" if _sn else f"`{_tn}` — columns to skip"
                     _sel = st.multiselect(
-                        f"`{_tn}` — columns to skip", options=sorted(_cols),
+                        _lbl, options=sorted(_cols),
                         default=sorted(c for c in _cols if c in _skip_now),
                         key=f"skipcols_{_tn}")
                     _picked.update(_sel)
@@ -2162,71 +2185,117 @@ elif step == 2:
 
             # ── source-extra: a source column the target warehouse doesn't have ──
             if wh_missing:
+                import pandas as pd
                 st.markdown("#### Columns missing from the target warehouse")
                 st.caption(
                     "Referenced by the source but absent from the target warehouse, so the TML "
                     "cannot import as-is. **Default is to keep them** — add the column to the target "
-                    "warehouse, then re-run. Tick a column only to **drop** it from this promotion "
-                    "(along with any visualization that uses it).")
+                    "warehouse, then re-run. Tick **Drop?** on a row only to drop that column from "
+                    "this promotion (along with any visualization that uses it).")
                 st.caption("Checked against the **target connection** (the warehouse itself), so this "
-                           "is the complete set — not one column per re-validate.")
+                           "is the complete set — not one column per re-validate. The **#** column is "
+                           "the table's S.No from the count table above.")
                 if any(not f.get("verified") for f in wh_missing):
-                    st.caption("⚠︎ **unverified** rows are for a table whose warehouse could not be "
-                               "read; they are inferred from the target's modeled columns and may "
-                               "include a column that actually exists in the warehouse. Verify before "
-                               "dropping.")
-                # Select-all: tick/untick every missing-column drop at once.
-                def _toggle_all_wh():
-                    _v = st.session_state.get("selall_wh", False)
-                    for _f in wh_missing:
-                        st.session_state[f"dropwh_{_f['object']}_{_f['column']}"] = _v
-                st.checkbox(f"**Select all** {len(wh_missing)} column(s) to drop",
-                            key="selall_wh", on_change=_toggle_all_wh)
-                drop_set = set()
+                    st.caption("⚠︎ in the **✓** column means that table's warehouse could not be read; "
+                               "the row is inferred from the target's modeled columns and may include a "
+                               "column that actually exists in the warehouse. Verify before dropping.")
+
                 _promo_items = st.session_state.get("transformed_items", [])
-                # Group by table: sort by (table, column) and print a table header when it changes,
-                # so every missing column for a table sits together. `object` is now the real table
-                # name (from the warehouse diff), not "unknown".
-                _last_tbl = None
+                _sel = st.session_state.setdefault("wh_drop_selected", set())
+
+                # One row per missing column — a proper table, not a stack of checkboxes-in-expanders.
+                # Ticking a row no longer collapses anything (the old per-column st.expander reran and
+                # closed on every click); the blast radius is summarised inline in the Dependents
+                # column instead. QUALIFIED key `obj::col` scopes each drop to THIS table's column — a
+                # bare name would strip the column off EVERY table that has it and collapse shared-key
+                # joins (e.g. CID across the bridge tables), gutting the model.
+                _rows = []
                 for f in sorted(wh_missing, key=lambda x: ((x.get("object") or "").lower(),
                                                            (x.get("column") or "").lower())):
-                    _tbl = f.get("object") or "(unresolved table)"
-                    if _tbl != _last_tbl:
-                        st.markdown(f"**`{_tbl}`**")
-                        _last_tbl = _tbl
-                    mark  = "" if f.get("verified") else "⚠︎ unverified · "
-                    if st.checkbox(
-                            f"{mark}Drop  `{f['column']}`   ·   {f['connection']}",
-                            value=False, key=f"dropwh_{f['object']}_{f['column']}"):
-                        # QUALIFIED drop: scope to THIS table's column (obj::col). A bare column
-                        # name drops that column from EVERY table that has it and cascade-removes
-                        # every join keyed on it — e.g. dropping the flagged dim_cid_targets::CID as
-                        # bare "CID" also strips fact_subnational_cid_bridge::CID and collapses all
-                        # six CID joins, gutting the model. Scoping keeps the drop to the one column.
-                        drop_set.add(f"{f['object']}::{f['column']}" if f.get("object") else f["column"])
-                    # Blast radius. Distinguish a real cascade (a join / formula / viz that would
-                    # BREAK) from the trivial case where a model just exposes the column 1:1 (where
-                    # is only "column") — the latter is expected propagation, not extra loss, so it
-                    # reads as a calm one-liner instead of an alarming expander.
-                    usage = column_usage(_promo_items, f["column"])
-                    breaking   = [u for u in usage if any(w != "column" for w in u["where"])]
-                    model_maps = [u for u in usage if u not in breaking]
-                    if breaking:
-                        kinds = {}
-                        for u in breaking:
-                            kinds[u["kind"]] = kinds.get(u["kind"], 0) + 1
-                        summ = ", ".join(f"{n} {k}{'' if n == 1 else 's'}" for k, n in kinds.items())
-                        with st.expander(f"↳ dropping `{f['column']}` breaks {len(breaking)} dependent(s) "
-                                         f"on the source — {summ}"):
-                            for u in breaking:
-                                st.markdown(f"- **{u['kind']}** · {u['name']} — {', '.join(u['where'])}")
-                    elif model_maps:
-                        _nm = ", ".join(u["name"] for u in model_maps)
-                        st.caption(f"↳ dropping `{f['column']}` removes the column (and its mapping in "
-                                   f"{len(model_maps)} model(s): {_nm}); no join/formula/viz depends on it.")
+                    _tbl    = f.get("object") or "(unresolved table)"
+                    _scoped = f"{_tbl}::{f['column']}" if f.get("object") else f["column"]
+                    _deps   = column_dependents(_promo_items, [f["column"]])
+                    _dbits  = []
+                    if _deps.get("joins"):    _dbits.append(f"{len(_deps['joins'])} join(s)")
+                    if _deps.get("formulas"): _dbits.append(f"{len(_deps['formulas'])} formula(s)")
+                    if _deps.get("vizzes"):   _dbits.append(f"{len(_deps['vizzes'])} viz(s)")
+                    _rows.append({
+                        "#":      str(_tbl_serial.get(_tbl.strip().lower(), "")),
+                        "Table":  _tbl,
+                        "Column": f["column"],
+                        "Dependents (source)": ", ".join(_dbits) if _dbits else "none",
+                        "✓":      "✓" if f.get("verified") else "⚠︎",
+                        "Connection": f.get("connection", ""),
+                        "Drop?":  _scoped in _sel,
+                        "_scoped": _scoped,
+                    })
+                _df = pd.DataFrame(_rows)
+
+                # Search (#3) + tick/clear over the shown rows. Selection lives in wh_drop_selected and
+                # is reconciled from the VISIBLE rows only, so filtering never loses a tick.
+                _cs, _cb1, _cb2 = st.columns([3, 1, 1])
+                with _cs:
+                    _q = st.text_input("Filter columns", key="wh_search",
+                                       label_visibility="collapsed",
+                                       placeholder="🔎 Filter by table or column name").strip().lower()
+                if _q:
+                    _mask = _df.apply(lambda r: _q in str(r["Table"]).lower()
+                                      or _q in str(r["Column"]).lower(), axis=1)
+                    _view = _df[_mask]
+                else:
+                    _view = _df
+                with _cb1:
+                    if st.button(f"Tick shown ({len(_view)})", use_container_width=True,
+                                 disabled=_view.empty):
+                        _sel.update(_view["_scoped"].tolist()); st.rerun()
+                with _cb2:
+                    if st.button("Clear shown", use_container_width=True, disabled=_view.empty):
+                        for _sk in _view["_scoped"].tolist(): _sel.discard(_sk)
+                        st.rerun()
+                if _q:
+                    st.caption(f"{len(_view)} of {len(_df)} column(s) match “{_q}”.")
+
+                # Query-scoped key: a fresh editor per filtered view (seeded from _sel) so a stored
+                # edit-delta can't mis-apply to a shifted row after the row set changes.
+                _edited = st.data_editor(
+                    _view.drop(columns=["_scoped"]),
+                    column_config={
+                        "#":      st.column_config.TextColumn("#", width="small",
+                                    help="Matches the S.No in the count table above."),
+                        "Table":  st.column_config.TextColumn("Table", width="medium"),
+                        "Column": st.column_config.TextColumn("Column", width="medium"),
+                        "Dependents (source)": st.column_config.TextColumn(
+                                    "Dependents (source)", width="medium",
+                                    help="What in this promotion references the column — a drop "
+                                         "cascades to these."),
+                        "✓":      st.column_config.TextColumn("✓", width="small",
+                                    help="✓ warehouse-verified · ⚠︎ inferred from modeled columns"),
+                        "Connection": st.column_config.TextColumn("Connection", width="medium"),
+                        "Drop?":  st.column_config.CheckboxColumn("Drop?", width="small",
+                                    help="Tick to drop this column (and any viz that uses it)."),
+                    },
+                    disabled=["#", "Table", "Column", "Dependents (source)", "✓", "Connection"],
+                    hide_index=True, use_container_width=True, key=f"wh_drop_editor::{_q}",
+                )
+                # Reconcile ONLY the visible rows back into the persistent selection.
+                for _i in _view.index:
+                    _sk = _df.at[_i, "_scoped"]
+                    if bool(_edited.at[_i, "Drop?"]):
+                        _sel.add(_sk)
                     else:
-                        st.caption(f"↳ `{f['column']}` has no dependents in the promotion — dropping "
-                                   "it removes only the column.")
+                        _sel.discard(_sk)
+                drop_set = set(_sel)
+                st.caption(f"**{len(drop_set)}** column(s) marked to drop.")
+
+                # #7 — what's already gone this run, shown right here (not only on the next page).
+                _done = st.session_state.get("dropped_col_names", set())
+                if _done:
+                    st.caption("**Already dropped this run:** "
+                               + ", ".join(f"`{c.split('::')[-1]}`" for c in sorted(_done)))
+                _rep = st.session_state.get("_last_drop_report")
+                if _rep:
+                    st.success(_rep)
+
                 # Per-section apply only in the single-pass path. When discovery has run, one
                 # "Apply all" at the bottom handles every section in a single re-validate.
                 if not _discovered and st.button("Apply choices, re-export & re-validate", type="primary"):
@@ -2244,6 +2313,18 @@ elif step == 2:
                             st.session_state.setdefault("prune_tables", set()).update(_emptied)
                         st.session_state.transformed_items = fixed
                         _log_apply_detail("manual_apply", drop_set, _man, _emptied, fixed)
+                        # #8 — name exactly what left: table.column, plus the cascade actually removed.
+                        _names = ", ".join(f"`{s.replace('::', '.')}`" for s in sorted(drop_set))
+                        _casc  = []
+                        if _man.get("joins"):    _casc.append(f"{_man['joins']} join(s)")
+                        if _man.get("formulas"): _casc.append(f"{len(_man['formulas'])} formula(s)")
+                        if _man.get("vizzes"):   _casc.append(f"{_man['vizzes']} viz(s)")
+                        if _emptied:             _casc.append(f"{len(_emptied)} emptied table(s) pruned")
+                        _msg = f"Dropped {len(drop_set)} column(s): {_names}."
+                        if _casc:
+                            _msg += " Cascade removed " + ", ".join(_casc) + "."
+                        st.session_state._last_drop_report = _msg
+                        _sel.clear()   # selection consumed; the columns are gone from wh_missing now
                     filtered_fixed = [i for i in st.session_state.transformed_items
                                       if i.get("info", {}).get("name") not in skip_objects]
                     with st.spinner("Re-committing and re-validating…"):
@@ -2609,9 +2690,12 @@ elif step == 2:
             # ── single "Apply all" — only after discovery produced the complete set ──
             if _discovered:
                 _all_drop = set(fml_drop) | set(dang_drop)   # invalid-formula cols + dangling refs (by name)
-                for f in wh_missing + type_mismatch:
-                    _pre = "dropwh_" if f["kind"] == "missing_in_target_warehouse" else "droptm_"
-                    if st.session_state.get(f"{_pre}{f['object']}_{f['column']}"):
+                # Missing-column ticks now live in the data_editor's persistent selection (already
+                # scoped obj::col), so fold the whole set in. Type-mismatch drops still use their
+                # per-row checkboxes (droptm_…), which are unchanged.
+                _all_drop |= set(st.session_state.get("wh_drop_selected", set()))
+                for f in type_mismatch:
+                    if st.session_state.get(f"droptm_{f['object']}_{f['column']}"):
                         _obj = (f.get("object") or "").strip()
                         _all_drop.add(f"{_obj}::{f['column']}" if _obj else f["column"])
                 _tbl_now = set(tbl_drop)   # whole tables to prune (empty / disconnected)
@@ -2646,6 +2730,7 @@ elif step == 2:
                             # re-validate (connection reset) must not throw away the discovered set.
                             st.session_state.pop("discovered_findings", None)
                             st.session_state.pop("discovered_meta", None)
+                            st.session_state.pop("wh_drop_selected", None)   # ticks consumed
                     if _res:
                         st.rerun()
 
