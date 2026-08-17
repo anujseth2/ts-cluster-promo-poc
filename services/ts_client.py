@@ -446,6 +446,77 @@ class TSClient:
                 return out
         return out
 
+    def connection_column_types(self, connection_identifier: str, tables,
+                                 debug=None, timeout: int = 600) -> Dict[str, Dict[str, str]]:
+        """The WAREHOUSE's physical column TYPE per column, straight from the connection — the CDW
+        side of a 14536 DataType mismatch. Same request as connection_column_cases but captures the
+        column's data type instead of its casing. Returns {name.lower(): {col.lower(): type_str}}.
+
+        NOTE: this is the connection/search COLUMN path, which introspects <catalog>.information_schema
+        and 504s on legacy hive_metastore. For a hive target, read types directly from Databricks
+        (databricks_direct.hive_column_types via DESCRIBE) instead — this method is for warehouses
+        that answer connection/search (Unity Catalog, Snowflake, etc.)."""
+        out: Dict[str, Dict[str, str]] = {}
+        dwos = [{"database": t.get("database", ""), "schema": t.get("schema", ""),
+                 "table": t.get("table", "")} for t in tables if t.get("table")]
+        if not dwos:
+            return out
+        cid, auth = self._connection_meta(connection_identifier)
+        if not cid:
+            return out
+        by_dbtable = {(t.get("table") or "").strip().lower(): t.get("name") for t in tables}
+        candidates = [a for a in (auth, "SERVICE_ACCOUNT", "PERSONAL_ACCESS_TOKEN",
+                                  "OAUTH_WITH_SERVICE_PRINCIPAL", "OAUTH_WITH_PKCE") if a]
+        seen = set(); candidates = [a for a in candidates if not (a in seen or seen.add(a))]
+        for auth_try in candidates:
+            rec = {"auth_type": auth_try, "status": None, "has_objects": False,
+                   "columns_found": 0, "error": None}
+            body = {"connections": [{"identifier": cid, "data_warehouse_objects": dwos}],
+                    "data_warehouse_object_type": "COLUMN", "authentication_type": auth_try,
+                    "record_size": -1, "record_offset": 0}
+            try:
+                resp = self._session.post(f"{self.host}/api/rest/2.0/connection/search",
+                                          json=body, timeout=timeout)
+                rec["status"] = resp.status_code
+                data = resp.json()
+            except (ValueError, requests.RequestException) as e:
+                rec["error"] = str(e)[:200]
+                if debug is not None:
+                    debug.append(rec)
+                continue
+            if isinstance(data, dict) and data.get("error"):
+                rec["error"] = json.dumps(data.get("error"))[:300]
+            rows = data if isinstance(data, list) else [data]
+            found = {}
+            for c in rows:
+                dwo = c.get("data_warehouse_objects") if isinstance(c, dict) else None
+                if not dwo:
+                    continue
+                rec["has_objects"] = True
+                for db in dwo.get("databases", []) or []:
+                    for sch in db.get("schemas", []) or []:
+                        for t in sch.get("tables", []) or []:
+                            ts_name = by_dbtable.get((t.get("name") or "").strip().lower())
+                            if not ts_name:
+                                continue
+                            tmap = {}
+                            for col in t.get("columns", []) or []:
+                                nm = col.get("name")
+                                # field name varies by TS build — coalesce the likely keys
+                                ty = (col.get("type") or col.get("data_type")
+                                      or col.get("column_type") or col.get("dataType"))
+                                if nm and ty:
+                                    tmap[nm.strip().lower()] = str(ty)
+                            if tmap:
+                                found[ts_name.strip().lower()] = tmap
+            rec["columns_found"] = sum(len(v) for v in found.values())
+            if debug is not None:
+                debug.append(rec)
+            if found:
+                out.update(found)
+                return out
+        return out
+
     def table_column_cases(self, table_names) -> Dict[str, Dict[str, str]]:
         """{table_name.lower(): {db_column_name.lower(): actual_db_column_name}} for the named
         tables as they exist on THIS cluster. Used to align a promoted table's column casing to

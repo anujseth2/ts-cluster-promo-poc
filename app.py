@@ -2033,26 +2033,79 @@ elif step == 2:
                         target_docs[td["table"]["name"]] = td
             return silent_drop_findings(src_docs, target_docs)
 
-        def _target_col_types(mismatches):
-            """For each type_mismatch finding, read the target table's ACTUAL type for that
-            column (dev's type is in the error). Returns {(object, column_lower): type}.
-            The target logical table normally mirrors the warehouse; view access suffices."""
-            tgt   = target_client()
-            names = sorted({f["object"] for f in mismatches if f.get("object")})
-            out   = {}
+        def _modeled_col_types(names):
+            """Fallback only: the target LOGICAL table's MODELED type per column (export_tml +
+            column_signature). Mirrors the warehouse when the logical table is fresh, but can be
+            stale — used just for tables the warehouse itself couldn't answer. {name: {col_lower: type}}."""
+            tgt = target_client()
+            out = {}
+            names = sorted({n for n in names if n})
             if not names:
                 return out
             name_to_id = tgt._resolve_names_to_ids(names, "LOGICAL_TABLE")
-            sigs = {}
             if name_to_id:
                 raw    = tgt.export_tml(list(name_to_id.values()))
                 titems = raw if isinstance(raw, list) else raw.get("object", [])
                 for it in titems:
                     td = _parse_edoc(it.get("edoc", "{}"))
                     if "table" in td and td["table"].get("name"):
-                        sigs[td["table"]["name"]] = column_signature(td)
+                        out[td["table"]["name"]] = column_signature(td)
+            return out
+
+        def _target_col_types(mismatches):
+            """The target WAREHOUSE's actual physical type per mismatched column — the CDW side of a
+            14536 DataType mismatch. Reads the warehouse directly: hive_metastore via Databricks
+            DESCRIBE when target DBX creds are set (the connection/search path 504s on hive), else the
+            connection/search COLUMN path (Unity Catalog / Snowflake / …). Falls back to the target
+            logical table's MODELED type for any table the warehouse couldn't answer.
+            Returns {(object, column_lower): {"type": str, "source": "warehouse"|"modeled"}}."""
+            want = {}   # object -> {col_lower, …}
             for f in mismatches:
-                out[(f["object"], f["column"].lower())] = sigs.get(f["object"], {}).get(f["column"].lower(), "")
+                if f.get("object") and f.get("column"):
+                    want.setdefault(f["object"], set()).add(f["column"].lower())
+            if not want:
+                return {}
+
+            # Coordinates (db/schema/db_table) for each mismatched table, captured at export.
+            coord_by_name = {(c.get("name") or "").strip().lower(): c
+                             for c in (st.session_state.get("_promoted_coords") or [])}
+            tbls = [coord_by_name[n.strip().lower()] for n in want
+                    if n.strip().lower() in coord_by_name]
+
+            wh = {}   # name.lower() -> {col_lower: warehouse_type}
+            # 1) hive_metastore direct (authoritative + fast; skips the connection/search 504).
+            _host = opt_env("TS_TARGET_DBX_HOST"); _whid = opt_env("TS_TARGET_DBX_WAREHOUSE")
+            _tok  = opt_env("TS_TARGET_DBX_TOKEN")
+            if tbls and _host and _whid and _tok:
+                try:
+                    from services.databricks_direct import hive_column_types
+                    wh.update(hive_column_types(_host, _whid, _tok, tbls, opt_env("TS_PROXY")))
+                except Exception:
+                    pass
+            # 2) connection/search COLUMN for any table hive didn't cover (non-hive warehouses).
+            _conn = (st.session_state.get("_promoted_tgt_conn")
+                     or teams[team_name].get("target_connection", ""))
+            _rest = [t for t in tbls if (t.get("name") or "").strip().lower() not in wh]
+            if _rest and _conn:
+                try:
+                    wh.update(target_client().connection_column_types(_conn, _rest))
+                except Exception:
+                    pass
+
+            # 3) modeled fallback only for tables no warehouse read could answer.
+            _need_modeled = [n for n in want if n.strip().lower() not in wh]
+            modeled = _modeled_col_types(_need_modeled) if _need_modeled else {}
+
+            out = {}
+            for f in mismatches:
+                obj = f.get("object"); col = (f.get("column") or "")
+                _wt = (wh.get((obj or "").strip().lower(), {}) or {}).get(col.lower())
+                if _wt:
+                    out[(obj, col.lower())] = {"type": _wt, "source": "warehouse"}
+                else:
+                    out[(obj, col.lower())] = {
+                        "type": (modeled.get(obj, {}) or {}).get(col.lower(), ""),
+                        "source": "modeled"}
             return out
 
         def _target_col_usage(mismatches):
@@ -2438,8 +2491,11 @@ elif step == 2:
                     "those too (previewed before you confirm).")
 
                 tm_key = tuple(sorted((f["object"], f["column"]) for f in type_mismatch))
-                if st.session_state.get("_tm_key") != tm_key:
-                    with st.spinner("Reading target types and scanning dependents for this column…"):
+                # _tm_key2: the enrichment shape changed to {type, source}, so a bumped key forces
+                # one clean recompute if an old-shape value lingers in a hot-reloaded session.
+                if st.session_state.get("_tm_key2") != tm_key:
+                    with st.spinner("Reading the target warehouse's column types (CDW) and scanning "
+                                    "dependents…"):
                         # Optional enrichment (target types + what-uses-this-column). It reads/exports
                         # target objects, which can fail if the caller can't SEE them (ThoughtSpot
                         # returns 404 for objects the user has no access to) or the connection is
@@ -2453,16 +2509,22 @@ elif step == 2:
                             st.caption("⚠ Couldn't read target column types / dependents "
                                        f"({str(_e)[:120]}). Showing the mismatch without target "
                                        "detail — often means your user can't see those target objects.")
-                        st.session_state._tm_key    = tm_key
+                        st.session_state._tm_key2   = tm_key
                 tgt_types = st.session_state.get("_tm_types", {})
                 tgt_usage = st.session_state.get("_tm_usage", {})
 
                 tm_drop = set()
                 for f in type_mismatch:
-                    tgt_t = tgt_types.get((f["object"], f["column"].lower()), "")
-                    test_str = f"`{tgt_t.upper()}`" if tgt_t else "`(differs — see warehouse)`"
+                    _ti  = tgt_types.get((f["object"], f["column"].lower())) or {}
+                    tgt_t = _ti.get("type", "")
+                    if tgt_t:
+                        _tag = ("target warehouse" if _ti.get("source") == "warehouse"
+                                else "modeled — warehouse unread")
+                        test_str = f"`{tgt_t.upper()}` _({_tag})_"
+                    else:
+                        test_str = "`(differs — warehouse unread)`"
                     st.markdown(
-                        f"**`{f['column']}`**  ·  {f['object']}  —  dev: `{f['source_type']}`,  test: {test_str}")
+                        f"**`{f['column']}`**  ·  {f['object']}  —  dev: `{f['source_type']}`,  target: {test_str}")
                     st.caption(
                         f"Align the target warehouse: set `{f['column_fqn']}` to `{f['source_type']}` "
                         f"on connection **{f['connection']}** to match dev.")
@@ -2532,7 +2594,7 @@ elif step == 2:
                             st.session_state.validation_errors = err
                             st.session_state.validation_ok     = ok
                             st.session_state.pop("silent_drops", None)
-                            st.session_state.pop("_tm_key", None)
+                            st.session_state.pop("_tm_key2", None)
                     if _res:
                         st.rerun()
 

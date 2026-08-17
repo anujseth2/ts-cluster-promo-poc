@@ -49,6 +49,45 @@ def list_tables(host, warehouse_id, token, catalog, schema, proxy=""):
     return [row[1] for row in ((r.get("result") or {}).get("data_array") or []) if len(row) > 1]
 
 
+def hive_column_types(host, warehouse_id, token, tables, proxy="", debug=None):
+    """Like hive_column_cases, but returns each column's warehouse PHYSICAL TYPE (the CDW side of
+    a 14536 DataType mismatch). SHOW COLUMNS gives names only, so this uses DESCRIBE, whose rows are
+    [col_name, data_type, comment]. Rows from the first blank / '#'-prefixed col_name onward are the
+    partition/metadata section and are ignored. Returns {name.lower(): {col.lower(): type_str}}."""
+    host = (host or "").strip().rstrip("/")
+    if not (host and warehouse_id and token) or not tables:
+        return {}
+    s = _session(token, proxy)
+    out = {}
+    for t in tables:
+        db, sch, tbl = t.get("database", ""), t.get("schema", ""), t.get("table", "")
+        name = t.get("name") or tbl
+        if not tbl:
+            continue
+        fqn = ".".join(x for x in (db, sch, tbl) if x)
+        state, r = _run_statement(s, host, warehouse_id, f"DESCRIBE TABLE {fqn}")
+        rec = {"table": name, "fqn": fqn, "state": state}
+        if state == "SUCCEEDED":
+            tmap = {}
+            for row in ((r.get("result") or {}).get("data_array") or []):
+                if not row:
+                    break
+                cn = (row[0] or "").strip()
+                if not cn or cn.startswith("#"):
+                    break   # partition / detailed-table-info section begins here
+                dt = ((row[1] or "").strip() if len(row) > 1 else "")
+                if cn and dt:
+                    tmap[cn.lower()] = dt
+            if tmap:
+                out[name.strip().lower()] = tmap
+            rec["columns"] = len(tmap)
+        else:
+            rec["error"] = str((r.get("status") or {}).get("error", ""))[:200]
+        if debug is not None:
+            debug.append(rec)
+    return out
+
+
 def hive_column_cases(host, warehouse_id, token, tables, proxy="", debug=None):
     """tables: iterable of {"name" (TS logical name), "database", "schema", "table" (db_table)}.
     For each, run SHOW COLUMNS and map the TS logical name -> the warehouse's true column casing.
