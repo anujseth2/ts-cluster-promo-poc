@@ -221,6 +221,18 @@ def _display_cols(t):
     return out
 
 
+def _gap_label(src_n, tgt_n):
+    """Human-readable column gap for the source-vs-target count table. Avoids a bare negative
+    number (a '-3' reads as a bug); names the direction and always shows a non-negative count."""
+    if tgt_n is None:
+        return ""
+    if src_n > tgt_n:
+        return f"{src_n - tgt_n} in source only"
+    if tgt_n > src_n:
+        return f"{tgt_n - src_n} in target only"
+    return "match"
+
+
 def _record_drop(man):
     """Accumulate a drop_columns manifest (columns/vizzes/joins/formulas) into session counters
     for the Import Results report."""
@@ -1685,7 +1697,7 @@ elif step == 2:
                 "Table": t["name"],
                 "Source cols": src_n,
                 "Target warehouse cols": tgt_n if tgt_n is not None else "— (not read)",
-                "Δ": (src_n - tgt_n) if tgt_n is not None else "",
+                "Gap": _gap_label(src_n, tgt_n),
             })
         # Per-table serial number, in the SAME order _sno() numbers the count table below, so the
         # dropper and the skip dialog can prefix each table with the number the operator sees here.
@@ -1695,9 +1707,11 @@ elif step == 2:
             with st.expander(f"Table column counts — source vs target warehouse ({len(_shape_rows)} table(s))",
                              expanded=False):
                 import pandas as pd
-                st.caption("Δ = source − target warehouse. Positive → source has columns the "
-                           "warehouse lacks (must add or drop). Negative → warehouse has extras the "
-                           "source omits (dropped on the target unless carried through).")
+                st.caption("**Gap** names the direction of the difference. *in source only* → the "
+                           "source references columns the warehouse lacks (add them to the warehouse, "
+                           "or drop them below). *in target only* → the warehouse has columns the "
+                           "source omits (dropped on the target unless carried through). *match* → "
+                           "same count.")
                 st.dataframe(_sno(pd.DataFrame(_shape_rows)), use_container_width=True, hide_index=True)
 
         # ── Skip specific columns (leave a column out without touching the rest) ──
@@ -2367,8 +2381,9 @@ elif step == 2:
                         _sel.clear()   # selection consumed; the columns are gone from wh_missing now
                     filtered_fixed = [i for i in st.session_state.transformed_items
                                       if i.get("info", {}).get("name") not in skip_objects]
-                    with st.spinner("Re-committing and re-validating…"):
-                        _res = _safe_validate(filtered_fixed)
+                    with st.status("Re-committing & re-validating…", expanded=True) as _rv:
+                        _res = _safe_validate(filtered_fixed, step=lambda _m: _rv.write(_m))
+                        _rv.update(state=("complete" if _res else "error"), expanded=False)
                         if _res:
                             pr_url, err, ok = _res
                             st.session_state.pr_url            = pr_url
@@ -2508,8 +2523,9 @@ elif step == 2:
                         st.session_state.setdefault("dropped_col_names", set()).update(tm_drop)
                     filtered_fixed = [i for i in st.session_state.transformed_items
                                       if i.get("info", {}).get("name") not in skip_objects]
-                    with st.spinner("Re-committing and re-validating…"):
-                        _res = _safe_validate(filtered_fixed)
+                    with st.status("Re-committing & re-validating…", expanded=True) as _rv:
+                        _res = _safe_validate(filtered_fixed, step=lambda _m: _rv.write(_m))
+                        _rv.update(state=("complete" if _res else "error"), expanded=False)
                         if _res:
                             pr_url, err, ok = _res
                             st.session_state.pr_url            = pr_url
@@ -2540,8 +2556,9 @@ elif step == 2:
                         st.session_state.setdefault("dropped_col_names", set()).update(fml_drop)
                     filtered_fixed = [i for i in st.session_state.transformed_items
                                       if i.get("info", {}).get("name") not in skip_objects]
-                    with st.spinner("Re-committing and re-validating…"):
-                        _res = _safe_validate(filtered_fixed)
+                    with st.status("Re-committing & re-validating…", expanded=True) as _rv:
+                        _res = _safe_validate(filtered_fixed, step=lambda _m: _rv.write(_m))
+                        _rv.update(state=("complete" if _res else "error"), expanded=False)
                         if _res:
                             pr_url, err, ok = _res
                             st.session_state.pr_url            = pr_url
@@ -2716,8 +2733,9 @@ elif step == 2:
                         st.session_state.pop("discovered_meta", None)
                         _ff = [i for i in st.session_state.transformed_items
                                if i.get("info", {}).get("name") not in st.session_state["skip_objects"]]
-                        with st.spinner("Re-committing and re-validating…"):
-                            _res = _safe_validate(_ff)
+                        with st.status("Re-committing & re-validating…", expanded=True) as _rv:
+                            _res = _safe_validate(_ff, step=lambda _m: _rv.write(_m))
+                            _rv.update(state=("complete" if _res else "error"), expanded=False)
                             if _res:
                                 pr_url, err, ok = _res
                                 st.session_state.pr_url            = pr_url
@@ -2758,8 +2776,9 @@ elif step == 2:
                         st.session_state.setdefault("prune_tables", set()).update(_tbl_now)
                     filtered_fixed = [i for i in st.session_state.transformed_items
                                       if i.get("info", {}).get("name") not in skip_objects]
-                    with st.spinner("Re-committing and re-validating…"):
-                        _res = _safe_validate(filtered_fixed)
+                    with st.status("Re-committing & re-validating…", expanded=True) as _rv:
+                        _res = _safe_validate(filtered_fixed, step=lambda _m: _rv.write(_m))
+                        _rv.update(state=("complete" if _res else "error"), expanded=False)
                         if _res:
                             pr_url, err, ok = _res
                             st.session_state.pr_url            = pr_url
