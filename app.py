@@ -1013,6 +1013,8 @@ if step == 0:
 
 elif step == 1:
     st.subheader("obj_id Health Check")
+    st.caption("⏱ Matching tables against the target reads the target cluster; the first run after "
+               "a cold Databricks warehouse can take a minute or two — a spinner means it's working.")
     # NOTE: we do NOT clear the export here just for visiting this page — that would throw away
     # Git Operations progress on mere navigation (Home / breadcrumb). Instead, the obj_id/align
     # actions below set `_objids_dirty`, and Git Operations re-exports only when that flag is set
@@ -1421,6 +1423,9 @@ elif step == 1:
 
 elif step == 2:
     st.subheader("TML Validation")
+    st.caption("⏱ This step reads columns from the warehouse and validates the TML against it. "
+               "A **cold Databricks SQL warehouse can take a minute or two** to wake and respond — "
+               "warm it first for a faster run; a spinner/status box means it's working, not hung.")
 
     selected_ids = st.session_state.get("selected_ids", [])
 
