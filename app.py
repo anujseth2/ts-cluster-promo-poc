@@ -2113,6 +2113,53 @@ elif step == 2:
                         "source": "modeled"}
             return out
 
+        def _source_col_types(mismatches):
+            """The SOURCE CDW's physical type per mismatched column — read straight from the source
+            warehouse. hive_metastore via Databricks DESCRIBE when TS_SOURCE_DBX_* creds are set
+            (mirrors the target read; hive 504s connection/search), else the source connection/search
+            COLUMN path. Source coordinates come from the RAW source export (_source_raw_items),
+            pre-remap, so the read hits the source db/schema/db_table — not the target-remapped ones.
+            Returns {(object, column_lower): type_str}  (empty string when the warehouse couldn't be read)."""
+            want = {}
+            for f in mismatches:
+                if f.get("object") and f.get("column"):
+                    want.setdefault(f["object"], set()).add(f["column"].lower())
+            if not want:
+                return {}
+            # Source coordinates from the raw source TML (db / schema / db_table before any remap).
+            coord_by_name = {}
+            for it in st.session_state.get("_source_raw_items", []):
+                t = _parse_edoc(it.get("edoc", "{}")).get("table") or {}
+                if t.get("name"):
+                    coord_by_name[t["name"].strip().lower()] = {
+                        "name": t["name"], "database": t.get("db", ""),
+                        "schema": t.get("schema", ""), "table": t.get("db_table", "")}
+            tbls = [coord_by_name[n.strip().lower()] for n in want
+                    if n.strip().lower() in coord_by_name]
+
+            wh = {}   # name.lower() -> {col_lower: source_warehouse_type}
+            _host = opt_env("TS_SOURCE_DBX_HOST"); _whid = opt_env("TS_SOURCE_DBX_WAREHOUSE")
+            _tok  = opt_env("TS_SOURCE_DBX_TOKEN")
+            if tbls and _host and _whid and _tok:
+                try:
+                    from services.databricks_direct import hive_column_types
+                    wh.update(hive_column_types(_host, _whid, _tok, tbls, opt_env("TS_PROXY")))
+                except Exception:
+                    pass
+            _conn = teams[team_name].get("source_connection", "")
+            _rest = [t for t in tbls if (t.get("name") or "").strip().lower() not in wh]
+            if _rest and _conn:
+                try:
+                    wh.update(source_client().connection_column_types(_conn, _rest))
+                except Exception:
+                    pass
+            out = {}
+            for f in mismatches:
+                obj = f.get("object"); col = (f.get("column") or "")
+                out[(obj, col.lower())] = (wh.get((obj or "").strip().lower(), {})
+                                           or {}).get(col.lower(), "")
+            return out
+
         def _target_col_usage(mismatches):
             """Column-PRECISE target impact. Stage 1: table-level dependents (one call).
             Stage 2: export those objects + scan each for the actual column reference.
@@ -2487,52 +2534,70 @@ elif step == 2:
 
             # ── type drift: column exists on both sides, types differ ──
             if type_mismatch:
-                st.markdown("#### Column type mismatches (warehouse drift)")
+                st.markdown("#### Column type mismatches")
                 st.caption(
-                    "These columns exist on both clusters but the **target warehouse**'s physical "
-                    "type differs from dev's. **Dev is the source of truth**, so the fix is to align "
-                    "the target warehouse to dev — not to alter the promoted content. Dropping is a "
-                    "last resort; if a join/formula depends on the column, dropping cascade-removes "
-                    "those too (previewed before you confirm).")
+                    "The column's data type disagrees across **source CDW · source TML · target CDW** "
+                    "(all three shown below). These are **flagged, never auto-corrected** — the tool "
+                    "will not silently change a type to force the import through. Fix it at the data "
+                    "layer (align the warehouse / model), then re-run. Dropping is a last resort; if a "
+                    "join/formula depends on the column, dropping cascade-removes those too (previewed "
+                    "before you confirm).")
 
                 tm_key = tuple(sorted((f["object"], f["column"]) for f in type_mismatch))
                 # _tm_key2: the enrichment shape changed to {type, source}, so a bumped key forces
                 # one clean recompute if an old-shape value lingers in a hot-reloaded session.
                 if st.session_state.get("_tm_key2") != tm_key:
-                    with st.spinner("Reading the target warehouse's column types (CDW) and scanning "
-                                    "dependents…"):
-                        # Optional enrichment (target types + what-uses-this-column). It reads/exports
-                        # target objects, which can fail if the caller can't SEE them (ThoughtSpot
-                        # returns 404 for objects the user has no access to) or the connection is
-                        # unreachable. Never let it crash the page — degrade to no detail.
+                    with st.spinner("Reading the source & target warehouse column types (CDW) and "
+                                    "scanning dependents… a cold warehouse can take a minute or two."):
+                        # Optional enrichment (source + target warehouse types + what-uses-this-column).
+                        # Reads warehouses / exports target objects, which can fail (a 404 on objects the
+                        # user can't see, a cold/unreachable connection). Never let it crash the page —
+                        # each read is best-effort and degrades to "(warehouse unread)".
                         try:
-                            st.session_state._tm_types = _target_col_types(type_mismatch)
-                            st.session_state._tm_usage = _target_col_usage(type_mismatch)
+                            st.session_state._tm_types     = _target_col_types(type_mismatch)
+                            st.session_state._tm_src_types = _source_col_types(type_mismatch)
+                            st.session_state._tm_usage     = _target_col_usage(type_mismatch)
                         except Exception as _e:
-                            st.session_state._tm_types = {}
-                            st.session_state._tm_usage = {}
-                            st.caption("⚠ Couldn't read target column types / dependents "
-                                       f"({str(_e)[:120]}). Showing the mismatch without target "
-                                       "detail — often means your user can't see those target objects.")
+                            st.session_state._tm_types     = {}
+                            st.session_state._tm_src_types = {}
+                            st.session_state._tm_usage     = {}
+                            st.caption("⚠ Couldn't read warehouse column types / dependents "
+                                       f"({str(_e)[:120]}). Showing the mismatch without warehouse "
+                                       "detail — often means the connection is cold or your user can't "
+                                       "see those objects.")
                         st.session_state._tm_key2   = tm_key
                 tgt_types = st.session_state.get("_tm_types", {})
+                src_types = st.session_state.get("_tm_src_types", {})
                 tgt_usage = st.session_state.get("_tm_usage", {})
 
+                _tnorm = lambda s: "".join((s or "").lower().split())   # loose compare for display
                 tm_drop = set()
                 for f in type_mismatch:
-                    _ti  = tgt_types.get((f["object"], f["column"].lower())) or {}
+                    _ti   = tgt_types.get((f["object"], f["column"].lower())) or {}
                     tgt_t = _ti.get("type", "")
+                    src_cdw = src_types.get((f["object"], f["column"].lower()), "")
+                    src_tml = f.get("source_type", "")
+                    # 3-way: source CDW · source TML · target CDW (whichever we could read).
+                    _sc = f"`{src_cdw.upper()}`" if src_cdw else "`(warehouse unread)`"
+                    _st_ = f"`{src_tml}`" if src_tml else "`(?)`"
                     if tgt_t:
-                        _tag = ("target warehouse" if _ti.get("source") == "warehouse"
-                                else "modeled — warehouse unread")
-                        test_str = f"`{tgt_t.upper()}` _({_tag})_"
+                        _tag = "" if _ti.get("source") == "warehouse" else " ⚠modeled"
+                        _tc = f"`{tgt_t.upper()}`{_tag}"
                     else:
-                        test_str = "`(differs — warehouse unread)`"
+                        _tc = "`(warehouse unread)`"
                     st.markdown(
-                        f"**`{f['column']}`**  ·  {f['object']}  —  dev: `{f['source_type']}`,  target: {test_str}")
-                    st.caption(
-                        f"Align the target warehouse: set `{f['column_fqn']}` to `{f['source_type']}` "
-                        f"on connection **{f['connection']}** to match dev.")
+                        f"⚠️ **`{f['column']}`**  ·  {f['object']}  —  "
+                        f"source CDW: {_sc}  ·  source TML: {_st_}  ·  target CDW: {_tc}")
+                    # Where's the divergence? Only assert it on values we actually read (loose compare).
+                    if src_cdw and _tnorm(src_cdw) != _tnorm(src_tml):
+                        st.caption(f"↳ source model is out of sync with its own warehouse "
+                                   f"(TML `{src_tml}` vs source CDW `{src_cdw.upper()}`) — a real gap; "
+                                   "fix the source model/warehouse.")
+                    if src_cdw and tgt_t and _tnorm(src_cdw) != _tnorm(tgt_t):
+                        st.caption(f"↳ the two warehouses differ (source CDW `{src_cdw.upper()}` vs "
+                                   f"target CDW `{tgt_t.upper()}`).")
+                    st.caption("Flagged, not auto-corrected — align the type at the data layer, "
+                               "then re-run.")
 
                     deps = column_dependents(st.session_state.transformed_items, [f["column"]])
                     bits = []
