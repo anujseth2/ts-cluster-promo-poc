@@ -2138,15 +2138,20 @@ elif step == 2:
                     if n.strip().lower() in coord_by_name]
 
             wh = {}   # name.lower() -> {col_lower: source_warehouse_type}
-            _host = opt_env("TS_SOURCE_DBX_HOST"); _whid = opt_env("TS_SOURCE_DBX_WAREHOUSE")
-            _tok  = opt_env("TS_SOURCE_DBX_TOKEN")
+            # Source DBX creds — fall back to the TARGET creds for now (Anuj: "source == target,
+            # will separate later"). When the source warehouse is genuinely distinct, set the
+            # TS_SOURCE_DBX_* vars and this uses them without a code change.
+            _host = opt_env("TS_SOURCE_DBX_HOST") or opt_env("TS_TARGET_DBX_HOST")
+            _whid = opt_env("TS_SOURCE_DBX_WAREHOUSE") or opt_env("TS_TARGET_DBX_WAREHOUSE")
+            _tok  = opt_env("TS_SOURCE_DBX_TOKEN") or opt_env("TS_TARGET_DBX_TOKEN")
             if tbls and _host and _whid and _tok:
                 try:
                     from services.databricks_direct import hive_column_types
                     wh.update(hive_column_types(_host, _whid, _tok, tbls, opt_env("TS_PROXY")))
                 except Exception:
                     pass
-            _conn = teams[team_name].get("source_connection", "")
+            _conn = (teams[team_name].get("source_connection", "")
+                     or teams[team_name].get("target_connection", ""))
             _rest = [t for t in tbls if (t.get("name") or "").strip().lower() not in wh]
             if _rest and _conn:
                 try:
