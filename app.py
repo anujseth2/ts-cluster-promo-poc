@@ -2165,6 +2165,42 @@ elif step == 2:
                                            or {}).get(col.lower(), "")
             return out
 
+        def _read_source_col_map():
+            """The SOURCE warehouse's column SET (names) for every promoted table, so the TML can be
+            diffed against it (columns present in the TML but gone from the source CDW). hive SHOW
+            COLUMNS via the source DBX creds (falling back to target for now), else source
+            connection/search. Source coordinates come from the raw source export, pre-remap.
+            Returns {table_lower: {col_lower: actual_case}} — same shape as the target map."""
+            coord_by_name = {}
+            for it in st.session_state.get("_source_raw_items", []):
+                t = _parse_edoc(it.get("edoc", "{}")).get("table") or {}
+                if t.get("name"):
+                    coord_by_name[t["name"].strip().lower()] = {
+                        "name": t["name"], "database": t.get("db", ""),
+                        "schema": t.get("schema", ""), "table": t.get("db_table", "")}
+            tbls = list(coord_by_name.values())
+            out = {}
+            if not tbls:
+                return out
+            _host = opt_env("TS_SOURCE_DBX_HOST") or opt_env("TS_TARGET_DBX_HOST")
+            _whid = opt_env("TS_SOURCE_DBX_WAREHOUSE") or opt_env("TS_TARGET_DBX_WAREHOUSE")
+            _tok  = opt_env("TS_SOURCE_DBX_TOKEN") or opt_env("TS_TARGET_DBX_TOKEN")
+            if _host and _whid and _tok:
+                try:
+                    from services.databricks_direct import hive_column_cases
+                    out.update(hive_column_cases(_host, _whid, _tok, tbls, opt_env("TS_PROXY")))
+                except Exception:
+                    pass
+            _conn = (teams[team_name].get("source_connection", "")
+                     or teams[team_name].get("target_connection", ""))
+            _rest = [t for t in tbls if (t.get("name") or "").strip().lower() not in out]
+            if _rest and _conn:
+                try:
+                    out.update(source_client().connection_column_cases(_conn, _rest))
+                except Exception:
+                    pass
+            return out
+
         def _target_col_usage(mismatches):
             """Column-PRECISE target impact. Stage 1: table-level dependents (one call).
             Stage 2: export those objects + scan each for the actual column reference.
@@ -2210,6 +2246,108 @@ elif step == 2:
                     return t.get("name") or db_table
             obj = f.get("object")
             return obj if obj and obj != "unknown" else (db_table or obj)
+
+        # ── SOURCE-FIRST CHECK: columns absent from the SOURCE warehouse (flag + approve) ──
+        # GSK 2026-08-18: validate against the source CDW. A promoted column the SOURCE warehouse no
+        # longer has (out-of-sync TML — dropped on the CDW side, e.g. "Opus Priority Account") can't
+        # be trusted. Per Anuj it is NEVER dropped silently — surface it here and require a tick +
+        # Apply. A table the source read couldn't cover is simply skipped (no false positives).
+        import pandas as pd
+        _sc_head, _sc_btn = st.columns([3, 2])
+        with _sc_head:
+            st.markdown("**Source warehouse check**")
+            if st.session_state.get("_source_col_map"):
+                st.caption(f"✅ Read {len(st.session_state['_source_col_map'])} source table(s) — "
+                           "columns below are in the promotion but not in the source warehouse.")
+            else:
+                st.caption("Surface promoted columns that no longer exist in the **source** CDW "
+                           "(out-of-sync TML) — flagged for approval, never dropped automatically.")
+        with _sc_btn:
+            if st.button("🔌 Check against source warehouse", disabled=not filtered_items,
+                         help="Reads the source warehouse column set (source DBX creds, falling "
+                              "back to target for now) and diffs the promotion against it."):
+                with st.status("Reading the source warehouse… a cold warehouse can take a minute "
+                               "or two.", expanded=True) as _ss:
+                    _sm = _read_source_col_map()
+                    _ss.update(label=f"Source warehouse read — {len(_sm)} table(s) resolved.",
+                               state=("complete" if _sm else "error"), expanded=False)
+                st.session_state._source_col_map = _sm
+                st.rerun()
+
+        _src_map = st.session_state.get("_source_col_map") or {}
+        if _src_map:
+            _src_missing = warehouse_missing_findings(
+                st.session_state.get("transformed_items", []), _src_map,
+                connection=(teams[team_name].get("source_connection", "")
+                            or teams[team_name].get("target_connection", "")))
+            for _f in _src_missing:
+                _f["kind"] = "missing_in_source_warehouse"
+            if not _src_missing:
+                st.caption("✔ No promoted column is missing from the source warehouse.")
+            else:
+                st.warning(f"{len(_src_missing)} promoted column(s) are **absent from the source "
+                           "warehouse** (out-of-sync TML). Tick to drop — nothing drops until you Apply.")
+                _ssel = st.session_state.setdefault("src_drop_selected", set())
+                _srows = []
+                for _f in sorted(_src_missing, key=lambda x: ((x.get("object") or "").lower(),
+                                                              (x.get("column") or "").lower())):
+                    _tbl = _f.get("object") or "(table)"
+                    _sk  = f"{_tbl}::{_f['column']}" if _f.get("object") else _f["column"]
+                    _srows.append({"Table": _tbl, "Column": _f["column"],
+                                   "Drop?": _sk in _ssel, "_scoped": _sk})
+                _sdf = pd.DataFrame(_srows)
+                _sq  = st.text_input("Filter source-absent", key="src_search",
+                                     label_visibility="collapsed",
+                                     placeholder="🔎 Filter by table or column name").strip().lower()
+                _sview = _sdf
+                if _sq:
+                    _sview = _sdf[_sdf.apply(lambda r: _sq in str(r["Table"]).lower()
+                                             or _sq in str(r["Column"]).lower(), axis=1)]
+                _sed = st.data_editor(
+                    _sview.drop(columns=["_scoped"]),
+                    column_config={
+                        "Table":  st.column_config.TextColumn("Table", width="medium"),
+                        "Column": st.column_config.TextColumn("Column", width="medium"),
+                        "Drop?":  st.column_config.CheckboxColumn("Drop?", width="small",
+                                    help="Tick to drop this out-of-sync column from the promotion."),
+                    },
+                    disabled=["Table", "Column"], hide_index=True, use_container_width=True,
+                    key=f"src_drop_editor::{_sq}")
+                for _i in _sview.index:
+                    _sk = _sdf.at[_i, "_scoped"]
+                    if bool(_sed.at[_i, "Drop?"]):
+                        _ssel.add(_sk)
+                    else:
+                        _ssel.discard(_sk)
+                st.caption(f"**{len(_ssel)}** source-absent column(s) approved to drop. "
+                           "(Also applied by the discovery **Apply all** below.)")
+                if st.button("Apply source drops, re-export & re-validate", disabled=not _ssel):
+                    _sdrop = set(_ssel)
+                    fixed, _man = drop_columns(st.session_state.transformed_items, _sdrop)
+                    _record_drop(_man)
+                    st.session_state.setdefault("dropped_col_names", set()).update(_sdrop)
+                    _emptied = {ff["table"] for ff in table_cleanup_findings(fixed)}
+                    if _emptied:
+                        fixed, _ts = _prune_tables_whole(fixed, _emptied)
+                        st.session_state.setdefault("prune_tables", set()).update(_emptied)
+                    st.session_state.transformed_items = fixed
+                    _log_apply_detail("source_missing_apply", _sdrop, _man, _emptied, fixed)
+                    _ssel.clear()
+                    st.session_state.pop("_source_col_map", None)   # stale after a drop; re-read on demand
+                    _ff = [i for i in st.session_state.transformed_items
+                           if i.get("info", {}).get("name") not in skip_objects]
+                    with st.status("Re-committing & re-validating…", expanded=True) as _rv:
+                        _res = _safe_validate(_ff, step=lambda _m: _rv.write(_m))
+                        _rv.update(state=("complete" if _res else "error"), expanded=False)
+                        if _res:
+                            pr_url, err, ok = _res
+                            st.session_state.pr_url            = pr_url
+                            st.session_state.validation_errors = err
+                            st.session_state.validation_ok     = ok
+                            st.session_state.pop("silent_drops", None)
+                    if _res:
+                        st.rerun()
+        st.divider()
 
         # ── Stage 1: Export → commit/PR → discover ALL issues in one action ─────
         # No separate single-validate step: the primary button commits the TML + opens the PR,
@@ -2889,6 +3027,8 @@ elif step == 2:
                 # scoped obj::col), so fold the whole set in. Type-mismatch drops still use their
                 # per-row checkboxes (droptm_…), which are unchanged.
                 _all_drop |= set(st.session_state.get("wh_drop_selected", set()))
+                # Source-absent columns approved in the source-warehouse check drop here too.
+                _all_drop |= set(st.session_state.get("src_drop_selected", set()))
                 for f in type_mismatch:
                     if st.session_state.get(f"droptm_{f['object']}_{f['column']}"):
                         _obj = (f.get("object") or "").strip()
@@ -2927,6 +3067,8 @@ elif step == 2:
                             st.session_state.pop("discovered_findings", None)
                             st.session_state.pop("discovered_meta", None)
                             st.session_state.pop("wh_drop_selected", None)   # ticks consumed
+                            st.session_state.pop("src_drop_selected", None)
+                            st.session_state.pop("_source_col_map", None)    # stale after drops
                     if _res:
                         st.rerun()
 

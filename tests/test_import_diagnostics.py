@@ -255,6 +255,27 @@ def test_warehouse_missing_no_map_skips(commerce_table_item):
     assert warehouse_missing_findings([commerce_table_item], {}, fallback_map={}) == []
 
 
+# ── Increment 2: the SAME diff pointed at the SOURCE warehouse map (out-of-sync TML) ──
+
+def _tbl_item(name, cols):
+    doc = {"table": {"name": name, "db": "d", "schema": "s", "db_table": name,
+                     "columns": [{"db_column_name": c} for c in cols]}}
+    return {"edoc": json.dumps(doc)}
+
+
+def test_source_absent_flags_only_out_of_sync_column_case_insensitively():
+    # respbio_fact has an out-of-sync column (opus_priority_account) gone from the source CDW;
+    # CID (upper in TML) matches cid in the warehouse case-insensitively and must NOT be flagged;
+    # a table the source read couldn't cover (ghost) is skipped -> no false positive.
+    items = [_tbl_item("respbio_fact", ["amount", "opus_priority_account"]),
+             _tbl_item("dim_cid", ["CID"]),
+             _tbl_item("ghost", ["x"])]
+    src_map = {"respbio_fact": {"amount": "amount"}, "dim_cid": {"cid": "cid"}}
+    found = warehouse_missing_findings(items, src_map, connection="src")
+    assert sorted((f["object"], f["column"]) for f in found) == \
+        [("respbio_fact", "opus_priority_account")]
+
+
 # ── friendly_error (humanised messages) ─────────────────────────────────────────
 
 def test_friendly_error_suspended_warehouse():
