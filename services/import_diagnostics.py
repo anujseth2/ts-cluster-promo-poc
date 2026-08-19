@@ -708,8 +708,16 @@ def drop_columns(items, columns):
                         # column is targeted (not a same-named column on another table).
                         _qual_hit = ("::" in cid
                                      and (cid.split("::")[0], cid.split("::")[-1]) in removed_qual)
-                        if (_col_name(c) in targets or surfaces_removed_formula or dn in removed
-                                or _qual_hit):
+                        # A PHYSICAL, table-backed model column (column_id `table::col`) may drop ONLY
+                        # via a bare `targets` hit or its own `_qual_hit` — NOT via `dn in removed`.
+                        # `removed` accumulates the display name of every dropped column for the leaf/
+                        # formula cascade; for a shared name like HCP_ID that bare match would drop the
+                        # same-named column off a DIFFERENT table/model (whose own column wasn't
+                        # targeted). Only formula/derived columns (no physical `table::col` id) use the
+                        # bare display-name cascade.
+                        _is_physical = ("::" in cid and not cid.startswith("formula_"))
+                        if (_col_name(c) in targets or surfaces_removed_formula or _qual_hit
+                                or (dn in removed and not _is_physical)):
                             man["columns"] += 1
                             man["column_names"].append(c.get("name") or _col_name(c))
                             if dn and dn not in removed:
@@ -717,10 +725,16 @@ def drop_columns(items, columns):
                         else:
                             keep.append(c)
                     node["columns"] = keep
-            # Joins whose `on` condition references a removed name.
+            # Joins whose `on` condition references a removed COLUMN. A join's `on` is written with
+            # table-qualified physical refs ([table::COL]), never model display names — so match it
+            # ONLY against the explicit bare drops (`targets`) and the qualified set (`removed_qual`),
+            # NOT the accumulated `removed`. `removed` picks up the DISPLAY NAME of every dropped
+            # column (for the leaf/viz cascade); for a shared join key like HCP_ID that bare name would
+            # otherwise match [otherTable::HCP_ID] on EVERY table and wrongly sever every HCP_ID join
+            # from a single scoped drop — disconnecting the model.
             for mt in (node.get("model_tables") or node.get("tables") or []):
                 if mt.get("joins"):
-                    _kept_j = [j for j in mt["joins"] if not _refs_any(j, removed, removed_qual)]
+                    _kept_j = [j for j in mt["joins"] if not _refs_any(j, targets, removed_qual)]
                     for j in mt["joins"]:
                         if j not in _kept_j:
                             man["join_names"].append(

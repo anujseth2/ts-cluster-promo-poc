@@ -226,6 +226,45 @@ def test_drop_columns_bare_still_hits_all_tables():
     assert {c["column_id"] for c in m["columns"]} == set()     # both A::X and B::X gone
 
 
+def test_drop_qualified_shared_join_key_keeps_unrelated_joins():
+    # THE HCP_ID bug: a shared join key whose model DISPLAY name equals the physical ref tail.
+    # Dropping tableA::HCP_ID must NOT sever the tableB<->tableC join on HCP_ID (a different table).
+    # The earlier qualified test used distinct display names ("A X"/"B X") and so missed this.
+    model = {"model": {"name": "M",
+        "columns": [{"name": "HCP_ID", "column_id": "tablea::hcp_id"}],
+        "model_tables": [
+            {"name": "tableA", "joins": [{"name": "j_AC", "on": "[tableA::HCP_ID] = [tableC::HCP_ID]"}]},
+            {"name": "tableB", "joins": [{"name": "j_BC", "on": "[tableB::HCP_ID] = [tableC::HCP_ID]"}]}]}}
+    tbl = lambda n: {"table": {"name": n, "columns": [{"name": "HCP_ID", "db_column_name": "HCP_ID"}]}}
+    items = [{"edoc": json.dumps(model), "info": {"name": "M"}}] + \
+            [{"edoc": json.dumps(tbl(n)), "info": {"name": n}} for n in ("tableA", "tableB", "tableC")]
+    fixed, man = drop_columns(items, {"tableA::HCP_ID"})
+    m = json.loads(fixed[0]["edoc"])["model"]
+    joins = {j["name"] for mt in m["model_tables"] for j in mt.get("joins", [])}
+    assert joins == {"j_BC"}          # only tableA's join gone; tableB<->tableC survives
+    cols = {json.loads(fixed[i]["edoc"])["table"]["name"]:
+            [c["db_column_name"] for c in json.loads(fixed[i]["edoc"])["table"]["columns"]]
+            for i in (1, 2, 3)}
+    assert cols["tableA"] == [] and cols["tableB"] == ["HCP_ID"] and cols["tableC"] == ["HCP_ID"]
+
+
+def test_drop_qualified_does_not_touch_same_name_column_in_other_model():
+    # Two models each surface HCP_ID from their OWN table. Dropping tableA::HCP_ID (model MA) must
+    # not drop model MB's HCP_ID column (which surfaces tableB, untargeted) via the shared name.
+    mA = {"model": {"name": "MA", "columns": [{"name": "HCP_ID", "column_id": "tablea::hcp_id"}],
+          "model_tables": [{"name": "tableA", "joins": [{"name": "jA", "on": "[tableA::HCP_ID] = [tableC::HCP_ID]"}]}]}}
+    mB = {"model": {"name": "MB", "columns": [{"name": "HCP_ID", "column_id": "tableb::hcp_id"}],
+          "model_tables": [{"name": "tableB", "joins": [{"name": "jB", "on": "[tableB::HCP_ID] = [tableC::HCP_ID]"}]}]}}
+    tbl = lambda n: {"table": {"name": n, "columns": [{"name": "HCP_ID", "db_column_name": "HCP_ID"}]}}
+    items = [{"edoc": json.dumps(mA), "info": {"name": "MA"}},
+             {"edoc": json.dumps(mB), "info": {"name": "MB"}}] + \
+            [{"edoc": json.dumps(tbl(n)), "info": {"name": n}} for n in ("tableA", "tableB", "tableC")]
+    fixed, man = drop_columns(items, {"tableA::HCP_ID"})
+    mb = json.loads(fixed[1]["edoc"])["model"]
+    assert [c["column_id"] for c in mb["columns"]] == ["tableb::hcp_id"]   # MB's HCP_ID untouched
+    assert {j["name"] for mt in mb["model_tables"] for j in mt.get("joins", [])} == {"jB"}
+
+
 def test_classify_unrecognised_is_other():
     f = classify_import_errors([{"name": "x", "status": "ERROR", "error": "kaboom"}])
     assert f[0]["kind"] == "other" and f[0]["error"] == "kaboom"
