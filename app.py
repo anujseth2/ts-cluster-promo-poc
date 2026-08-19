@@ -559,7 +559,10 @@ if step == 0:
                         "pre_import_index", "dropped_col_names", "dropped_cols_count",
                         "dropped_vizs_count", "prune_summary",
                         "_fb_previews", "feedback_mode", "ack_replace", "fb_replace_report",
-                        "_include_feedback", "_export_fb_state"):
+                        "_include_feedback", "_export_fb_state",
+                        # source-CDW validation state (Increments 2 & 3) — reset for new content
+                        "recase_approved", "_recase_applied_set", "_recase_events",
+                        "_source_col_map", "src_drop_selected", "wh_drop_selected"):
                 st.session_state.pop(key, None)
 
     assets = st.session_state.get("assets", [])
@@ -1568,6 +1571,17 @@ elif step == 2:
                             _recase_events.append({"table": _rtn, "from": _rdbn, "to": _rtgt})
             st.session_state._recase_events = _recase_events
             st.session_state._source_raw_items = [dict(it) for it in items]
+            # APPROVE-FIRST recasing (Anuj 2026-08-18: no silent mutations). Nothing is recased until
+            # the operator approves it in the "Column recasing" panel — the transform sees only the
+            # APPROVED subset of the (full) warehouse casing map. Empty approval set → no recasing, so
+            # unapproved columns keep their source casing. `_column_case_map` stays the FULL map (other
+            # consumers — the missing-column fallback — need it).
+            _rapproved = st.session_state.get("recase_approved", set())
+            applied_case_map = {
+                _t: {_c: _case for _c, _case in (_cols or {}).items()
+                     if f"{_t}::{_c}" in _rapproved}
+                for _t, _cols in column_case_map.items()}
+            st.session_state._recase_applied_set = set(_rapproved)
             st.write("③ Applying the data-layer transform (connection remap, obj_ids, column casing)…")
             transformed_items, warnings = transform_items(
                 items,
@@ -1576,7 +1590,7 @@ elif step == 2:
                 db_map=teams[team_name].get("db_map", {}),
                 schema_map=teams[team_name].get("schema_map", {}),
                 table_remap=st.session_state.get("table_remap", {}),
-                column_case_map=column_case_map,
+                column_case_map=applied_case_map,
             )
             # Prune any tables the user chose to drop out of the model (not-on-target excludes).
             prune = st.session_state.get("prune_tables", set())
@@ -1753,6 +1767,66 @@ elif step == 2:
                                "dropped_cols_count", "dropped_vizs_count"):
                         st.session_state.pop(_k, None)
                     st.rerun()
+
+        # ── APPROVE-FIRST COLUMN RECASING (no silent mutations) ──
+        # The warehouse stores some columns under a different casing than the source TML (e.g. CID vs
+        # cid). Recasing aligns db_column_name to the warehouse's ACTUAL casing so it binds. Per Anuj
+        # this is NEVER applied silently: every proposed recasing is surfaced and applied only on
+        # approval + Apply. Until then the column keeps its source casing (and may fail to bind).
+        _recase_props = st.session_state.get("_recase_events") or []
+        if _recase_props:
+            _rapp = st.session_state.setdefault("recase_approved", set())
+            _applied_set = st.session_state.get("_recase_applied_set", set())
+            _pending = _rapp != _applied_set
+            _hdr = (f"Column recasing — {len(_recase_props)} proposed, {len(_rapp)} approved"
+                    + ("  ·  ⚠ not yet applied" if _pending else ""))
+            with st.expander(_hdr, expanded=bool(_pending or not _applied_set)):
+                st.caption("Approve a recasing to align the promoted `db_column_name` to the "
+                           "warehouse's **actual** casing (upper/lower/mixed — read live, never "
+                           "assumed). Nothing is recased until you approve and Apply; an unapproved "
+                           "column keeps its source casing and may fail to bind on import.")
+                import pandas as pd
+                _rrows = []
+                for _e in sorted(_recase_props, key=lambda x: (x["table"].lower(), x["from"].lower())):
+                    _sk = f"{_e['table'].strip().lower()}::{_e['from'].strip().lower()}"
+                    _rrows.append({"Table": _e["table"], "From": _e["from"], "To": _e["to"],
+                                   "Approve?": _sk in _rapp, "_sk": _sk})
+                _rdf = pd.DataFrame(_rrows)
+                _ba, _bc = st.columns([1, 1])
+                with _ba:
+                    if st.button(f"Approve all ({len(_rdf)})", key="recase_all",
+                                 use_container_width=True):
+                        _rapp.update(_rdf["_sk"].tolist()); st.rerun()
+                with _bc:
+                    if st.button("Clear all", key="recase_clear", disabled=not _rapp,
+                                 use_container_width=True):
+                        _rapp.clear(); st.rerun()
+                _red = st.data_editor(
+                    _rdf.drop(columns=["_sk"]),
+                    column_config={
+                        "Table":    st.column_config.TextColumn("Table", width="medium"),
+                        "From":     st.column_config.TextColumn("From (source)", width="medium"),
+                        "To":       st.column_config.TextColumn("To (warehouse)", width="medium"),
+                        "Approve?": st.column_config.CheckboxColumn("Approve?", width="small",
+                                      help="Tick to recase this column to the warehouse casing."),
+                    },
+                    disabled=["Table", "From", "To"], hide_index=True,
+                    use_container_width=True, key="recase_editor")
+                for _i in _rdf.index:
+                    _sk = _rdf.at[_i, "_sk"]
+                    if bool(_red.at[_i, "Approve?"]):
+                        _rapp.add(_sk)
+                    else:
+                        _rapp.discard(_sk)
+                if _rapp != _applied_set:
+                    st.warning(f"{len(_rapp)} recasing(s) approved but not yet applied to the bundle.")
+                    if st.button("Apply recasings & re-export", type="primary", key="recase_apply"):
+                        st.session_state.pop("transformed_items", None)
+                        for _k in ("pr_url", "validation_errors", "validation_ok"):
+                            st.session_state.pop(_k, None)
+                        st.rerun()
+                elif _rapp:
+                    st.caption(f"✅ {len(_rapp)} recasing(s) applied to the bundle.")
 
         def _run_validation(items, step=None):
             """Commit items to dev, create/update PR, validate models from dev. Returns (pr_url, errors, ok).
@@ -3519,13 +3593,16 @@ elif step == 4:
                 if dropped_vizs:
                     st.markdown(f"**Visualizations dropped:** {dropped_vizs}")
 
-        # What the promotion recased to match the target warehouse (otherwise a silent change).
-        _recases = st.session_state.get("_recase_events") or []
+        # What the promotion recased to match the warehouse — only the APPROVED recasings that were
+        # actually applied (approve-first; proposals the operator didn't approve aren't listed here).
+        _applied_recase = st.session_state.get("_recase_applied_set", set())
+        _recases = [r for r in (st.session_state.get("_recase_events") or [])
+                    if f"{r['table'].strip().lower()}::{r['from'].strip().lower()}" in _applied_recase]
         if _recases:
-            with st.expander(f"Recased to match the target warehouse ({len(_recases)} column(s))",
+            with st.expander(f"Recased to match the warehouse ({len(_recases)} column(s), approved)",
                              expanded=True):
-                st.caption("Physical column names auto-adjusted to the warehouse's exact casing so "
-                           "the TML binds on import. Logical column names are unchanged.")
+                st.caption("Physical column names aligned to the warehouse's exact casing (approved "
+                           "in the recasing panel) so the TML binds on import. Logical names unchanged.")
                 _rc = pd.DataFrame([{"Table": r["table"], "From": r["from"], "To": r["to"]}
                                     for r in _recases])
                 st.dataframe(_sno(_rc), use_container_width=True, hide_index=True)

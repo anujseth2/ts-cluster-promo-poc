@@ -31,6 +31,15 @@ def test_transform_recases_db_column_name_only(make_table_doc):
     assert col["name"] == "revenue"               # logical name untouched
 
 
+def test_transform_no_recase_when_map_empty(make_table_doc):
+    # Approve-first (Increment 3): with no approved recasings the map is empty, so the physical
+    # db_column_name keeps its SOURCE casing — nothing is recased silently.
+    doc = make_table_doc(columns=[("revenue", "DOUBLE")])
+    src_case = doc["table"]["columns"][0]["db_column_name"]
+    out, _ = transform_doc(doc, column_case_map={})
+    assert out["table"]["columns"][0]["db_column_name"] == src_case
+
+
 def test_transform_preserves_obj_id(commerce_table_doc):
     out, _ = transform_doc(commerce_table_doc)
     assert out["obj_id"] == "commerce_tbl"        # identity carried cross-cluster
