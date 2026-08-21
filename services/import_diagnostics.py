@@ -794,22 +794,47 @@ def column_drop_cascade(items, columns):
 
 _WH_TO_TS_TYPE = {
     "boolean": "BOOL", "bool": "BOOL",
-    "tinyint": "INT64", "smallint": "INT64", "int": "INT64", "integer": "INT64",
+    # 32-bit ints map to INT32 (the TML uses INT32 for these); only 64-bit -> INT64.
+    "tinyint": "INT32", "smallint": "INT32", "int": "INT32", "integer": "INT32",
     "bigint": "INT64", "long": "INT64",
-    "float": "DOUBLE", "double": "DOUBLE", "real": "DOUBLE",
+    "float": "FLOAT", "double": "DOUBLE", "real": "DOUBLE",
     "string": "VARCHAR", "text": "VARCHAR",
     "date": "DATE",
     "timestamp": "DATE_TIME", "timestamp_ntz": "DATE_TIME", "datetime": "DATE_TIME",
 }
 
+# Coarse type FAMILY. Type mismatches only BLOCK the import across families (string vs number vs
+# bool vs date — a 14536 hard-fail); within a family (INT32 vs INT64, FLOAT vs DOUBLE) the platform
+# only WARNS and imports fine. So flagging is family-level to avoid false positives like "INT vs
+# INT32". Covers both warehouse strings (bigint, string, …) and TS tokens (INT32, VARCHAR, …).
+_TYPE_FAMILY = {
+    "tinyint": "num", "smallint": "num", "int": "num", "integer": "num", "bigint": "num",
+    "long": "num", "float": "num", "double": "num", "real": "num", "decimal": "num", "numeric": "num",
+    "int16": "num", "int32": "num", "int64": "num",
+    "string": "str", "varchar": "str", "char": "str", "text": "str",
+    "boolean": "bool", "bool": "bool",
+    "date": "date", "timestamp": "date", "timestamp_ntz": "date", "datetime": "date",
+    "date_time": "date", "time": "date",
+}
+
+
+def type_family(t):
+    """Coarse family (num/str/bool/date/void) for a warehouse type OR a TS token; "" if unknown.
+    Precision is stripped, so decimal(10,2) -> decimal -> num and varchar(255) -> varchar -> str."""
+    t = (t or "").strip().lower()
+    if not t:
+        return ""
+    if t == "void":
+        return "void"
+    return _TYPE_FAMILY.get(t.split("(")[0].strip(), "")
+
 
 def warehouse_type_to_ts(wh_type):
     """Map a warehouse (Databricks) physical type to the ThoughtSpot TML `data_type` TOKEN that
-    represents it (e.g. bigint -> INT64, string -> VARCHAR). TML data_type is a TS enum, NOT the raw
-    warehouse string — writing 'bigint' is rejected ('Data type bigint is not valid'). Returns "" for
-    anything we can't confidently map (e.g. Databricks 'void'), so the caller offers NO realign there
-    — you cannot realign to a type that isn't real. Verified TS tokens: INT64/DOUBLE/VARCHAR/BOOL/
-    DATE/DATE_TIME."""
+    represents it (int -> INT32, bigint -> INT64, string -> VARCHAR, …). TML data_type is a TS enum,
+    NOT the raw warehouse string — writing 'bigint' is rejected ('Data type bigint is not valid').
+    Returns "" for anything we can't confidently map (e.g. Databricks 'void') so the caller offers no
+    realign there. Tokens: INT32/INT64/DOUBLE/FLOAT/VARCHAR/BOOL/DATE/DATE_TIME."""
     t = (wh_type or "").strip().lower()
     if not t:
         return ""
@@ -826,12 +851,11 @@ def warehouse_type_findings(items, type_map, connection=""):
     (the type whack-a-mole). `type_map` = {table_lower: {col_lower: warehouse_type_string}} (e.g. from
     hive DESCRIBE). Returns type_mismatch findings in the same shape as classify_import_errors.
 
-    Conservative to avoid false positives: a column is flagged ONLY when the warehouse type maps to a
-    real TS token that differs from the TML's token, OR the warehouse type is VOID (unusable). A type
-    we can't map (unknown) is NOT flagged — we can't assert a mismatch. A column absent from the map
-    is skipped (that's a MISSING case, handled elsewhere)."""
-    def _n(s):
-        return "".join((s or "").lower().split())
+    Flags a column ONLY on a CROSS-FAMILY difference (string vs number vs bool vs date) — the case
+    that actually hard-fails import (14536) — or when the warehouse type is VOID (unusable). A
+    within-family difference (INT vs INT32, FLOAT vs DOUBLE) is NOT flagged: the platform only warns
+    and imports fine, and treating it as a mismatch produced false positives like 'INT vs INT32'. An
+    unknown type on either side, or a column absent from the map, is skipped."""
     out = []
     for item in items:
         try:
@@ -854,8 +878,9 @@ def warehouse_type_findings(items, type_map, connection=""):
             if cdw_t is None:
                 continue   # not in the warehouse -> MISSING, not a type mismatch
             tml_t = ((c.get("db_column_properties") or {}).get("data_type") or "").strip()
-            cdw_ts = warehouse_type_to_ts(cdw_t)
-            _flag = (cdw_ts and _n(cdw_ts) != _n(tml_t)) or (not cdw_ts and _n(cdw_t) == "void")
+            _cf, _tf = type_family(cdw_t), type_family(tml_t)
+            # cross-family (real 14536 blocker) or an unusable VOID warehouse type; NOT within-family
+            _flag = _cf == "void" or (_cf and _tf and _cf != _tf)
             if _flag:
                 out.append({
                     "kind": "type_mismatch",

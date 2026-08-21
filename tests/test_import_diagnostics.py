@@ -342,6 +342,8 @@ def test_warehouse_type_findings_skips_unread_table():
 def test_warehouse_type_to_ts_tokens():
     from services.import_diagnostics import warehouse_type_to_ts
     assert warehouse_type_to_ts("bigint") == "INT64"      # the HCP_ID case — NOT literal 'bigint'
+    assert warehouse_type_to_ts("int") == "INT32"         # 32-bit int -> INT32, NOT INT64
+    assert warehouse_type_to_ts("integer") == "INT32"
     assert warehouse_type_to_ts("BIGINT") == "INT64"      # case-insensitive
     assert warehouse_type_to_ts("string") == "VARCHAR"
     assert warehouse_type_to_ts("boolean") == "BOOL"
@@ -350,6 +352,21 @@ def test_warehouse_type_to_ts_tokens():
     assert warehouse_type_to_ts("timestamp") == "DATE_TIME"
     assert warehouse_type_to_ts("void") == ""             # not a real type -> no realign
     assert warehouse_type_to_ts("") == ""
+
+
+def test_type_family_and_within_family_not_flagged():
+    from services.import_diagnostics import type_family, warehouse_type_findings
+    # int / INT32 / bigint are all the same family -> within-family, must NOT be a mismatch
+    assert type_family("int") == type_family("INT32") == type_family("bigint") == "num"
+    assert type_family("varchar(255)") == "str" and type_family("decimal(10,2)") == "num"
+    assert type_family("void") == "void" and type_family("weird") == ""
+    # warehouse INT vs TML INT32 (both number) -> NOT flagged (the false-positive we fixed);
+    # warehouse bigint vs TML VARCHAR (number vs string) -> flagged (real, HCP_ID case).
+    doc = {"table": {"name": "t", "db": "d", "schema": "s", "db_table": "t", "columns": [
+        {"db_column_name": "call_date", "db_column_properties": {"data_type": "INT32"}},
+        {"db_column_name": "hcp_id",    "db_column_properties": {"data_type": "VARCHAR"}}]}}
+    found = warehouse_type_findings([{"edoc": json.dumps(doc)}], {"t": {"call_date": "int", "hcp_id": "bigint"}})
+    assert [f["column"] for f in found] == ["hcp_id"]
 
 
 def test_realign_ignores_bare_and_empty():

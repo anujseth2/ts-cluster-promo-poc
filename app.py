@@ -27,7 +27,7 @@ from services.import_diagnostics import (
     classify_import_errors, drop_columns, silent_drop_findings, column_dependents, column_usage,
     drop_vizzes, table_drop_preview, drop_tables, warehouse_missing_findings, friendly_error,
     column_drop_cascade, finding_key, dangling_reference_findings, table_cleanup_findings,
-    realign_column_types, warehouse_type_to_ts, warehouse_type_findings,
+    realign_column_types, warehouse_type_to_ts, warehouse_type_findings, type_family,
 )
 from services.table_matcher import column_signature
 from services.feedback_replace import feedback_preview, replace_prep, replace_finalize
@@ -2973,6 +2973,13 @@ elif step == 2:
                             "Drop?":      _scoped in _tmsel,
                             "_scoped":    _scoped,
                         })
+                        continue
+                    # Only CROSS-FAMILY differences block the import (string vs number vs bool vs
+                    # date). Within a family (INT vs INT32, FLOAT vs DOUBLE) the platform just warns
+                    # and imports fine — skip it so e.g. INT/INT32/INT never shows as a mismatch.
+                    _whfam  = type_family(tgt_t) or type_family(src_cdw)
+                    _tmlfam = type_family(src_tml)
+                    if _whfam and _tmlfam and _whfam == _tmlfam:
                         continue
                     _agree = bool(src_cdw and tgt_t and _tnorm(src_cdw) == _tnorm(tgt_t))
                     # REALIGN only when both warehouses agree on a real type and the TML is the stale
