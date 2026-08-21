@@ -2417,11 +2417,15 @@ elif step == 2:
         # then loops VALIDATE_ONLY (on a throwaway copy) until clean, surfacing every issue at
         # once. It never touches the connection/search COLUMN path that 504s.
         _dm = st.session_state.get("discovered_meta")
-        _lbl = "🔎 Re-discover all issues" if _dm else "🔎 Export & discover all issues"
+        st.caption("One dry-run validation: it writes the TML to the dev branch, opens the PR, and "
+                   "checks it against the target **without importing**, surfacing every issue in one "
+                   "pass. Fix what it flags and re-validate here; the actual merge and import happen "
+                   "in Step 3.")
+        _lbl = "🔎 Re-validate against target" if _dm else "🔎 Validate against target"
         if st.button(_lbl, type="primary", disabled=not filtered_items,
-                     help="Commits the TML + opens the PR, then validates a throwaway copy "
-                          "repeatedly until clean — surfacing every issue at once."):
-            with st.status("Committing & discovering all issues…", expanded=True) as _disc:
+                     help="Commits the TML + opens the PR, then dry-run validates against the target "
+                          "repeatedly until it stops finding new issues. Nothing is imported."):
+            with st.status("Committing & validating against the target…", expanded=True) as _disc:
                 try:
                     st.write("Committing TML + opening the PR…")
                     _gc = git_client()
@@ -2439,7 +2443,7 @@ elif step == 2:
             _rtail = {"clean": " · validated clean",
                       "no_progress": " · stopped before clean (remaining errors can't be auto-resolved)",
                       "request_failed": " · stopped: connection to the target failed — warm the warehouse and retry"}
-            st.caption(f"Discovery: {len(st.session_state.get('discovered_findings', []))} issue(s) "
+            st.caption(f"Validation: {len(st.session_state.get('discovered_findings', []))} issue(s) "
                        f"over {_dm['passes']} pass(es)" + _rtail.get(_dm.get("reason", ""), ""))
 
         # Raw validation run log — so consecutive runs are diffable (which files were validated,
