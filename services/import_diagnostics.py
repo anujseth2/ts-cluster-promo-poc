@@ -820,6 +820,54 @@ def warehouse_type_to_ts(wh_type):
     return _WH_TO_TS_TYPE.get(t, "")
 
 
+def warehouse_type_findings(items, type_map, connection=""):
+    """ONE-PASS type diff: every promoted column whose TML `data_type` disagrees with the warehouse's
+    physical type, surfaced all at once instead of relying on VALIDATE_ONLY's one-per-round 14536
+    (the type whack-a-mole). `type_map` = {table_lower: {col_lower: warehouse_type_string}} (e.g. from
+    hive DESCRIBE). Returns type_mismatch findings in the same shape as classify_import_errors.
+
+    Conservative to avoid false positives: a column is flagged ONLY when the warehouse type maps to a
+    real TS token that differs from the TML's token, OR the warehouse type is VOID (unusable). A type
+    we can't map (unknown) is NOT flagged — we can't assert a mismatch. A column absent from the map
+    is skipped (that's a MISSING case, handled elsewhere)."""
+    def _n(s):
+        return "".join((s or "").lower().split())
+    out = []
+    for item in items:
+        try:
+            doc = _parse_edoc(item)
+        except Exception:
+            continue
+        t = (doc or {}).get("table")
+        if not t or not t.get("name"):
+            continue
+        wh = type_map.get(t["name"].strip().lower())
+        if not wh:
+            continue
+        db, sch = t.get("db", ""), t.get("schema", "")
+        phys = t.get("db_table") or t.get("name")
+        for c in t.get("columns", []) or []:
+            dbn = (c.get("db_column_name") or c.get("name") or "").strip()
+            if not dbn:
+                continue
+            cdw_t = wh.get(dbn.lower())
+            if cdw_t is None:
+                continue   # not in the warehouse -> MISSING, not a type mismatch
+            tml_t = ((c.get("db_column_properties") or {}).get("data_type") or "").strip()
+            cdw_ts = warehouse_type_to_ts(cdw_t)
+            _flag = (cdw_ts and _n(cdw_ts) != _n(tml_t)) or (not cdw_ts and _n(cdw_t) == "void")
+            if _flag:
+                out.append({
+                    "kind": "type_mismatch",
+                    "object": t["name"],
+                    "column": dbn,
+                    "column_fqn": ".".join(x for x in (db, sch, phys, dbn) if x),
+                    "source_type": tml_t,
+                    "connection": (t.get("connection") or {}).get("name") or connection,
+                })
+    return out
+
+
 def realign_column_types(items, realign):
     """Approve-first TYPE realignment: set a column's declared data_type to a new value so it
     matches the CDW (fixing a 14536 DataType mismatch), instead of dropping the column. This is

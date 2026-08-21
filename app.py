@@ -27,7 +27,7 @@ from services.import_diagnostics import (
     classify_import_errors, drop_columns, silent_drop_findings, column_dependents, column_usage,
     drop_vizzes, table_drop_preview, drop_tables, warehouse_missing_findings, friendly_error,
     column_drop_cascade, finding_key, dangling_reference_findings, table_cleanup_findings,
-    realign_column_types, warehouse_type_to_ts,
+    realign_column_types, warehouse_type_to_ts, warehouse_type_findings,
 )
 from services.table_matcher import column_signature
 from services.feedback_replace import feedback_preview, replace_prep, replace_finalize
@@ -615,7 +615,7 @@ if step == 0:
                         "recase_approved", "_recase_applied_set", "_recase_events",
                         "_source_col_map", "src_drop_selected", "wh_drop_selected",
                         "tm_drop_selected", "tm_realign_selected", "_tm_realign_to",
-                        "_target_modeled_map"):
+                        "_tm_target_full", "_tm_source_full", "_target_modeled_map"):
                 st.session_state.pop(key, None)
 
     assets = st.session_state.get("assets", [])
@@ -2200,6 +2200,10 @@ elif step == 2:
                     wh.update(target_client().connection_column_types(_conn, _rest))
                 except Exception:
                     pass
+            # Stash the FULL per-table warehouse type map (all columns of the mismatched tables, as
+            # DESCRIBE/connection returns them) so the one-pass type diff can flag every mismatched
+            # column in those tables at once — not one per re-validate.
+            st.session_state._tm_target_full = wh
 
             # 3) modeled fallback only for tables no warehouse read could answer.
             _need_modeled = [n for n in want if n.strip().lower() not in wh]
@@ -2262,6 +2266,7 @@ elif step == 2:
                     wh.update(source_client().connection_column_types(_conn, _rest))
                 except Exception:
                     pass
+            st.session_state._tm_source_full = wh   # full per-table source type map (for the 3-way row)
             out = {}
             for f in mismatches:
                 obj = f.get("object"); col = (f.get("column") or "")
@@ -2789,8 +2794,22 @@ elif step == 2:
                             st.caption("⚠ Couldn't read warehouse column types "
                                        f"({str(_e)[:120]}). Showing dev's type only.")
                         st.session_state._tm_key2 = tm_key
-                tgt_types = st.session_state.get("_tm_types", {})
-                src_types = st.session_state.get("_tm_src_types", {})
+                # Full per-table warehouse type maps (all columns of the mismatched tables) — read once
+                # by the enrichment above. The row's target/source type reads from these, so the
+                # ONE-PASS findings below (columns validate hasn't reported yet) also resolve.
+                _tfull = st.session_state.get("_tm_target_full") or {}
+                _sfull = st.session_state.get("_tm_source_full") or {}
+
+                # ONE-PASS type check: flag EVERY type-mismatched column in the already-read tables,
+                # not just the one VALIDATE_ONLY reported this round. Kills the type whack-a-mole.
+                if _tfull:
+                    _seen_tm = {(f.get("object"), (f.get("column") or "").lower()) for f in type_mismatch}
+                    for _op in warehouse_type_findings(
+                            st.session_state.get("transformed_items", []), _tfull,
+                            connection=teams[team_name].get("target_connection", "")):
+                        _k = (_op.get("object"), (_op.get("column") or "").lower())
+                        if _k not in _seen_tm:
+                            type_mismatch.append(_op); _seen_tm.add(_k)
 
                 _tnorm = lambda s: "".join((s or "").lower().split())   # loose compare
                 _tmsel   = st.session_state.setdefault("tm_drop_selected", set())
@@ -2807,9 +2826,8 @@ elif step == 2:
                     _scoped = f"{obj}::{col}" if f.get("object") else col
                     if _scoped in _already_gone or col in _already_gone:
                         continue
-                    _ti = tgt_types.get((f.get("object"), col.lower())) or {}
-                    tgt_t = _ti.get("type", "")
-                    src_cdw = src_types.get((f.get("object"), col.lower()), "")
+                    tgt_t   = (_tfull.get((obj or "").strip().lower()) or {}).get(col.lower(), "")
+                    src_cdw = (_sfull.get((obj or "").strip().lower()) or {}).get(col.lower(), "")
                     src_tml = f.get("source_type", "")
                     # VOID: the warehouse has NO usable type for this column. It can't bind and can't
                     # be realigned — it is NOT a type mismatch. Route it to its own drop table so it
@@ -2840,14 +2858,13 @@ elif step == 2:
                         _issue = "types differ — realign only when both warehouses agree; else drop"
                     if _ralign:
                         _realign_to[_scoped] = _ralign
-                    _tag = "" if _ti.get("source") == "warehouse" else " (modeled)"
                     _rows.append({
                         "#":          str(_tbl_serial.get(obj.strip().lower(), "")),
                         "Table":      obj,
                         "Column":     col,
                         "Source CDW": src_cdw.upper() if src_cdw else "(unread)",
                         "Source TML": src_tml or "(?)",
-                        "Target CDW": (tgt_t.upper() + _tag) if tgt_t else "(unread)",
+                        "Target CDW": tgt_t.upper() if tgt_t else "(unread)",
                         "Issue":      _issue,
                         "Realign to": _ralign if _ralign else "—",
                         "Realign?":   _scoped in _tmrsel,
@@ -2945,8 +2962,7 @@ elif step == 2:
                         "Source CDW": st.column_config.TextColumn("Source CDW", width="small"),
                         "Source TML": st.column_config.TextColumn("Source TML", width="small"),
                         "Target CDW": st.column_config.TextColumn("Target CDW", width="small",
-                                        help="'(modeled)' = read from the target's logical table, "
-                                             "not the warehouse."),
+                                        help="The target warehouse's physical type for this column."),
                         "Issue":      st.column_config.TextColumn("Issue", width="medium"),
                         "Realign to": st.column_config.TextColumn("Realign to", width="small",
                                         help="The TS type token a realign would set on the TML. Only "

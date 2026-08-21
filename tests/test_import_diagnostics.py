@@ -317,6 +317,28 @@ def test_realign_column_types_sets_scoped_type_only():
     assert a == "BIGINT" and b == "VARCHAR"      # scoped: tableB untouched
 
 
+def test_warehouse_type_findings_one_pass():
+    from services.import_diagnostics import warehouse_type_findings
+    doc = {"table": {"name": "t", "db": "d", "schema": "s", "db_table": "t", "columns": [
+        {"db_column_name": "hcp_id", "db_column_properties": {"data_type": "VARCHAR"}},   # stale -> flag
+        {"db_column_name": "amount", "db_column_properties": {"data_type": "DOUBLE"}},    # matches -> ok
+        {"db_column_name": "opas",   "db_column_properties": {"data_type": "VARCHAR"}},   # void -> flag
+        {"db_column_name": "extra",  "db_column_properties": {"data_type": "VARCHAR"}},   # not in wh -> skip
+    ]}}
+    type_map = {"t": {"hcp_id": "bigint", "amount": "double", "opas": "void"}}
+    found = warehouse_type_findings([{"edoc": json.dumps(doc)}], type_map, connection="c")
+    cols = sorted(f["column"] for f in found)
+    assert cols == ["hcp_id", "opas"]          # amount matches (double==DOUBLE); extra not in warehouse
+    assert all(f["kind"] == "type_mismatch" and f["source_type"] for f in found)
+
+
+def test_warehouse_type_findings_skips_unread_table():
+    from services.import_diagnostics import warehouse_type_findings
+    doc = {"table": {"name": "t", "columns": [
+        {"db_column_name": "x", "db_column_properties": {"data_type": "VARCHAR"}}]}}
+    assert warehouse_type_findings([{"edoc": json.dumps(doc)}], {}) == []   # table not in map -> nothing
+
+
 def test_warehouse_type_to_ts_tokens():
     from services.import_diagnostics import warehouse_type_to_ts
     assert warehouse_type_to_ts("bigint") == "INT64"      # the HCP_ID case — NOT literal 'bigint'
