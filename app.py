@@ -221,15 +221,15 @@ def _display_cols(t):
     return out
 
 
-def _gap_label(src_n, tgt_n):
-    """Human-readable column gap for the source-vs-target count table. Avoids a bare negative
-    number (a '-3' reads as a bug); names the direction and always shows a non-negative count."""
-    if tgt_n is None:
-        return ""
-    if src_n > tgt_n:
-        return f"{src_n - tgt_n} in source only"
-    if tgt_n > src_n:
-        return f"{tgt_n - src_n} in target only"
+def _gap_label(promoted_n, modeled_n):
+    """Human-readable column delta between what the promotion carries and the target's MODELED
+    table. Not the physical warehouse size. Avoids a bare negative number (a '-3' reads as a bug)."""
+    if modeled_n is None:
+        return "new on target"
+    if promoted_n > modeled_n:
+        return f"+{promoted_n - modeled_n} added to target model"
+    if modeled_n > promoted_n:
+        return f"{modeled_n - promoted_n} in target model, not promoted"
     return "match"
 
 
@@ -562,7 +562,8 @@ if step == 0:
                         "_include_feedback", "_export_fb_state",
                         # source-CDW validation state (Increments 2 & 3) — reset for new content
                         "recase_approved", "_recase_applied_set", "_recase_events",
-                        "_source_col_map", "src_drop_selected", "wh_drop_selected"):
+                        "_source_col_map", "src_drop_selected", "wh_drop_selected",
+                        "_target_modeled_map"):
                 st.session_state.pop(key, None)
 
     assets = st.session_state.get("assets", [])
@@ -1521,6 +1522,11 @@ elif step == 2:
                 column_case_map = target_client().table_column_cases(names)
             except Exception:
                 column_case_map = {}
+            # Snapshot the target's MODELED columns (the logical table as it exists on test right now)
+            # BEFORE the hive merge widens the map to the full physical set. The shape display compares
+            # the promotion to THIS — "what got promoted vs what the target model has" — not the
+            # physical warehouse count (which is far larger and reads like the column count exploded).
+            st.session_state._target_modeled_map = {_t: dict(_c) for _t, _c in column_case_map.items()}
             # Hive_metastore casing (authoritative, direct). ThoughtSpot's connection/search 504s on
             # hive_metastore because it introspects columns via <catalog>.information_schema, which
             # hive lacks. So for a hive target we read the true casing straight from Databricks via
@@ -1695,11 +1701,12 @@ elif step == 2:
                     st.session_state._warehouse_col_map = _wh_new
                     st.rerun()
 
-        # Table shape at a glance: how many columns the SOURCE promotes vs how many the TARGET
-        # warehouse actually has. A gap on either side is what drives adds (source>target) or
-        # silent drops (target>source), so surface it up front.
-        _wh = st.session_state.get("_warehouse_col_map") or {}
-        _cm = st.session_state.get("_column_case_map") or {}   # ②b direct-hive / fast-path casing
+        # Table shape at a glance: how many columns the promotion CARRIES vs how many the target's
+        # MODEL currently has (the logical table on test). This is the "what changes in the model"
+        # view. It is NOT the physical warehouse column count — that set is far larger (a wide fact
+        # table can have 100+ physical columns while the model surfaces 70) and only matters for the
+        # bind/missing check, which lives in its own section below.
+        _tm = st.session_state.get("_target_modeled_map") or {}
         _shape_rows = []
         for i in filtered_items:
             d = _parse_edoc(i.get("edoc", "{}"))
@@ -1708,29 +1715,29 @@ elif step == 2:
                 continue
             src_n = len(_display_cols(t))   # SAME set the skip/drop lists use → counts always agree
             _key  = t["name"].strip().lower()
-            wh    = _wh.get(_key)
-            if wh is None:
-                wh = _cm.get(_key)   # fall back to the warehouse casing read at export (hive/CDW)
-            tgt_n = len(wh) if wh is not None else None
+            modeled = _tm.get(_key)
+            tgt_n = len(modeled) if modeled is not None else None
             _shape_rows.append({
                 "Table": t["name"],
-                "Source cols": src_n,
-                "Target warehouse cols": tgt_n if tgt_n is not None else "— (not read)",
-                "Gap": _gap_label(src_n, tgt_n),
+                "Promoted cols": src_n,
+                "Target model cols": tgt_n if tgt_n is not None else "— (new on target)",
+                "Model delta": _gap_label(src_n, tgt_n),
             })
         # Per-table serial number, in the SAME order _sno() numbers the count table below, so the
         # dropper and the skip dialog can prefix each table with the number the operator sees here.
         _tbl_serial = {(r["Table"] or "").strip().lower(): idx + 1
                        for idx, r in enumerate(_shape_rows)}
         if _shape_rows:
-            with st.expander(f"Table column counts — source vs target warehouse ({len(_shape_rows)} table(s))",
+            with st.expander(f"Table column counts — promoted vs target model ({len(_shape_rows)} table(s))",
                              expanded=False):
                 import pandas as pd
-                st.caption("**Gap** names the direction of the difference. *in source only* → the "
-                           "source references columns the warehouse lacks (add them to the warehouse, "
-                           "or drop them below). *in target only* → the warehouse has columns the "
-                           "source omits (dropped on the target unless carried through). *match* → "
-                           "same count.")
+                st.caption("**Promoted** is what this promotion carries (after any drops); **target "
+                           "model** is the logical table on the target today. **Model delta**: *added "
+                           "to target model* → columns the promotion introduces; *in target model, not "
+                           "promoted* → columns the target has that the promotion doesn't carry; *new "
+                           "on target* → the table doesn't exist on the target yet. This is the model "
+                           "change, not the physical warehouse size; columns that can't bind to the "
+                           "warehouse are flagged in the sections below.")
                 st.dataframe(_sno(pd.DataFrame(_shape_rows)), use_container_width=True, hide_index=True)
 
         # ── Skip specific columns (leave a column out without touching the rest) ──
@@ -3637,35 +3644,34 @@ elif step == 4:
 
         if not success.empty:
             st.markdown("**Succeeded**")
-            # Columns (source → warehouse): proves the promoted columns line up with the target
-            # warehouse. Source = raw source export; warehouse = read directly at export (the hive /
-            # CDW casing read). "warehouse not read" = the target couldn't be introspected.
-            _src_cols = {}
-            for _it in st.session_state.get("_source_raw_items", []):
+            # Columns (promoted vs target model): how many columns the promotion carried, and how that
+            # compares to the target's MODEL before import — NOT the physical warehouse size (which is
+            # far larger and only matters for binding, flagged during validation). Promoted = the
+            # columns that actually went (post-drop transform); target model = the pre-import snapshot.
+            _promoted_cols = {}
+            for _it in st.session_state.get("transformed_items", []):
                 _dt = (_parse_edoc(_it.get("edoc", "{}")).get("table") or {})
                 if _dt.get("name"):
-                    _src_cols[_dt["name"]] = [(_c.get("db_column_name") or "").strip().lower()
-                                              for _c in (_dt.get("columns") or []) if _c.get("db_column_name")]
-            _col_map = st.session_state.get("_column_case_map") or {}
+                    _promoted_cols[_dt["name"].strip().lower()] = len(_display_cols(_dt))
+            _modeled = st.session_state.get("_target_modeled_map") or {}
 
             def _shape2(row):
                 base = detail_by_name.get(row["name"], {}).get("detail", "")
                 if row["type"] != "Table":
                     return base
-                src = _src_cols.get(row["name"])
-                if src is None:
+                promoted = _promoted_cols.get(row["name"].strip().lower())
+                if promoted is None:
                     return base
-                wh = _col_map.get(row["name"].strip().lower())
-                if not wh:
-                    return f"{len(src)} cols → warehouse not read"
-                missing = [c for c in src if c not in wh]
-                return f"{len(src)} → {len(wh)} cols " + ("✓" if not missing else f"⚠ {len(missing)} missing")
+                modeled = _modeled.get(row["name"].strip().lower())
+                if modeled is None:
+                    return f"{promoted} cols promoted (new table on target)"
+                return f"{promoted} cols promoted · {_gap_label(promoted, len(modeled))}"
 
             success = success.copy()
             success["shape2"] = success.apply(_shape2, axis=1)
             _succ = success[["name", "type", "change", "shape2", "obj_id", "new_id"]].rename(columns={
                 "name": "Object", "type": "Type", "change": "State on target (from → to)",
-                "shape2": "Columns (source → warehouse)", "obj_id": "obj_id (shared identity)",
+                "shape2": "Columns (promoted vs target model)", "obj_id": "obj_id (shared identity)",
                 "new_id": "target GUID"})
             st.dataframe(_sno(_succ), use_container_width=True, hide_index=True)
 
