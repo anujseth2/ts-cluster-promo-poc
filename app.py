@@ -613,7 +613,8 @@ if step == 0:
                         "_include_feedback", "_export_fb_state",
                         # source-CDW validation state (Increments 2 & 3) — reset for new content
                         "recase_approved", "_recase_applied_set", "_recase_events",
-                        "_source_col_map", "src_drop_selected", "wh_drop_selected",
+                        "_source_col_map", "_source_type_map", "src_drop_selected",
+                        "src_type_drop_selected", "wh_drop_selected",
                         "tm_drop_selected", "tm_realign_selected", "_tm_realign_to",
                         "_tm_target_full", "_tm_source_full", "_target_modeled_map"):
                 st.session_state.pop(key, None)
@@ -2310,6 +2311,40 @@ elif step == 2:
                     pass
             return out
 
+        def _read_source_type_map():
+            """The SOURCE warehouse's TYPE per column for every promoted table (DESCRIBE), so the
+            promotion can be diffed against source types + casing in one pass. Same creds/coords as
+            _read_source_col_map. Returns {table_lower: {col_lower: type_string}}."""
+            coord_by_name = {}
+            for it in st.session_state.get("_source_raw_items", []):
+                t = _parse_edoc(it.get("edoc", "{}")).get("table") or {}
+                if t.get("name"):
+                    coord_by_name[t["name"].strip().lower()] = {
+                        "name": t["name"], "database": t.get("db", ""),
+                        "schema": t.get("schema", ""), "table": t.get("db_table", "")}
+            tbls = list(coord_by_name.values())
+            out = {}
+            if not tbls:
+                return out
+            _host = opt_env("TS_SOURCE_DBX_HOST") or opt_env("TS_TARGET_DBX_HOST")
+            _whid = opt_env("TS_SOURCE_DBX_WAREHOUSE") or opt_env("TS_TARGET_DBX_WAREHOUSE")
+            _tok  = opt_env("TS_SOURCE_DBX_TOKEN") or opt_env("TS_TARGET_DBX_TOKEN")
+            if _host and _whid and _tok:
+                try:
+                    from services.databricks_direct import hive_column_types
+                    out.update(hive_column_types(_host, _whid, _tok, tbls, opt_env("TS_PROXY")))
+                except Exception:
+                    pass
+            _conn = (teams[team_name].get("source_connection", "")
+                     or teams[team_name].get("target_connection", ""))
+            _rest = [t for t in tbls if (t.get("name") or "").strip().lower() not in out]
+            if _rest and _conn:
+                try:
+                    out.update(source_client().connection_column_types(_conn, _rest))
+                except Exception:
+                    pass
+            return out
+
         def _resolve_finding_table(f):
             """A table that fails the CDW type check comes back with header name 'unknown',
             but the error's FQN (db.schema.db_table.col) names the physical table. Map that
@@ -2347,14 +2382,19 @@ elif step == 2:
                            "(out-of-sync TML) — flagged for approval, never dropped automatically.")
         with _sc_btn:
             if st.button("🔌 Check against source warehouse", disabled=not filtered_items,
-                         help="Reads the source warehouse column set (source DBX creds, falling "
-                              "back to target for now) and diffs the promotion against it."):
-                with st.status("Reading the source warehouse… a cold warehouse can take a minute "
-                               "or two.", expanded=True) as _ss:
-                    _sm = _read_source_col_map()
-                    _ss.update(label=f"Source warehouse read — {len(_sm)} table(s) resolved.",
+                         help="Reads the source warehouse (source DBX creds, falling back to target "
+                              "for now) and diffs the promotion against it — absent columns, casing, "
+                              "and types, all at once."):
+                with st.status("Reading the source warehouse (columns, casing, types)… a cold "
+                               "warehouse can take a minute or two.", expanded=True) as _ss:
+                    _sm  = _read_source_col_map()    # names + casing (SHOW COLUMNS)
+                    _ss.write(f"columns/casing: {len(_sm)} table(s)")
+                    _stm = _read_source_type_map()   # types (DESCRIBE)
+                    _ss.write(f"types: {len(_stm)} table(s)")
+                    _ss.update(label=f"Source warehouse read — {len(_sm)} table(s).",
                                state=("complete" if _sm else "error"), expanded=False)
-                st.session_state._source_col_map = _sm
+                st.session_state._source_col_map  = _sm
+                st.session_state._source_type_map = _stm
                 st.rerun()
 
         _src_map = st.session_state.get("_source_col_map") or {}
@@ -2454,6 +2494,97 @@ elif step == 2:
                             st.session_state.pop("silent_drops", None)
                     if _res:
                         st.rerun()
+
+            # ── (B) type differs from the SOURCE warehouse — drop here, or realign below ──
+            _src_type = st.session_state.get("_source_type_map") or {}
+            _src_conn = (teams[team_name].get("source_connection", "")
+                         or teams[team_name].get("target_connection", ""))
+            _gone = st.session_state.get("dropped_col_names", set())
+            _stfind = [f for f in warehouse_type_findings(
+                           st.session_state.get("transformed_items", []), _src_type, connection=_src_conn)
+                       if f"{f['object']}::{f['column']}" not in _gone and f["column"] not in _gone]
+            if _stfind:
+                st.markdown("**Type differs from the source warehouse** — drop, or realign in the "
+                            "type-mismatch table below")
+                st.caption("With identical source/target creds these mirror the Column type mismatches "
+                           "section; they become source-specific once you set separate source creds. "
+                           "Realign lives in that table (it needs the target check); drop here.")
+                _stsel = st.session_state.setdefault("src_type_drop_selected", set())
+                _strows = []
+                for _f in sorted(_stfind, key=lambda x: ((x.get("object") or "").lower(),
+                                                         (x.get("column") or "").lower())):
+                    _tbl = _f["object"]; _sk = f"{_tbl}::{_f['column']}"
+                    _scdw = (_src_type.get(_tbl.strip().lower()) or {}).get(_f["column"].lower(), "")
+                    _strows.append({"Table": _tbl, "Column": _f["column"],
+                                    "Source type": (_scdw.upper() if _scdw else "(?)"),
+                                    "TML type": _f.get("source_type") or "(?)",
+                                    "Drop?": _sk in _stsel, "_scoped": _sk})
+                _stdf = pd.DataFrame(_strows, columns=["Table", "Column", "Source type", "TML type",
+                                                       "Drop?", "_scoped"])
+                _stb1, _ = st.columns([1, 4])
+                with _stb1:
+                    if st.button(f"Drop all ({len(_stdf)})", key="srctype_all", use_container_width=True):
+                        _stsel.update(_stdf["_scoped"].tolist()); _bump_editor("srctype"); st.rerun()
+                _select_editor(
+                    _stdf, ["Drop?"], ["src_type_drop_selected"], "srctype",
+                    column_config={
+                        "Table":  st.column_config.TextColumn("Table", width="medium"),
+                        "Column": st.column_config.TextColumn("Column", width="medium"),
+                        "Source type": st.column_config.TextColumn("Source type", width="small"),
+                        "TML type": st.column_config.TextColumn("TML type", width="small"),
+                        "Drop?":  st.column_config.CheckboxColumn("Drop?", width="small",
+                                    help="Drop this column (realign lives in the type-mismatch table)."),
+                    },
+                    disabled=["Table", "Column", "Source type", "TML type"])
+                if _stsel and st.button(f"Apply source-type drops ({len(_stsel)}) & re-validate",
+                                        key="srctype_apply"):
+                    _d = set(_stsel)
+                    fixed, _man = drop_columns(st.session_state.transformed_items, _d)
+                    _record_drop(_man)
+                    st.session_state.setdefault("dropped_col_names", set()).update(_d)
+                    _emptied = {ff["table"] for ff in table_cleanup_findings(fixed)}
+                    if _emptied:
+                        fixed, _ts = _prune_tables_whole(fixed, _emptied)
+                        st.session_state.setdefault("prune_tables", set()).update(_emptied)
+                    st.session_state.transformed_items = fixed
+                    _log_apply_detail("source_type_apply", _d, _man, _emptied, fixed)
+                    _stsel.clear()
+                    st.session_state.pop("_source_col_map", None)
+                    st.session_state.pop("_source_type_map", None)
+                    _ff = [i for i in st.session_state.transformed_items
+                           if i.get("info", {}).get("name") not in skip_objects]
+                    with st.status("Re-committing & re-validating…", expanded=True) as _rv:
+                        _res = _safe_validate(_ff, step=lambda _m: _rv.write(_m))
+                        _rv.update(state=("complete" if _res else "error"), expanded=False)
+                        if _res:
+                            pr_url, err, ok = _res
+                            st.session_state.pr_url            = pr_url
+                            st.session_state.validation_errors = err
+                            st.session_state.validation_ok     = ok
+                            st.session_state.pop("silent_drops", None)
+                    if _res:
+                        st.rerun()
+
+            # ── (C) casing differs from the SOURCE warehouse — read-only; approve in Column recasing ──
+            _case_rows = []
+            for _it in st.session_state.get("transformed_items", []):
+                _t = _parse_edoc(_it.get("edoc", "{}")).get("table")
+                if not _t or not _t.get("name"):
+                    continue
+                _cm = _src_map.get(_t["name"].strip().lower())
+                if not _cm:
+                    continue
+                for _c in _t.get("columns", []) or []:
+                    _dbn = (_c.get("db_column_name") or "").strip()
+                    if _dbn and _cm.get(_dbn.lower()) and _cm[_dbn.lower()] != _dbn:
+                        _case_rows.append({"Table": _t["name"], "Column (TML)": _dbn,
+                                           "Source casing": _cm[_dbn.lower()]})
+            if _case_rows:
+                st.markdown("**Casing differs from the source warehouse**")
+                st.caption("Approve and apply these in the **Column recasing** section above (it recases "
+                           "to the warehouse's casing and re-exports). Listed here for the source-first "
+                           "view; nothing to tick here.")
+                st.dataframe(_sno(pd.DataFrame(_case_rows)), use_container_width=True, hide_index=True)
         st.divider()
 
         # ── Stage 1: Export → commit/PR → discover ALL issues in one action ─────
@@ -3228,6 +3359,7 @@ elif step == 2:
                 _all_drop |= set(st.session_state.get("wh_drop_selected", set()))
                 # Source-absent columns approved in the source-warehouse check drop here too.
                 _all_drop |= set(st.session_state.get("src_drop_selected", set()))
+                _all_drop |= set(st.session_state.get("src_type_drop_selected", set()))
                 # Type-mismatch drops now live in the table's persistent selection (already scoped
                 # table::col), replacing the old per-row droptm_ checkboxes.
                 _all_drop |= set(st.session_state.get("tm_drop_selected", set()))
@@ -3276,6 +3408,7 @@ elif step == 2:
                             st.session_state.pop("discovered_meta", None)
                             st.session_state.pop("wh_drop_selected", None)   # ticks consumed
                             st.session_state.pop("src_drop_selected", None)
+                            st.session_state.pop("src_type_drop_selected", None)
                             st.session_state.pop("tm_drop_selected", None)
                             st.session_state.pop("tm_realign_selected", None)
                             st.session_state.pop("_source_col_map", None)    # stale after drops
