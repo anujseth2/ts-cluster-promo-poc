@@ -563,7 +563,7 @@ if step == 0:
                         # source-CDW validation state (Increments 2 & 3) — reset for new content
                         "recase_approved", "_recase_applied_set", "_recase_events",
                         "_source_col_map", "src_drop_selected", "wh_drop_selected",
-                        "_target_modeled_map"):
+                        "tm_drop_selected", "_target_modeled_map"):
                 st.session_state.pop(key, None)
 
     assets = st.session_state.get("assets", [])
@@ -2262,34 +2262,6 @@ elif step == 2:
                     pass
             return out
 
-        def _target_col_usage(mismatches):
-            """Column-PRECISE target impact. Stage 1: table-level dependents (one call).
-            Stage 2: export those objects + scan each for the actual column reference.
-            Returns {(object, column_lower): {"affected":[{name,kind,where}], "total":int, "missing"?}}."""
-            tgt = target_client()
-            by_table = {}
-            for f in mismatches:
-                if f.get("object") and f.get("column"):
-                    by_table.setdefault(f["object"], []).append(f["column"])
-            name_to_id = tgt._resolve_names_to_ids(list(by_table), "LOGICAL_TABLE")
-            out = {}
-            for tbl, cols in by_table.items():
-                tid = name_to_id.get(tbl)
-                if not tid:
-                    for c in cols:
-                        out[(tbl, c.lower())] = {"affected": [], "total": 0, "missing": True}
-                    continue
-                deps    = tgt.list_dependents([tid], "LOGICAL_TABLE").get(tid, [])
-                dep_ids = [d["id"] for d in deps if d.get("id")]
-                items   = []
-                if dep_ids:
-                    raw    = tgt.export_tml(dep_ids)
-                    titems = raw if isinstance(raw, list) else raw.get("object", [])
-                    items  = [{"edoc": it.get("edoc", "{}")} for it in titems]
-                for c in cols:
-                    out[(tbl, c.lower())] = {"affected": column_usage(items, c), "total": len(deps)}
-            return out
-
         def _resolve_finding_table(f):
             """A table that fails the CDW type check comes back with header name 'unknown',
             but the error's FQN (db.schema.db_table.col) names the physical table. Map that
@@ -2744,125 +2716,115 @@ elif step == 2:
 
             # ── type drift: column exists on both sides, types differ ──
             if type_mismatch:
+                import pandas as pd
                 st.markdown("#### Column type mismatches")
                 st.caption(
-                    "The column's data type disagrees across **source CDW · source TML · target CDW** "
-                    "(all three shown below). These are **flagged, never auto-corrected** — the tool "
-                    "will not silently change a type to force the import through. Fix it at the data "
-                    "layer (align the warehouse / model), then re-run. Dropping is a last resort; if a "
-                    "join/formula depends on the column, dropping cascade-removes those too (previewed "
-                    "before you confirm).")
+                    "The data type disagrees across **source CDW · source TML · target CDW**. These are "
+                    "**flagged, never auto-corrected** — the tool won't silently change a type to force "
+                    "the import through. Prefer aligning the type at the data layer, then re-validate. "
+                    "Tick **Drop?** only as a last resort: it removes the column (scoped to that one "
+                    "table) and cascades to whatever depends on it.")
 
                 tm_key = tuple(sorted((f["object"], f["column"]) for f in type_mismatch))
-                # _tm_key2: the enrichment shape changed to {type, source}, so a bumped key forces
-                # one clean recompute if an old-shape value lingers in a hot-reloaded session.
                 if st.session_state.get("_tm_key2") != tm_key:
-                    with st.spinner("Reading the source & target warehouse column types (CDW) and "
-                                    "scanning dependents… a cold warehouse can take a minute or two."):
-                        # Optional enrichment (source + target warehouse types + what-uses-this-column).
-                        # Reads warehouses / exports target objects, which can fail (a 404 on objects the
-                        # user can't see, a cold/unreachable connection). Never let it crash the page —
-                        # each read is best-effort and degrades to "(warehouse unread)".
+                    with st.spinner("Reading the source & target warehouse column types (CDW)… "
+                                    "a cold warehouse can take a minute or two."):
+                        # Best-effort warehouse type reads; degrade to "(unread)" on any failure.
                         try:
                             st.session_state._tm_types     = _target_col_types(type_mismatch)
                             st.session_state._tm_src_types = _source_col_types(type_mismatch)
-                            st.session_state._tm_usage     = _target_col_usage(type_mismatch)
                         except Exception as _e:
                             st.session_state._tm_types     = {}
                             st.session_state._tm_src_types = {}
-                            st.session_state._tm_usage     = {}
-                            st.caption("⚠ Couldn't read warehouse column types / dependents "
-                                       f"({str(_e)[:120]}). Showing the mismatch without warehouse "
-                                       "detail — often means the connection is cold or your user can't "
-                                       "see those objects.")
-                        st.session_state._tm_key2   = tm_key
+                            st.caption("⚠ Couldn't read warehouse column types "
+                                       f"({str(_e)[:120]}). Showing dev's type only.")
+                        st.session_state._tm_key2 = tm_key
                 tgt_types = st.session_state.get("_tm_types", {})
                 src_types = st.session_state.get("_tm_src_types", {})
-                tgt_usage = st.session_state.get("_tm_usage", {})
 
-                _tnorm = lambda s: "".join((s or "").lower().split())   # loose compare for display
-                tm_drop = set()
-                for f in type_mismatch:
-                    _ti   = tgt_types.get((f["object"], f["column"].lower())) or {}
+                _tnorm = lambda s: "".join((s or "").lower().split())   # loose compare
+                _tmsel = st.session_state.setdefault("tm_drop_selected", set())
+                _promo = st.session_state.get("transformed_items", [])
+                _rows = []
+                for f in sorted(type_mismatch, key=lambda x: ((x.get("object") or "").lower(),
+                                                              (x.get("column") or "").lower())):
+                    obj = f.get("object") or "(table)"
+                    col = f.get("column", "")
+                    _ti = tgt_types.get((f.get("object"), col.lower())) or {}
                     tgt_t = _ti.get("type", "")
-                    src_cdw = src_types.get((f["object"], f["column"].lower()), "")
+                    src_cdw = src_types.get((f.get("object"), col.lower()), "")
                     src_tml = f.get("source_type", "")
-                    # 3-way: source CDW · source TML · target CDW (whichever we could read).
-                    _sc = f"`{src_cdw.upper()}`" if src_cdw else "`(warehouse unread)`"
-                    _st_ = f"`{src_tml}`" if src_tml else "`(?)`"
-                    if tgt_t:
-                        _tag = "" if _ti.get("source") == "warehouse" else " ⚠modeled"
-                        _tc = f"`{tgt_t.upper()}`{_tag}"
-                    else:
-                        _tc = "`(warehouse unread)`"
-                    st.markdown(
-                        f"⚠️ **`{f['column']}`**  ·  {f['object']}  —  "
-                        f"source CDW: {_sc}  ·  source TML: {_st_}  ·  target CDW: {_tc}")
-                    # Where's the divergence? Only assert it on values we actually read (loose compare).
+                    _issue = []
                     if src_cdw and _tnorm(src_cdw) != _tnorm(src_tml):
-                        st.caption(f"↳ source model is out of sync with its own warehouse "
-                                   f"(TML `{src_tml}` vs source CDW `{src_cdw.upper()}`) — a real gap; "
-                                   "fix the source model/warehouse.")
+                        _issue.append("TML out of sync with source CDW")
                     if src_cdw and tgt_t and _tnorm(src_cdw) != _tnorm(tgt_t):
-                        st.caption(f"↳ the two warehouses differ (source CDW `{src_cdw.upper()}` vs "
-                                   f"target CDW `{tgt_t.upper()}`).")
-                    st.caption("Flagged, not auto-corrected — align the type at the data layer, "
-                               "then re-run.")
+                        _issue.append("source vs target CDW differ")
+                    _casc = column_drop_cascade(_promo, [col])   # scoped cascade preview
+                    _dep = []
+                    if _casc["joins"]:    _dep.append(f"{_casc['joins']} join(s)")
+                    if _casc["formulas"]: _dep.append(f"{len(_casc['formulas'])} formula(s)")
+                    if _casc["vizzes"]:   _dep.append(f"{_casc['vizzes']} viz(es)")
+                    _scoped = f"{obj}::{col}" if f.get("object") else col
+                    _tag = "" if _ti.get("source") == "warehouse" else " (modeled)"
+                    _rows.append({
+                        "#":          str(_tbl_serial.get(obj.strip().lower(), "")),
+                        "Table":      obj,
+                        "Column":     col,
+                        "Source CDW": src_cdw.upper() if src_cdw else "(unread)",
+                        "Source TML": src_tml or "(?)",
+                        "Target CDW": (tgt_t.upper() + _tag) if tgt_t else "(unread)",
+                        "Issue":      "; ".join(_issue) if _issue else "types differ",
+                        "Dropping removes": ", ".join(_dep) if _dep else "just the column",
+                        "Drop?":      _scoped in _tmsel,
+                        "_scoped":    _scoped,
+                    })
+                _df = pd.DataFrame(_rows)
+                _q = st.text_input("Filter type mismatches", key="tm_search",
+                                   label_visibility="collapsed",
+                                   placeholder="🔎 Filter by table or column name").strip().lower()
+                _view = _df
+                if _q:
+                    _view = _df[_df.apply(lambda r: _q in str(r["Table"]).lower()
+                                          or _q in str(r["Column"]).lower(), axis=1)]
+                _ed = st.data_editor(
+                    _view.drop(columns=["_scoped"]),
+                    column_config={
+                        "#":          st.column_config.TextColumn("#", width="small",
+                                        help="Matches the S.No in the count table above."),
+                        "Table":      st.column_config.TextColumn("Table", width="medium"),
+                        "Column":     st.column_config.TextColumn("Column", width="medium"),
+                        "Source CDW": st.column_config.TextColumn("Source CDW", width="small"),
+                        "Source TML": st.column_config.TextColumn("Source TML", width="small"),
+                        "Target CDW": st.column_config.TextColumn("Target CDW", width="small",
+                                        help="'(modeled)' = read from the target's logical table, "
+                                             "not the warehouse."),
+                        "Issue":      st.column_config.TextColumn("Issue", width="medium"),
+                        "Dropping removes": st.column_config.TextColumn("Dropping removes", width="medium",
+                                        help="What a drop would cascade-remove from the promotion."),
+                        "Drop?":      st.column_config.CheckboxColumn("Drop?", width="small",
+                                        help="Last resort: drop this column (scoped to this table) "
+                                             "and its dependents."),
+                    },
+                    disabled=["#", "Table", "Column", "Source CDW", "Source TML", "Target CDW",
+                              "Issue", "Dropping removes"],
+                    hide_index=True, use_container_width=True, key=f"tm_editor::{_q}")
+                for _i in _view.index:
+                    _sk = _df.at[_i, "_scoped"]
+                    if bool(_ed.at[_i, "Drop?"]):
+                        _tmsel.add(_sk)
+                    else:
+                        _tmsel.discard(_sk)
+                st.caption(f"**{len(_tmsel)}** column(s) marked to drop. Aligning the type at the data "
+                           "layer is preferred; drop only as a last resort.")
 
-                    deps = column_dependents(st.session_state.transformed_items, [f["column"]])
-                    bits = []
-                    if deps["joins"]:    bits.append("joins: "    + ", ".join(deps["joins"]))
-                    if deps["formulas"]: bits.append("formulas: " + ", ".join(deps["formulas"]))
-                    if deps["vizzes"]:   bits.append("vizzes: "   + ", ".join(str(v) for v in deps["vizzes"]))
-                    if bits:
-                        st.caption("In-promotion dependents — " + "  ·  ".join(bits))
-
-                    # Target-side blast radius, COLUMN-PRECISE: of all objects on the table,
-                    # which actually reference THIS column (and where).
-                    usage = tgt_usage.get((f["object"], f["column"].lower()))
-                    if usage is not None:
-                        if usage.get("missing"):
-                            st.caption(f"Target-side: `{f['object']}` not found on Test, no dependents to scan.")
-                        else:
-                            aff, total = usage["affected"], usage["total"]
-                            if aff:
-                                kinds = {}
-                                for a in aff:
-                                    kinds[a["kind"]] = kinds.get(a["kind"], 0) + 1
-                                ksum = ", ".join(f"{n} {k}{'' if n == 1 else 's'}" for k, n in kinds.items())
-                                st.caption(
-                                    f"Target-side impact (column-precise): **{len(aff)} of {total}** objects on "
-                                    f"the table actually use this column — {ksum}.")
-                                with st.expander(f"Show the {len(aff)} affected object(s) on Test"):
-                                    for a in aff:
-                                        st.markdown(f"- **{a['kind']}** · {a['name']} · {', '.join(a['where'])}")
-                            else:
-                                st.caption(
-                                    f"Target-side impact: none of the {total} objects on the table use this "
-                                    "column (only the table definition itself).")
-
-                    # Aligning the target warehouse type is still the recommended fix. But dropping is
-                    # no longer BLOCKED when a join/formula depends — drop_columns cascade-removes
-                    # them. Preview exactly what the drop would take with it.
-                    _casc = column_drop_cascade(st.session_state.transformed_items, [f["column"]])
-                    if _casc["joins"] or _casc["formulas"] or _casc["vizzes"]:
-                        _bits = []
-                        if _casc["joins"]:    _bits.append(f"{_casc['joins']} join(s)")
-                        if _casc["formulas"]: _bits.append("formulas: " + ", ".join(_casc["formulas"]))
-                        if _casc["vizzes"]:   _bits.append(f"{_casc['vizzes']} viz(es)")
-                        st.caption("↳ dropping also cascade-removes — " + "  ·  ".join(_bits)
-                                   + ".  Prefer aligning the target warehouse type instead.")
-                    if st.checkbox(
-                            f"Drop `{f['column']}` from this promotion (cascades the above)",
-                            value=False, key=f"droptm_{f['object']}_{f['column']}"):
-                        tm_drop.add(f["column"])
-
-                if not _discovered and st.button("Apply drops, re-export & re-validate", key="tm_apply"):
-                    if tm_drop:
-                        fixed, _man = drop_columns(st.session_state.transformed_items, tm_drop)
-                        st.session_state.transformed_items  = fixed
-                        _record_drop(_man)
-                        st.session_state.setdefault("dropped_col_names", set()).update(tm_drop)
+                if not _discovered and st.button("Apply drops, re-export & re-validate", key="tm_apply",
+                                                 disabled=not _tmsel):
+                    _drop = set(_tmsel)   # SCOPED table::col keys — never bare (avoids the shared-key over-drop)
+                    fixed, _man = drop_columns(st.session_state.transformed_items, _drop)
+                    st.session_state.transformed_items = fixed
+                    _record_drop(_man)
+                    st.session_state.setdefault("dropped_col_names", set()).update(_drop)
+                    _tmsel.clear()
                     filtered_fixed = [i for i in st.session_state.transformed_items
                                       if i.get("info", {}).get("name") not in skip_objects]
                     with st.status("Re-committing & re-validating…", expanded=True) as _rv:
@@ -3090,16 +3052,14 @@ elif step == 2:
             # ── single "Apply all" — only after discovery produced the complete set ──
             if _discovered:
                 _all_drop = set(fml_drop) | set(dang_drop)   # invalid-formula cols + dangling refs (by name)
-                # Missing-column ticks now live in the data_editor's persistent selection (already
-                # scoped obj::col), so fold the whole set in. Type-mismatch drops still use their
-                # per-row checkboxes (droptm_…), which are unchanged.
+                # Missing-column ticks live in the data_editor's persistent selection (already scoped
+                # obj::col), so fold the whole set in.
                 _all_drop |= set(st.session_state.get("wh_drop_selected", set()))
                 # Source-absent columns approved in the source-warehouse check drop here too.
                 _all_drop |= set(st.session_state.get("src_drop_selected", set()))
-                for f in type_mismatch:
-                    if st.session_state.get(f"droptm_{f['object']}_{f['column']}"):
-                        _obj = (f.get("object") or "").strip()
-                        _all_drop.add(f"{_obj}::{f['column']}" if _obj else f["column"])
+                # Type-mismatch drops now live in the table's persistent selection (already scoped
+                # table::col), replacing the old per-row droptm_ checkboxes.
+                _all_drop |= set(st.session_state.get("tm_drop_selected", set()))
                 _tbl_now = set(tbl_drop)   # whole tables to prune (empty / disconnected)
                 st.divider()
                 _lbl_tbl = f" + {len(_tbl_now)} table(s)" if _tbl_now else ""
@@ -3135,6 +3095,7 @@ elif step == 2:
                             st.session_state.pop("discovered_meta", None)
                             st.session_state.pop("wh_drop_selected", None)   # ticks consumed
                             st.session_state.pop("src_drop_selected", None)
+                            st.session_state.pop("tm_drop_selected", None)
                             st.session_state.pop("_source_col_map", None)    # stale after drops
                     if _res:
                         st.rerun()
