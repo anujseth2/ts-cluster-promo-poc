@@ -1536,6 +1536,7 @@ elif step == 2:
             _dbx_host = opt_env("TS_TARGET_DBX_HOST")
             _dbx_wh   = opt_env("TS_TARGET_DBX_WAREHOUSE")
             _dbx_tok  = opt_env("TS_TARGET_DBX_TOKEN")
+            _hive = {}   # authoritative physical read of the TARGET warehouse (hive/UC), if creds set
             if _dbx_host and _dbx_wh and _dbx_tok:
                 st.write("②b Reading hive_metastore casing directly from Databricks…")
                 try:
@@ -1549,9 +1550,12 @@ elif step == 2:
                     st.write(f"   warehouse casing resolved for {_ok}/{len(_dbg)} table(s).")
                 except Exception as _e:
                     st.write(f"   ⚠ direct warehouse casing skipped: {str(_e)[:150]}")
-            # A fresh export resets any prior warehouse (CDW) read — re-verify on demand below.
             st.session_state._column_case_map = column_case_map
-            st.session_state._warehouse_col_map = {}
+            # The TARGET warehouse is read HERE, at export (the direct hive read that actually works
+            # on GSK — the old connection/search "Verify" button 504'd on hive and was redundant with
+            # this). So the missing-column check treats these as warehouse-verified with no extra
+            # click. Empty when no target DBX creds → the check falls back to modeled columns.
+            st.session_state._warehouse_col_map = _hive
             # Persist coords + connection so the opt-in "verify against the warehouse" button can
             # issue the (slow) connection read without re-exporting.
             st.session_state._promoted_coords = promoted
@@ -1661,45 +1665,15 @@ elif step == 2:
             if i.get("info", {}).get("name") not in skip_objects
         ]
 
-        # Opt-in authoritative warehouse read. Kept OFF the export critical path because COLUMN
-        # introspection can be very slow / 504 on some warehouses (GSK). Missing-column checks work
-        # without it (falling back to the target's modeled columns, flagged 'unverified'); click
-        # this to upgrade them to warehouse-verified when the connection can answer.
-        _coords = st.session_state.get("_promoted_coords") or []
-        if _coords:
-            _bcol1, _bcol2 = st.columns([3, 2])
-            with _bcol1:
-                if st.session_state.get("_warehouse_col_map"):
-                    st.caption(f"✅ Warehouse-verified columns for "
-                               f"{len(st.session_state['_warehouse_col_map'])} table(s).")
-                else:
-                    st.caption("Column checks use the target's **modeled** columns (fast). Verify "
-                               "against the warehouse for authoritative results — may be slow.")
-            with _bcol2:
-                if st.button("🔌 Verify columns against warehouse", help="Reads columns via the "
-                             "connection. Slow / can time out on some warehouses; never blocks export."):
-                    _tconn = st.session_state.get("_promoted_tgt_conn") or ""
-                    _groups = {}
-                    for _p in _coords:
-                        _eff = _tconn or _p.get("connection") or ""
-                        if _eff:
-                            _groups.setdefault(_eff, []).append(_p)
-                    _wh_new = {}
-                    with st.status("Reading warehouse columns via the connection…",
-                                   expanded=True) as _wh_status:
-                        for _cn, _tbls in _groups.items():
-                            st.write(f"connection `{_cn}` — {len(_tbls)} table(s)…")
-                            try:
-                                for _k, _v in target_client().connection_column_cases(
-                                        _cn, _tbls).items():
-                                    _wh_new.setdefault(_k, _v)
-                            except Exception as _e:
-                                st.write(f"⚠ `{_cn}` failed: {str(_e)[:200]}")
-                        _wh_status.update(
-                            label=f"Warehouse read done — {len(_wh_new)} table(s) resolved.",
-                            state=("complete" if _wh_new else "error"), expanded=False)
-                    st.session_state._warehouse_col_map = _wh_new
-                    st.rerun()
+        # The TARGET warehouse is read automatically at export (the direct hive read above), and the
+        # discovery step validates against the target as well, so there is no separate "verify against
+        # the target warehouse" button anymore — it used the connection/search path that 504s on GSK
+        # and only duplicated what already happens. The one explicit warehouse action left is the
+        # SOURCE check further down, which is the only warehouse we cannot see any other way.
+        if st.session_state.get("_warehouse_col_map"):
+            st.caption(f"✅ Target warehouse columns read at export for "
+                       f"{len(st.session_state['_warehouse_col_map'])} table(s) — missing-column "
+                       "checks below are warehouse-verified.")
 
         # Table shape at a glance: how many columns the promotion CARRIES vs how many the target's
         # MODEL currently has (the logical table on test). This is the "what changes in the model"
@@ -2342,12 +2316,14 @@ elif step == 2:
         import pandas as pd
         _sc_head, _sc_btn = st.columns([3, 2])
         with _sc_head:
-            st.markdown("**Source warehouse check**")
+            st.markdown("**Source warehouse check** (the target is checked automatically)")
             if st.session_state.get("_source_col_map"):
                 st.caption(f"✅ Read {len(st.session_state['_source_col_map'])} source table(s) — "
                            "columns below are in the promotion but not in the source warehouse.")
             else:
-                st.caption("Surface promoted columns that no longer exist in the **source** CDW "
+                st.caption("The **target** warehouse is already read at export and re-checked during "
+                           "validation. This button reads the **source** warehouse (the only one not "
+                           "seen otherwise) to surface promoted columns that no longer exist there "
                            "(out-of-sync TML) — flagged for approval, never dropped automatically.")
         with _sc_btn:
             if st.button("🔌 Check against source warehouse", disabled=not filtered_items,
