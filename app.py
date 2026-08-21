@@ -1749,8 +1749,14 @@ elif step == 2:
                 _tbl_cols[t["name"]] = _display_cols(t)
         if _tbl_cols:
             _skip_now = st.session_state.get("skip_columns", set())
-            with st.expander("Skip specific columns (optional) — leave a column out, keep the rest",
-                             expanded=bool(_skip_now)):
+            # A session-persisted toggle instead of st.expander. An expander re-applies its
+            # `expanded` flag on every rerun, so picking a column inside it (which reruns) snapped it
+            # shut every time. A checkbox keeps its own state across reruns, so the section stays open
+            # while you pick. Default it open when skips already exist.
+            st.session_state.setdefault("_show_skip", bool(_skip_now))
+            st.checkbox("Skip specific columns (optional) — leave a column out, keep the rest",
+                        key="_show_skip")
+            if st.session_state.get("_show_skip"):
                 st.caption("Pick columns to exclude from this promotion. The rest of the table "
                            "promotes normally; any viz that uses a skipped column is dropped too. "
                            "The number by each table matches its S.No in the count table above.")
