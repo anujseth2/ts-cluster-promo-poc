@@ -2332,15 +2332,45 @@ elif step == 2:
                     _sk  = f"{_tbl}::{_f['column']}" if _f.get("object") else _f["column"]
                     _srows.append({"Table": _tbl, "Column": _f["column"],
                                    "Drop?": _sk in _ssel, "_scoped": _sk})
-                _sdf = pd.DataFrame(_srows)
+                _sdf = pd.DataFrame(_srows, columns=["Table", "Column", "Drop?", "_scoped"])
                 _sq  = st.text_input("Filter source-absent", key="src_search",
                                      label_visibility="collapsed",
                                      placeholder="🔎 Filter by table or column name").strip().lower()
                 _sview = _sdf
-                if _sq:
+                if _sq and not _sdf.empty:
                     _sview = _sdf[_sdf.apply(lambda r: _sq in str(r["Table"]).lower()
                                              or _sq in str(r["Column"]).lower(), axis=1)]
-                _sed = st.data_editor(
+                # Drop-all / clear over the shown rows. Bumping the editor generation forces a fresh
+                # editor so a bulk change doesn't fight the widget's stored per-cell edits.
+                _sba, _sbc, _ = st.columns([1, 1, 3])
+                with _sba:
+                    if st.button(f"Drop all shown ({len(_sview)})", key="src_drop_all",
+                                 use_container_width=True, disabled=_sview.empty):
+                        _ssel.update(_sview["_scoped"].tolist())
+                        st.session_state._src_gen = st.session_state.get("_src_gen", 0) + 1
+                        st.rerun()
+                with _sbc:
+                    if st.button("Clear all", key="src_drop_clear", use_container_width=True,
+                                 disabled=not _ssel):
+                        _ssel.clear()
+                        st.session_state._src_gen = st.session_state.get("_src_gen", 0) + 1
+                        st.rerun()
+                # Single-click ticks: an on_change callback consumes the edit BEFORE the rerun body,
+                # so the checkbox no longer needs a second click. Positions map via a stashed list
+                # (the callback runs before this run's locals exist, so it reads session_state only).
+                _ekey = f"src_drop_editor::{_sq}::{st.session_state.get('_src_gen', 0)}"
+                st.session_state._src_pos_map = _sview["_scoped"].tolist()
+
+                def _src_cb(ekey):
+                    _sel = st.session_state.setdefault("src_drop_selected", set())
+                    _pm  = st.session_state.get("_src_pos_map", [])
+                    _st  = st.session_state.get(ekey, {}) or {}
+                    for _pos, _ch in (_st.get("edited_rows") or {}).items():
+                        _p = int(_pos)
+                        if "Drop?" in _ch and 0 <= _p < len(_pm):
+                            (_sel.add if _ch["Drop?"] else _sel.discard)(_pm[_p])
+
+                st.data_editor(
                     _sview.drop(columns=["_scoped"]),
                     column_config={
                         "Table":  st.column_config.TextColumn("Table", width="medium"),
@@ -2349,13 +2379,7 @@ elif step == 2:
                                     help="Tick to drop this out-of-sync column from the promotion."),
                     },
                     disabled=["Table", "Column"], hide_index=True, use_container_width=True,
-                    key=f"src_drop_editor::{_sq}")
-                for _i in _sview.index:
-                    _sk = _sdf.at[_i, "_scoped"]
-                    if bool(_sed.at[_i, "Drop?"]):
-                        _ssel.add(_sk)
-                    else:
-                        _ssel.discard(_sk)
+                    key=_ekey, on_change=_src_cb, args=(_ekey,))
                 st.caption(f"**{len(_ssel)}** source-absent column(s) approved to drop. "
                            "(Also applied by the discovery **Apply all** below.)")
                 if st.button("Apply source drops, re-export & re-validate", disabled=not _ssel):
