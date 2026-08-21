@@ -2775,14 +2775,6 @@ elif step == 2:
             # ── type drift: column exists on both sides, types differ ──
             if type_mismatch:
                 import pandas as pd
-                st.markdown("#### Column type mismatches")
-                st.caption(
-                    "The data type disagrees across **source CDW · source TML · target CDW**. These are "
-                    "**flagged, never auto-corrected** — the tool won't silently change a type to force "
-                    "the import through. Prefer aligning the type at the data layer, then re-validate. "
-                    "Tick **Drop?** only as a last resort: it removes the column (scoped to that one "
-                    "table) and cascades to whatever depends on it.")
-
                 tm_key = tuple(sorted((f["object"], f["column"]) for f in type_mismatch))
                 if st.session_state.get("_tm_key2") != tm_key:
                     with st.spinner("Reading the source & target warehouse column types (CDW)… "
@@ -2804,27 +2796,38 @@ elif step == 2:
                 _tmsel   = st.session_state.setdefault("tm_drop_selected", set())
                 _tmrsel  = st.session_state.setdefault("tm_realign_selected", set())
                 _realign_to = {}   # scoped key -> the TS TOKEN a realign would write
-                # Columns already dropped this run are NOT type-mismatch candidates — otherwise a
-                # column you resolved by dropping keeps reappearing here one re-validate at a time.
+                # Columns already dropped this run are NOT candidates — otherwise a column you resolved
+                # by dropping keeps reappearing one re-validate at a time.
                 _already_gone = st.session_state.get("dropped_col_names", set())
-                _rows = []
+                _rows, _void_rows = [], []
                 for f in sorted(type_mismatch, key=lambda x: ((x.get("object") or "").lower(),
                                                               (x.get("column") or "").lower())):
                     obj = f.get("object") or "(table)"
                     col = f.get("column", "")
                     _scoped = f"{obj}::{col}" if f.get("object") else col
                     if _scoped in _already_gone or col in _already_gone:
-                        continue   # dropped → not a realign/type candidate
+                        continue
                     _ti = tgt_types.get((f.get("object"), col.lower())) or {}
                     tgt_t = _ti.get("type", "")
                     src_cdw = src_types.get((f.get("object"), col.lower()), "")
                     src_tml = f.get("source_type", "")
+                    # VOID: the warehouse has NO usable type for this column. It can't bind and can't
+                    # be realigned — it is NOT a type mismatch. Route it to its own drop table so it
+                    # never shows up under "type mismatches" again.
+                    if _tnorm(tgt_t) == "void" or _tnorm(src_cdw) == "void":
+                        _void_rows.append({
+                            "#":          str(_tbl_serial.get(obj.strip().lower(), "")),
+                            "Table":      obj,
+                            "Column":     col,
+                            "Source CDW": src_cdw.upper() if src_cdw else "(unread)",
+                            "Target CDW": tgt_t.upper() if tgt_t else "(unread)",
+                            "Drop?":      _scoped in _tmsel,
+                            "_scoped":    _scoped,
+                        })
+                        continue
                     _agree = bool(src_cdw and tgt_t and _tnorm(src_cdw) == _tnorm(tgt_t))
-                    # REALIGN is offered ONLY when both warehouses agree on a real type and the TML is
-                    # the stale outlier. TS validates the TML against the TARGET CDW and re-introspects
-                    # the warehouse, so (a) the value must be the TS TOKEN for that type (INT64, not
-                    # 'bigint'), and (b) aligning to target when the warehouses DISAGREE would just mask
-                    # a genuine drift — which we refuse. A VOID / unmappable CDW type → no realign.
+                    # REALIGN only when both warehouses agree on a real type and the TML is the stale
+                    # outlier — written as the TS TOKEN (INT64, not 'bigint'). Disagree → fix warehouse.
                     _ts = warehouse_type_to_ts(tgt_t) if _agree else ""
                     if _ts and _tnorm(_ts) != _tnorm(src_tml):
                         _ralign = _ts
@@ -2832,9 +2835,6 @@ elif step == 2:
                     elif not _agree and src_cdw and tgt_t:
                         _ralign = ""
                         _issue = "source vs target warehouse types differ — fix the warehouse, or drop"
-                    elif tgt_t and _tnorm(tgt_t) == _tnorm("void"):
-                        _ralign = ""
-                        _issue = "column is VOID in the warehouse — drop it, or fix the warehouse"
                     else:
                         _ralign = ""
                         _issue = "types differ — realign only when both warehouses agree; else drop"
@@ -2855,13 +2855,53 @@ elif step == 2:
                         "_scoped":    _scoped,
                     })
                 st.session_state._tm_realign_to = _realign_to   # so "Apply all" can read the tokens
-                # Explicit columns so an all-resolved (empty) list still renders a harmless 0-row
-                # table instead of crashing on a missing column.
+
+                # ── unusable columns (VOID in the warehouse) — drop, NOT a type mismatch ──
+                if _void_rows:
+                    st.markdown("#### Columns the warehouse can't type (VOID) — drop")
+                    st.caption("These exist in the warehouse but with no usable type (VOID), so they "
+                               "can't bind and can't be realigned. Drop them from the promotion (or fix "
+                               "the column in the warehouse). This is not a type mismatch.")
+                    _vdf = pd.DataFrame(_void_rows, columns=["#", "Table", "Column", "Source CDW",
+                                                             "Target CDW", "Drop?", "_scoped"])
+                    _vb1, _vb2, _ = st.columns([1, 1, 3])
+                    with _vb1:
+                        if st.button(f"Drop all ({len(_vdf)})", key="tmvoid_all",
+                                     use_container_width=True, disabled=_vdf.empty):
+                            _tmsel.update(_vdf["_scoped"].tolist()); _bump_editor("tmvoid"); st.rerun()
+                    with _vb2:
+                        if st.button("Clear all", key="tmvoid_clear", use_container_width=True,
+                                     disabled=not any(_s in _tmsel for _s in _vdf["_scoped"])):
+                            for _s in _vdf["_scoped"].tolist():
+                                _tmsel.discard(_s)
+                            _bump_editor("tmvoid"); st.rerun()
+                    _select_editor(
+                        _vdf, ["Drop?"], ["tm_drop_selected"], "tmvoid",
+                        column_config={
+                            "#":          st.column_config.TextColumn("#", width="small"),
+                            "Table":      st.column_config.TextColumn("Table", width="medium"),
+                            "Column":     st.column_config.TextColumn("Column", width="medium"),
+                            "Source CDW": st.column_config.TextColumn("Source CDW", width="small"),
+                            "Target CDW": st.column_config.TextColumn("Target CDW", width="small"),
+                            "Drop?":      st.column_config.CheckboxColumn("Drop?", width="small",
+                                            help="Drop this unusable (VOID) column from the promotion."),
+                        },
+                        disabled=["#", "Table", "Column", "Source CDW", "Target CDW"])
+
+                # ── genuine type mismatches (realignable / real drift) ──
+                if _rows:
+                    st.markdown("#### Column type mismatches")
+                    st.caption(
+                        "The data type disagrees across **source CDW · source TML · target CDW**. "
+                        "**Flagged, never auto-corrected.** Realign when both warehouses agree the TML "
+                        "is stale; when they genuinely differ, fix the warehouse, or drop as a last "
+                        "resort (scoped to that one table).")
+                elif not _void_rows:
+                    st.caption("No type mismatches to resolve here (any already dropped are excluded).")
+                # Explicit columns so an empty list renders a harmless 0-row table (no crash).
                 _df = pd.DataFrame(_rows, columns=["#", "Table", "Column", "Source CDW", "Source TML",
                                                    "Target CDW", "Issue", "Realign to", "Realign?",
                                                    "Drop?", "_scoped"])
-                if not _rows:
-                    st.caption("No type mismatches to resolve here (any already dropped are excluded).")
                 _q = st.text_input("Filter type mismatches", key="tm_search",
                                    label_visibility="collapsed",
                                    placeholder="🔎 Filter by table or column name").strip().lower()
