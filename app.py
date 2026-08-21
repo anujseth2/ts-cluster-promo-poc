@@ -27,6 +27,7 @@ from services.import_diagnostics import (
     classify_import_errors, drop_columns, silent_drop_findings, column_dependents, column_usage,
     drop_vizzes, table_drop_preview, drop_tables, warehouse_missing_findings, friendly_error,
     column_drop_cascade, finding_key, dangling_reference_findings, table_cleanup_findings,
+    realign_column_types,
 )
 from services.table_matcher import column_signature
 from services.feedback_replace import feedback_preview, replace_prep, replace_finalize
@@ -563,7 +564,8 @@ if step == 0:
                         # source-CDW validation state (Increments 2 & 3) — reset for new content
                         "recase_approved", "_recase_applied_set", "_recase_events",
                         "_source_col_map", "src_drop_selected", "wh_drop_selected",
-                        "tm_drop_selected", "_target_modeled_map"):
+                        "tm_drop_selected", "tm_realign_selected", "_tm_realign_to",
+                        "_target_modeled_map"):
                 st.session_state.pop(key, None)
 
     assets = st.session_state.get("assets", [])
@@ -2743,8 +2745,9 @@ elif step == 2:
                 src_types = st.session_state.get("_tm_src_types", {})
 
                 _tnorm = lambda s: "".join((s or "").lower().split())   # loose compare
-                _tmsel = st.session_state.setdefault("tm_drop_selected", set())
-                _promo = st.session_state.get("transformed_items", [])
+                _tmsel   = st.session_state.setdefault("tm_drop_selected", set())
+                _tmrsel  = st.session_state.setdefault("tm_realign_selected", set())
+                _realign_to = {}   # scoped key -> the type a realign would write (case preserved)
                 _rows = []
                 for f in sorted(type_mismatch, key=lambda x: ((x.get("object") or "").lower(),
                                                               (x.get("column") or "").lower())):
@@ -2759,12 +2762,19 @@ elif step == 2:
                         _issue.append("TML out of sync with source CDW")
                     if src_cdw and tgt_t and _tnorm(src_cdw) != _tnorm(tgt_t):
                         _issue.append("source vs target CDW differ")
-                    _casc = column_drop_cascade(_promo, [col])   # scoped cascade preview
-                    _dep = []
-                    if _casc["joins"]:    _dep.append(f"{_casc['joins']} join(s)")
-                    if _casc["formulas"]: _dep.append(f"{len(_casc['formulas'])} formula(s)")
-                    if _casc["vizzes"]:   _dep.append(f"{_casc['vizzes']} viz(es)")
                     _scoped = f"{obj}::{col}" if f.get("object") else col
+                    # SOURCE-FIRST realignment target: if the TML disagrees with the source CDW, set
+                    # the TML type to the source CDW (fix the stale model). Once it matches source, if
+                    # it still disagrees with the target CDW, align to the target. Case preserved so
+                    # the value matches what the warehouse reports; the re-validate confirms it took.
+                    if src_cdw and _tnorm(src_tml) != _tnorm(src_cdw):
+                        _ralign = src_cdw
+                    elif tgt_t and _tnorm(src_tml) != _tnorm(tgt_t):
+                        _ralign = tgt_t
+                    else:
+                        _ralign = ""
+                    if _ralign:
+                        _realign_to[_scoped] = _ralign
                     _tag = "" if _ti.get("source") == "warehouse" else " (modeled)"
                     _rows.append({
                         "#":          str(_tbl_serial.get(obj.strip().lower(), "")),
@@ -2774,10 +2784,12 @@ elif step == 2:
                         "Source TML": src_tml or "(?)",
                         "Target CDW": (tgt_t.upper() + _tag) if tgt_t else "(unread)",
                         "Issue":      "; ".join(_issue) if _issue else "types differ",
-                        "Dropping removes": ", ".join(_dep) if _dep else "just the column",
+                        "Realign to": _ralign.upper() if _ralign else "—",
+                        "Realign?":   _scoped in _tmrsel,
                         "Drop?":      _scoped in _tmsel,
                         "_scoped":    _scoped,
                     })
+                st.session_state._tm_realign_to = _realign_to   # so "Apply all" can read the types
                 _df = pd.DataFrame(_rows)
                 _q = st.text_input("Filter type mismatches", key="tm_search",
                                    label_visibility="collapsed",
@@ -2799,32 +2811,48 @@ elif step == 2:
                                         help="'(modeled)' = read from the target's logical table, "
                                              "not the warehouse."),
                         "Issue":      st.column_config.TextColumn("Issue", width="medium"),
-                        "Dropping removes": st.column_config.TextColumn("Dropping removes", width="medium",
-                                        help="What a drop would cascade-remove from the promotion."),
+                        "Realign to": st.column_config.TextColumn("Realign to", width="small",
+                                        help="Type a realign would set on the TML: the SOURCE CDW "
+                                             "type when the TML is stale against it, otherwise the "
+                                             "target CDW type."),
+                        "Realign?":   st.column_config.CheckboxColumn("Realign?", width="small",
+                                        help="Set the TML's type to 'Realign to' (approve-first). "
+                                             "Preferred over dropping when the column exists."),
                         "Drop?":      st.column_config.CheckboxColumn("Drop?", width="small",
                                         help="Last resort: drop this column (scoped to this table) "
                                              "and its dependents."),
                     },
                     disabled=["#", "Table", "Column", "Source CDW", "Source TML", "Target CDW",
-                              "Issue", "Dropping removes"],
+                              "Issue", "Realign to"],
                     hide_index=True, use_container_width=True, key=f"tm_editor::{_q}")
                 for _i in _view.index:
                     _sk = _df.at[_i, "_scoped"]
-                    if bool(_ed.at[_i, "Drop?"]):
+                    if bool(_ed.at[_i, "Realign?"]):
+                        _tmrsel.add(_sk)
+                    else:
+                        _tmrsel.discard(_sk)
+                    # Drop and Realign are mutually exclusive per column; realign wins if both ticked.
+                    if bool(_ed.at[_i, "Drop?"]) and _sk not in _tmrsel:
                         _tmsel.add(_sk)
                     else:
                         _tmsel.discard(_sk)
-                st.caption(f"**{len(_tmsel)}** column(s) marked to drop. Aligning the type at the data "
-                           "layer is preferred; drop only as a last resort.")
+                st.caption(f"**{len(_tmrsel)}** to realign, **{len(_tmsel)}** to drop. Realigning the "
+                           "type is preferred when the column exists (your approval, not automatic); "
+                           "drop only as a last resort.")
 
-                if not _discovered and st.button("Apply drops, re-export & re-validate", key="tm_apply",
-                                                 disabled=not _tmsel):
-                    _drop = set(_tmsel)   # SCOPED table::col keys — never bare (avoids the shared-key over-drop)
-                    fixed, _man = drop_columns(st.session_state.transformed_items, _drop)
-                    st.session_state.transformed_items = fixed
-                    _record_drop(_man)
-                    st.session_state.setdefault("dropped_col_names", set()).update(_drop)
-                    _tmsel.clear()
+                if not _discovered and st.button("Apply realign / drops, re-export & re-validate",
+                                                 key="tm_apply", disabled=not (_tmsel or _tmrsel)):
+                    _items = st.session_state.transformed_items
+                    _re = {k: _realign_to[k] for k in _tmrsel if _realign_to.get(k)}
+                    if _re:
+                        _items, _rn = realign_column_types(_items, _re)
+                    _drop = {k for k in _tmsel if k not in _tmrsel}   # SCOPED; never bare
+                    if _drop:
+                        _items, _man = drop_columns(_items, _drop)
+                        _record_drop(_man)
+                        st.session_state.setdefault("dropped_col_names", set()).update(_drop)
+                    st.session_state.transformed_items = _items
+                    _tmsel.clear(); _tmrsel.clear()
                     filtered_fixed = [i for i in st.session_state.transformed_items
                                       if i.get("info", {}).get("name") not in skip_objects]
                     with st.status("Re-committing & re-validating…", expanded=True) as _rv:
@@ -3060,13 +3088,23 @@ elif step == 2:
                 # Type-mismatch drops now live in the table's persistent selection (already scoped
                 # table::col), replacing the old per-row droptm_ checkboxes.
                 _all_drop |= set(st.session_state.get("tm_drop_selected", set()))
+                # Type-mismatch REALIGNS (set the TML type, don't drop) — applied first; a realigned
+                # column is never also dropped.
+                _all_realign = {k: st.session_state.get("_tm_realign_to", {}).get(k)
+                                for k in st.session_state.get("tm_realign_selected", set())
+                                if st.session_state.get("_tm_realign_to", {}).get(k)}
+                _all_drop -= set(_all_realign)
                 _tbl_now = set(tbl_drop)   # whole tables to prune (empty / disconnected)
                 st.divider()
                 _lbl_tbl = f" + {len(_tbl_now)} table(s)" if _tbl_now else ""
+                _lbl_re = f"{len(_all_realign)} realign · " if _all_realign else ""
                 st.caption("All of the above was found by validating repeatedly until clean — "
-                           "tick what to drop, then resolve everything in a single re-validate.")
-                if st.button(f"Apply all resolutions & re-validate  ·  {len(_all_drop)} column(s){_lbl_tbl} to drop",
+                           "tick realign or drop, then resolve everything in a single re-validate.")
+                if st.button(f"Apply all resolutions & re-validate  ·  {_lbl_re}{len(_all_drop)} column(s){_lbl_tbl} to drop",
                              type="primary"):
+                    if _all_realign:
+                        fixed, _rn = realign_column_types(st.session_state.transformed_items, _all_realign)
+                        st.session_state.transformed_items = fixed
                     if _all_drop:
                         fixed, _man = drop_columns(st.session_state.transformed_items, _all_drop)
                         st.session_state.transformed_items = fixed
@@ -3096,6 +3134,7 @@ elif step == 2:
                             st.session_state.pop("wh_drop_selected", None)   # ticks consumed
                             st.session_state.pop("src_drop_selected", None)
                             st.session_state.pop("tm_drop_selected", None)
+                            st.session_state.pop("tm_realign_selected", None)
                             st.session_state.pop("_source_col_map", None)    # stale after drops
                     if _res:
                         st.rerun()

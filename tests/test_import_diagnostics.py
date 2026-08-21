@@ -302,6 +302,31 @@ def _tbl_item(name, cols):
     return {"edoc": json.dumps(doc)}
 
 
+def test_realign_column_types_sets_scoped_type_only():
+    from services.import_diagnostics import realign_column_types
+    # Two tables both have HCP_ID; realign ONLY tableA's HCP_ID (VARCHAR -> BIGINT).
+    def _t(name):
+        return {"edoc": json.dumps({"table": {"name": name, "columns": [
+            {"name": "HCP_ID", "db_column_name": "HCP_ID",
+             "db_column_properties": {"data_type": "VARCHAR"}}]}})}
+    items = [_t("tableA"), _t("tableB")]
+    out, n = realign_column_types(items, {"tableA::HCP_ID": "BIGINT"})
+    assert n == 1
+    a = json.loads(out[0]["edoc"])["table"]["columns"][0]["db_column_properties"]["data_type"]
+    b = json.loads(out[1]["edoc"])["table"]["columns"][0]["db_column_properties"]["data_type"]
+    assert a == "BIGINT" and b == "VARCHAR"      # scoped: tableB untouched
+
+
+def test_realign_ignores_bare_and_empty():
+    from services.import_diagnostics import realign_column_types
+    doc = {"edoc": json.dumps({"table": {"name": "t", "columns": [
+        {"name": "c", "db_column_name": "c", "db_column_properties": {"data_type": "VARCHAR"}}]}})}
+    # bare key (no ::) and empty type are ignored — never a global retype
+    out, n = realign_column_types([doc], {"c": "BIGINT", "t::c": ""})
+    assert n == 0
+    assert json.loads(out[0]["edoc"])["table"]["columns"][0]["db_column_properties"]["data_type"] == "VARCHAR"
+
+
 def test_source_absent_flags_only_out_of_sync_column_case_insensitively():
     # respbio_fact has an out-of-sync column (opus_priority_account) gone from the source CDW;
     # CID (upper in TML) matches cid in the warehouse case-insensitively and must NOT be flagged;

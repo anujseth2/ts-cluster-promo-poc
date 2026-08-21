@@ -792,6 +792,40 @@ def column_drop_cascade(items, columns):
     return man
 
 
+def realign_column_types(items, realign):
+    """Approve-first TYPE realignment: set a column's declared data_type to a new value so it
+    matches the CDW (fixing a 14536 DataType mismatch), instead of dropping the column. This is
+    a deliberate, user-approved change — never automatic.
+
+    `realign`: {"table::col": new_type} — ALWAYS table-qualified (scoped to that one table, so a
+    shared column name isn't retyped everywhere). The type is written to the TABLE column's
+    `db_column_properties.data_type` (where column_signature and TS's 14536 check read it); the
+    caller re-validates afterward, which is the source of truth on whether the new type satisfied
+    the warehouse. Returns (new_items, count_changed)."""
+    want = {}   # (table_lower, col_lower) -> new_type
+    for k, v in (realign or {}).items():
+        if "::" in (k or "") and v:
+            _t, _c = k.split("::", 1)
+            want[(_t.strip().lower(), _c.strip().lower())] = v
+    if not want:
+        return items, 0
+    out, n = [], 0
+    for item in items:
+        doc = _parse_edoc(item)
+        t = doc.get("table")
+        if t and t.get("columns"):
+            _tl = (t.get("name", "") or "").strip().lower()
+            for c in t["columns"]:
+                nm  = (c.get("name", "") or "").strip().lower()
+                dbn = (c.get("db_column_name", "") or "").strip().lower()
+                new_t = want.get((_tl, nm)) or want.get((_tl, dbn))
+                if new_t:
+                    c.setdefault("db_column_properties", {})["data_type"] = new_t
+                    n += 1
+        out.append({**item, "edoc": json.dumps(doc)})
+    return out, n
+
+
 def drop_vizzes(items, viz_ids):
     """Remove specific visualizations (by id) from any liveboard in `items`, and prune any
     layout tiles that referenced them (flat layout.tiles or tabbed layout.tabs[].tiles).
