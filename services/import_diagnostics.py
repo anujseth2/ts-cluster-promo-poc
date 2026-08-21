@@ -792,6 +792,34 @@ def column_drop_cascade(items, columns):
     return man
 
 
+_WH_TO_TS_TYPE = {
+    "boolean": "BOOL", "bool": "BOOL",
+    "tinyint": "INT64", "smallint": "INT64", "int": "INT64", "integer": "INT64",
+    "bigint": "INT64", "long": "INT64",
+    "float": "DOUBLE", "double": "DOUBLE", "real": "DOUBLE",
+    "string": "VARCHAR", "text": "VARCHAR",
+    "date": "DATE",
+    "timestamp": "DATE_TIME", "timestamp_ntz": "DATE_TIME", "datetime": "DATE_TIME",
+}
+
+
+def warehouse_type_to_ts(wh_type):
+    """Map a warehouse (Databricks) physical type to the ThoughtSpot TML `data_type` TOKEN that
+    represents it (e.g. bigint -> INT64, string -> VARCHAR). TML data_type is a TS enum, NOT the raw
+    warehouse string — writing 'bigint' is rejected ('Data type bigint is not valid'). Returns "" for
+    anything we can't confidently map (e.g. Databricks 'void'), so the caller offers NO realign there
+    — you cannot realign to a type that isn't real. Verified TS tokens: INT64/DOUBLE/VARCHAR/BOOL/
+    DATE/DATE_TIME."""
+    t = (wh_type or "").strip().lower()
+    if not t:
+        return ""
+    if t.startswith(("decimal", "numeric")):
+        return "DOUBLE"
+    if t.startswith(("varchar", "char")):
+        return "VARCHAR"
+    return _WH_TO_TS_TYPE.get(t, "")
+
+
 def realign_column_types(items, realign):
     """Approve-first TYPE realignment: set a column's declared data_type to a new value so it
     matches the CDW (fixing a 14536 DataType mismatch), instead of dropping the column. This is

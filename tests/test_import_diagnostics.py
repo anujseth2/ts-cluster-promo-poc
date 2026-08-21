@@ -317,6 +317,19 @@ def test_realign_column_types_sets_scoped_type_only():
     assert a == "BIGINT" and b == "VARCHAR"      # scoped: tableB untouched
 
 
+def test_warehouse_type_to_ts_tokens():
+    from services.import_diagnostics import warehouse_type_to_ts
+    assert warehouse_type_to_ts("bigint") == "INT64"      # the HCP_ID case — NOT literal 'bigint'
+    assert warehouse_type_to_ts("BIGINT") == "INT64"      # case-insensitive
+    assert warehouse_type_to_ts("string") == "VARCHAR"
+    assert warehouse_type_to_ts("boolean") == "BOOL"
+    assert warehouse_type_to_ts("double") == "DOUBLE"
+    assert warehouse_type_to_ts("decimal(10,2)") == "DOUBLE"
+    assert warehouse_type_to_ts("timestamp") == "DATE_TIME"
+    assert warehouse_type_to_ts("void") == ""             # not a real type -> no realign
+    assert warehouse_type_to_ts("") == ""
+
+
 def test_realign_ignores_bare_and_empty():
     from services.import_diagnostics import realign_column_types
     doc = {"edoc": json.dumps({"table": {"name": "t", "columns": [

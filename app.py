@@ -27,7 +27,7 @@ from services.import_diagnostics import (
     classify_import_errors, drop_columns, silent_drop_findings, column_dependents, column_usage,
     drop_vizzes, table_drop_preview, drop_tables, warehouse_missing_findings, friendly_error,
     column_drop_cascade, finding_key, dangling_reference_findings, table_cleanup_findings,
-    realign_column_types,
+    realign_column_types, warehouse_type_to_ts,
 )
 from services.table_matcher import column_signature
 from services.feedback_replace import feedback_preview, replace_prep, replace_finalize
@@ -2747,32 +2747,41 @@ elif step == 2:
                 _tnorm = lambda s: "".join((s or "").lower().split())   # loose compare
                 _tmsel   = st.session_state.setdefault("tm_drop_selected", set())
                 _tmrsel  = st.session_state.setdefault("tm_realign_selected", set())
-                _realign_to = {}   # scoped key -> the type a realign would write (case preserved)
+                _realign_to = {}   # scoped key -> the TS TOKEN a realign would write
+                # Columns already dropped this run are NOT type-mismatch candidates — otherwise a
+                # column you resolved by dropping keeps reappearing here one re-validate at a time.
+                _already_gone = st.session_state.get("dropped_col_names", set())
                 _rows = []
                 for f in sorted(type_mismatch, key=lambda x: ((x.get("object") or "").lower(),
                                                               (x.get("column") or "").lower())):
                     obj = f.get("object") or "(table)"
                     col = f.get("column", "")
+                    _scoped = f"{obj}::{col}" if f.get("object") else col
+                    if _scoped in _already_gone or col in _already_gone:
+                        continue   # dropped → not a realign/type candidate
                     _ti = tgt_types.get((f.get("object"), col.lower())) or {}
                     tgt_t = _ti.get("type", "")
                     src_cdw = src_types.get((f.get("object"), col.lower()), "")
                     src_tml = f.get("source_type", "")
-                    _issue = []
-                    if src_cdw and _tnorm(src_cdw) != _tnorm(src_tml):
-                        _issue.append("TML out of sync with source CDW")
-                    if src_cdw and tgt_t and _tnorm(src_cdw) != _tnorm(tgt_t):
-                        _issue.append("source vs target CDW differ")
-                    _scoped = f"{obj}::{col}" if f.get("object") else col
-                    # SOURCE-FIRST realignment target: if the TML disagrees with the source CDW, set
-                    # the TML type to the source CDW (fix the stale model). Once it matches source, if
-                    # it still disagrees with the target CDW, align to the target. Case preserved so
-                    # the value matches what the warehouse reports; the re-validate confirms it took.
-                    if src_cdw and _tnorm(src_tml) != _tnorm(src_cdw):
-                        _ralign = src_cdw
-                    elif tgt_t and _tnorm(src_tml) != _tnorm(tgt_t):
-                        _ralign = tgt_t
+                    _agree = bool(src_cdw and tgt_t and _tnorm(src_cdw) == _tnorm(tgt_t))
+                    # REALIGN is offered ONLY when both warehouses agree on a real type and the TML is
+                    # the stale outlier. TS validates the TML against the TARGET CDW and re-introspects
+                    # the warehouse, so (a) the value must be the TS TOKEN for that type (INT64, not
+                    # 'bigint'), and (b) aligning to target when the warehouses DISAGREE would just mask
+                    # a genuine drift — which we refuse. A VOID / unmappable CDW type → no realign.
+                    _ts = warehouse_type_to_ts(tgt_t) if _agree else ""
+                    if _ts and _tnorm(_ts) != _tnorm(src_tml):
+                        _ralign = _ts
+                        _issue = "TML type is stale; both warehouses agree it should be " + _ts
+                    elif not _agree and src_cdw and tgt_t:
+                        _ralign = ""
+                        _issue = "source vs target warehouse types differ — fix the warehouse, or drop"
+                    elif tgt_t and _tnorm(tgt_t) == _tnorm("void"):
+                        _ralign = ""
+                        _issue = "column is VOID in the warehouse — drop it, or fix the warehouse"
                     else:
                         _ralign = ""
+                        _issue = "types differ — realign only when both warehouses agree; else drop"
                     if _ralign:
                         _realign_to[_scoped] = _ralign
                     _tag = "" if _ti.get("source") == "warehouse" else " (modeled)"
@@ -2783,19 +2792,25 @@ elif step == 2:
                         "Source CDW": src_cdw.upper() if src_cdw else "(unread)",
                         "Source TML": src_tml or "(?)",
                         "Target CDW": (tgt_t.upper() + _tag) if tgt_t else "(unread)",
-                        "Issue":      "; ".join(_issue) if _issue else "types differ",
-                        "Realign to": _ralign.upper() if _ralign else "—",
+                        "Issue":      _issue,
+                        "Realign to": _ralign if _ralign else "—",
                         "Realign?":   _scoped in _tmrsel,
                         "Drop?":      _scoped in _tmsel,
                         "_scoped":    _scoped,
                     })
-                st.session_state._tm_realign_to = _realign_to   # so "Apply all" can read the types
-                _df = pd.DataFrame(_rows)
+                st.session_state._tm_realign_to = _realign_to   # so "Apply all" can read the tokens
+                # Explicit columns so an all-resolved (empty) list still renders a harmless 0-row
+                # table instead of crashing on a missing column.
+                _df = pd.DataFrame(_rows, columns=["#", "Table", "Column", "Source CDW", "Source TML",
+                                                   "Target CDW", "Issue", "Realign to", "Realign?",
+                                                   "Drop?", "_scoped"])
+                if not _rows:
+                    st.caption("No type mismatches to resolve here (any already dropped are excluded).")
                 _q = st.text_input("Filter type mismatches", key="tm_search",
                                    label_visibility="collapsed",
                                    placeholder="🔎 Filter by table or column name").strip().lower()
                 _view = _df
-                if _q:
+                if _q and not _df.empty:
                     _view = _df[_df.apply(lambda r: _q in str(r["Table"]).lower()
                                           or _q in str(r["Column"]).lower(), axis=1)]
                 _ed = st.data_editor(
@@ -2812,12 +2827,13 @@ elif step == 2:
                                              "not the warehouse."),
                         "Issue":      st.column_config.TextColumn("Issue", width="medium"),
                         "Realign to": st.column_config.TextColumn("Realign to", width="small",
-                                        help="Type a realign would set on the TML: the SOURCE CDW "
-                                             "type when the TML is stale against it, otherwise the "
-                                             "target CDW type."),
+                                        help="The TS type token a realign would set on the TML. Only "
+                                             "offered when BOTH warehouses agree on a real type and the "
+                                             "TML is the stale outlier; blank ('—') when they disagree "
+                                             "or the column is VOID (drop / fix the warehouse instead)."),
                         "Realign?":   st.column_config.CheckboxColumn("Realign?", width="small",
                                         help="Set the TML's type to 'Realign to' (approve-first). "
-                                             "Preferred over dropping when the column exists."),
+                                             "Preferred over dropping when both warehouses agree."),
                         "Drop?":      st.column_config.CheckboxColumn("Drop?", width="small",
                                         help="Last resort: drop this column (scoped to this table) "
                                              "and its dependents."),
