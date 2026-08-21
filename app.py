@@ -234,6 +234,56 @@ def _gap_label(promoted_n, modeled_n):
     return "match"
 
 
+def _select_editor(view, checkbox_cols, sel_keys, editor_base, column_config, disabled,
+                   exclusive=False):
+    """Render a data_editor whose checkbox column(s) persist in session sets, with SINGLE-CLICK
+    behaviour. `view` must carry a hidden '_scoped' column. For each (checkbox_col, sel_key) pair,
+    ticks land in st.session_state[sel_key] (a set of the row's _scoped value).
+
+    Single-click works because an on_change callback consumes the edit BEFORE the rerun body redraws
+    (a stashed position->scoped list maps the edit, since callbacks run before this run's locals
+    exist). `exclusive=True` makes the FIRST checkbox win over the second per row (used for
+    realign-vs-drop). A generation counter in the key lets bulk buttons reset the editor cleanly.
+
+    checkbox_cols/sel_keys are parallel lists (1 or 2 entries)."""
+    gen = st.session_state.get(f"_gen_{editor_base}", 0)
+    ekey = f"{editor_base}::{gen}"
+    st.session_state[f"_posmap_{editor_base}"] = list(view["_scoped"])
+    for _k in sel_keys:
+        st.session_state.setdefault(_k, set())
+
+    def _cb(ekey=ekey, cols=tuple(checkbox_cols), keys=tuple(sel_keys),
+            pk=f"_posmap_{editor_base}", excl=exclusive):
+        pm = st.session_state.get(pk, [])
+        state = st.session_state.get(ekey, {}) or {}
+        for _pos, _ch in (state.get("edited_rows") or {}).items():
+            p = int(_pos)
+            if not (0 <= p < len(pm)):
+                continue
+            sk = pm[p]
+            for _i, _col in enumerate(cols):
+                if _col not in _ch:
+                    continue
+                _set = st.session_state.setdefault(keys[_i], set())
+                if _ch[_col]:
+                    _set.add(sk)
+                    if excl and _i == 0:   # first checkbox wins: clear the other for this row
+                        for _j, _ok in enumerate(keys):
+                            if _j != _i:
+                                st.session_state.setdefault(_ok, set()).discard(sk)
+                else:
+                    _set.discard(sk)
+
+    st.data_editor(view.drop(columns=["_scoped"]), column_config=column_config, disabled=disabled,
+                   hide_index=True, use_container_width=True, key=ekey, on_change=_cb)
+
+
+def _bump_editor(editor_base):
+    """Force a fresh data_editor next run (after a bulk select-all/clear) so stored per-cell edits
+    don't fight the new seed."""
+    st.session_state[f"_gen_{editor_base}"] = st.session_state.get(f"_gen_{editor_base}", 0) + 1
+
+
 def _record_drop(man):
     """Accumulate a drop_columns manifest (columns/vizzes/joins/formulas) into session counters
     for the Import Results report."""
@@ -1725,28 +1775,26 @@ elif step == 2:
                 _tbl_cols[t["name"]] = _display_cols(t)
         if _tbl_cols:
             _skip_now = st.session_state.get("skip_columns", set())
-            # A session-persisted toggle instead of st.expander. An expander re-applies its
-            # `expanded` flag on every rerun, so picking a column inside it (which reruns) snapped it
-            # shut every time. A checkbox keeps its own state across reruns, so the section stays open
-            # while you pick. Default it open when skips already exist.
-            st.session_state.setdefault("_show_skip", bool(_skip_now))
-            st.checkbox("Skip specific columns (optional) — leave a column out, keep the rest",
-                        key="_show_skip")
-            if st.session_state.get("_show_skip"):
-                st.caption("Pick columns to exclude from this promotion. The rest of the table "
-                           "promotes normally; any viz that uses a skipped column is dropped too. "
-                           "The number by each table matches its S.No in the count table above.")
-                _picked = set()
-                # Order tables by their count-table serial so the two views line up row-for-row.
-                for _tn in sorted(_tbl_cols, key=lambda n: _tbl_serial.get(n.strip().lower(), 1e9)):
-                    _cols = _tbl_cols[_tn]
-                    _sn = _tbl_serial.get(_tn.strip().lower())
-                    _lbl = f"{_sn}. `{_tn}` — columns to skip" if _sn else f"`{_tn}` — columns to skip"
-                    _sel = st.multiselect(
-                        _lbl, options=sorted(_cols),
-                        default=sorted(c for c in _cols if c in _skip_now),
-                        key=f"skipcols_{_tn}")
-                    _picked.update(_sel)
+            # One dropdown (multiselect) of every promoted column, labelled "N. table · column" so it
+            # lines up with the count table's S.No. A multiselect is a dropdown that stays open and
+            # persists cleanly (no expander to collapse, no double-click). Values are SCOPED
+            # `table::col`, so skipping a shared name only drops it from that one table.
+            _skip_label_to_key, _skip_opts = {}, []
+            for _tn in sorted(_tbl_cols, key=lambda n: _tbl_serial.get(n.strip().lower(), 1e9)):
+                _sn = _tbl_serial.get(_tn.strip().lower())
+                for _c in sorted(_tbl_cols[_tn]):
+                    _lbl = f"{_sn}. {_tn} · {_c}" if _sn else f"{_tn} · {_c}"
+                    _skip_label_to_key[_lbl] = f"{_tn.strip().lower()}::{_c.strip().lower()}"
+                    _skip_opts.append(_lbl)
+            _picked_lbls = st.multiselect(
+                "Skip specific columns (optional) — leave a column out, keep the rest",
+                options=_skip_opts,
+                default=[_l for _l, _k in _skip_label_to_key.items() if _k in _skip_now],
+                key="skip_ms",
+                help="Pick columns to exclude from this promotion; the rest of each table promotes "
+                     "normally, and any viz that uses a skipped column is dropped too.")
+            _picked = {_skip_label_to_key[_l] for _l in _picked_lbls}
+            if _picked or _skip_now:
                 if st.button("Apply column skips & re-export", disabled=(_picked == _skip_now)):
                     st.session_state.skip_columns = _picked
                     # Force a clean re-export so the skip set is applied from a fresh bundle
@@ -1779,19 +1827,19 @@ elif step == 2:
                 for _e in sorted(_recase_props, key=lambda x: (x["table"].lower(), x["from"].lower())):
                     _sk = f"{_e['table'].strip().lower()}::{_e['from'].strip().lower()}"
                     _rrows.append({"Table": _e["table"], "From": _e["from"], "To": _e["to"],
-                                   "Approve?": _sk in _rapp, "_sk": _sk})
-                _rdf = pd.DataFrame(_rrows)
+                                   "Approve?": _sk in _rapp, "_scoped": _sk})
+                _rdf = pd.DataFrame(_rrows, columns=["Table", "From", "To", "Approve?", "_scoped"])
                 _ba, _bc = st.columns([1, 1])
                 with _ba:
                     if st.button(f"Approve all ({len(_rdf)})", key="recase_all",
                                  use_container_width=True):
-                        _rapp.update(_rdf["_sk"].tolist()); st.rerun()
+                        _rapp.update(_rdf["_scoped"].tolist()); _bump_editor("recase"); st.rerun()
                 with _bc:
                     if st.button("Clear all", key="recase_clear", disabled=not _rapp,
                                  use_container_width=True):
-                        _rapp.clear(); st.rerun()
-                _red = st.data_editor(
-                    _rdf.drop(columns=["_sk"]),
+                        _rapp.clear(); _bump_editor("recase"); st.rerun()
+                _select_editor(
+                    _rdf, ["Approve?"], ["recase_approved"], "recase",
                     column_config={
                         "Table":    st.column_config.TextColumn("Table", width="medium"),
                         "From":     st.column_config.TextColumn("From (source)", width="medium"),
@@ -1799,14 +1847,7 @@ elif step == 2:
                         "Approve?": st.column_config.CheckboxColumn("Approve?", width="small",
                                       help="Tick to recase this column to the warehouse casing."),
                     },
-                    disabled=["Table", "From", "To"], hide_index=True,
-                    use_container_width=True, key="recase_editor")
-                for _i in _rdf.index:
-                    _sk = _rdf.at[_i, "_sk"]
-                    if bool(_red.at[_i, "Approve?"]):
-                        _rapp.add(_sk)
-                    else:
-                        _rapp.discard(_sk)
+                    disabled=["Table", "From", "To"])
                 if _rapp != _applied_set:
                     st.warning(f"{len(_rapp)} recasing(s) approved but not yet applied to the bundle.")
                     if st.button("Apply recasings & re-export", type="primary", key="recase_apply"):
@@ -2596,36 +2637,36 @@ elif step == 2:
                         "Drop?":  _scoped in _sel,
                         "_scoped": _scoped,
                     })
-                _df = pd.DataFrame(_rows)
+                _df = pd.DataFrame(_rows, columns=["#", "Table", "Column", "Dependents (source)",
+                                                   "✓", "Connection", "Drop?", "_scoped"])
 
-                # Search (#3) + tick/clear over the shown rows. Selection lives in wh_drop_selected and
-                # is reconciled from the VISIBLE rows only, so filtering never loses a tick.
+                # Search + tick/clear over the shown rows. Selection persists in wh_drop_selected;
+                # single-click ticks + a fresh editor per (query, generation) come from _select_editor.
                 _cs, _cb1, _cb2 = st.columns([3, 1, 1])
                 with _cs:
                     _q = st.text_input("Filter columns", key="wh_search",
                                        label_visibility="collapsed",
                                        placeholder="🔎 Filter by table or column name").strip().lower()
-                if _q:
-                    _mask = _df.apply(lambda r: _q in str(r["Table"]).lower()
-                                      or _q in str(r["Column"]).lower(), axis=1)
-                    _view = _df[_mask]
+                if _q and not _df.empty:
+                    _view = _df[_df.apply(lambda r: _q in str(r["Table"]).lower()
+                                          or _q in str(r["Column"]).lower(), axis=1)]
                 else:
                     _view = _df
+                _eb = f"wh_drop::{_q}"
                 with _cb1:
                     if st.button(f"Tick shown ({len(_view)})", use_container_width=True,
                                  disabled=_view.empty):
-                        _sel.update(_view["_scoped"].tolist()); st.rerun()
+                        _sel.update(_view["_scoped"].tolist()); _bump_editor(_eb); st.rerun()
                 with _cb2:
                     if st.button("Clear shown", use_container_width=True, disabled=_view.empty):
-                        for _sk in _view["_scoped"].tolist(): _sel.discard(_sk)
-                        st.rerun()
+                        for _sk in _view["_scoped"].tolist():
+                            _sel.discard(_sk)
+                        _bump_editor(_eb); st.rerun()
                 if _q:
                     st.caption(f"{len(_view)} of {len(_df)} column(s) match “{_q}”.")
 
-                # Query-scoped key: a fresh editor per filtered view (seeded from _sel) so a stored
-                # edit-delta can't mis-apply to a shifted row after the row set changes.
-                _edited = st.data_editor(
-                    _view.drop(columns=["_scoped"]),
+                _select_editor(
+                    _view, ["Drop?"], ["wh_drop_selected"], _eb,
                     column_config={
                         "#":      st.column_config.TextColumn("#", width="small",
                                     help="Matches the S.No in the count table above."),
@@ -2641,16 +2682,7 @@ elif step == 2:
                         "Drop?":  st.column_config.CheckboxColumn("Drop?", width="small",
                                     help="Tick to drop this column (and any viz that uses it)."),
                     },
-                    disabled=["#", "Table", "Column", "Dependents (source)", "✓", "Connection"],
-                    hide_index=True, use_container_width=True, key=f"wh_drop_editor::{_q}",
-                )
-                # Reconcile ONLY the visible rows back into the persistent selection.
-                for _i in _view.index:
-                    _sk = _df.at[_i, "_scoped"]
-                    if bool(_edited.at[_i, "Drop?"]):
-                        _sel.add(_sk)
-                    else:
-                        _sel.discard(_sk)
+                    disabled=["#", "Table", "Column", "Dependents (source)", "✓", "Connection"])
                 drop_set = set(_sel)
                 st.caption(f"**{len(drop_set)}** column(s) marked to drop.")
 
@@ -2837,8 +2869,34 @@ elif step == 2:
                 if _q and not _df.empty:
                     _view = _df[_df.apply(lambda r: _q in str(r["Table"]).lower()
                                           or _q in str(r["Column"]).lower(), axis=1)]
-                _ed = st.data_editor(
-                    _view.drop(columns=["_scoped"]),
+                _teb = f"tm::{_q}"
+                # select-all buttons over shown rows: realign-all only ticks rows that actually HAVE a
+                # realign target ('Realign to' != '—'); drop-all ticks the rest.
+                _tb1, _tb2, _tb3, _ = st.columns([1.3, 1, 1, 2])
+                _shown = list(_view["_scoped"]) if not _view.empty else []
+                _realignable = [row["_scoped"] for _, row in _view.iterrows()
+                                if row.get("Realign to") not in ("—", "", None)] if not _view.empty else []
+                with _tb1:
+                    if st.button(f"Realign all ({len(_realignable)})", key="tm_re_all",
+                                 use_container_width=True, disabled=not _realignable):
+                        _tmrsel.update(_realignable)
+                        for _sk in _realignable:
+                            _tmsel.discard(_sk)
+                        _bump_editor(_teb); st.rerun()
+                with _tb2:
+                    if st.button(f"Drop rest ({len(set(_shown) - set(_realignable))})", key="tm_drop_all",
+                                 use_container_width=True, disabled=not _shown):
+                        for _sk in _shown:
+                            if _sk not in _tmrsel:
+                                _tmsel.add(_sk)
+                        _bump_editor(_teb); st.rerun()
+                with _tb3:
+                    if st.button("Clear all", key="tm_clear", use_container_width=True,
+                                 disabled=not (_tmsel or _tmrsel)):
+                        _tmsel.clear(); _tmrsel.clear()
+                        _bump_editor(_teb); st.rerun()
+                _select_editor(
+                    _view, ["Realign?", "Drop?"], ["tm_realign_selected", "tm_drop_selected"], _teb,
                     column_config={
                         "#":          st.column_config.TextColumn("#", width="small",
                                         help="Matches the S.No in the count table above."),
@@ -2864,20 +2922,9 @@ elif step == 2:
                     },
                     disabled=["#", "Table", "Column", "Source CDW", "Source TML", "Target CDW",
                               "Issue", "Realign to"],
-                    hide_index=True, use_container_width=True, key=f"tm_editor::{_q}")
-                for _i in _view.index:
-                    _sk = _df.at[_i, "_scoped"]
-                    if bool(_ed.at[_i, "Realign?"]):
-                        _tmrsel.add(_sk)
-                    else:
-                        _tmrsel.discard(_sk)
-                    # Drop and Realign are mutually exclusive per column; realign wins if both ticked.
-                    if bool(_ed.at[_i, "Drop?"]) and _sk not in _tmrsel:
-                        _tmsel.add(_sk)
-                    else:
-                        _tmsel.discard(_sk)
+                    exclusive=True)   # Realign? wins over Drop? per row
                 st.caption(f"**{len(_tmrsel)}** to realign, **{len(_tmsel)}** to drop. Realigning the "
-                           "type is preferred when the column exists (your approval, not automatic); "
+                           "type is preferred when both warehouses agree (your approval, not automatic); "
                            "drop only as a last resort.")
 
                 if not _discovered and st.button("Apply realign / drops, re-export & re-validate",
