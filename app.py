@@ -44,7 +44,8 @@ TEAMS_FILE = Path(__file__).parent / "config" / "teams.json"
 STEPS = [
     "1 · Select Assets",
     "2a · obj_id Setup",
-    "2b · TML Validation",
+    "2b · Source Audit",
+    "2c · TML Validation",
     "3 · Git Operations",
     "4 · Import Results",
 ]
@@ -1475,10 +1476,24 @@ elif step == 1:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STEP 2b — TML Validation
+# STEP 2b — Source Audit (fix source drift BEFORE promoting to the target)
 # ══════════════════════════════════════════════════════════════════════════════
 
 elif step == 2:
+    st.subheader("Source Audit")
+    st.caption("Audit the promotion against the **source** warehouse first — drop columns the source "
+               "no longer has, realign or drop source type drift, recase to the source's casing — so "
+               "the TML is source-faithful before it's validated against the target on the next step.")
+    st.info("Coming together — the source checks and the export are moving here next. For now, "
+            "continue to **TML Validation** to run the target validation as before.")
+    _nav(2, can_next=True, next_hint="")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 2c — TML Validation (validate the source-audited TML against the TARGET)
+# ══════════════════════════════════════════════════════════════════════════════
+
+elif step == 3:
     st.subheader("TML Validation")
     st.caption("⏱ This step reads columns from the warehouse and validates the TML against it. "
                "A **cold Databricks SQL warehouse can take a minute or two** to wake and respond — "
@@ -3443,14 +3458,14 @@ elif step == 2:
                 msg += f" {leaves} liveboard/answer(s) will import after."
             st.success(msg)
 
-    _nav(2, can_next="pr_url" in st.session_state,
+    _nav(3, can_next="pr_url" in st.session_state,
           next_hint="Validate & stage the PR to continue")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # STEP 3 — Git Operations (merge & promote)
 # ══════════════════════════════════════════════════════════════════════════════
-elif step == 3:
+elif step == 4:
     transformed_items = st.session_state.get("transformed_items")
     skip_objects   = st.session_state.get("skip_objects", set())
     filtered_items = [i for i in (transformed_items or [])
@@ -3661,14 +3676,14 @@ elif step == 3:
 
     # No next_hint on Git Operations: the page's own buttons (Export & Validate, Merge &
     # Import) are the guidance, and a persistent ⛔ caption through the whole flow just nags.
-    _nav(3, can_next="import_results" in st.session_state)
+    _nav(4, can_next="import_results" in st.session_state)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # STEP 4 — Import Results
 # ══════════════════════════════════════════════════════════════════════════════
 
-elif step == 4:
+elif step == 5:
     st.subheader("Import Results")
 
     results = st.session_state.get("import_results")
@@ -3951,4 +3966,4 @@ elif step == 4:
                 "status": "Status", "error": "Error"})
             st.dataframe(_sno(_fail), use_container_width=True, hide_index=True)
 
-    _nav(4)
+    _nav(5)
