@@ -412,6 +412,81 @@ def _log_apply_detail(tag, drop_set, man, pruned, items):
     return rec
 
 
+# ────────────────────────────────────────────────────────────────────────────
+# Source-warehouse reads — promoted to module level so BOTH Source Audit (2b) and any
+# other page can diff the promotion against the source CDW. Pure: session_state + globals.
+# ────────────────────────────────────────────────────────────────────────────
+def _read_source_col_map():
+    """The SOURCE warehouse's column SET (names) for every promoted table, so the TML can be
+    diffed against it (columns present in the TML but gone from the source CDW). hive SHOW
+    COLUMNS via the source DBX creds (falling back to target for now), else source
+    connection/search. Source coordinates come from the raw source export, pre-remap.
+    Returns {table_lower: {col_lower: actual_case}} — same shape as the target map."""
+    coord_by_name = {}
+    for it in st.session_state.get("_source_raw_items", []):
+        t = _parse_edoc(it.get("edoc", "{}")).get("table") or {}
+        if t.get("name"):
+            coord_by_name[t["name"].strip().lower()] = {
+                "name": t["name"], "database": t.get("db", ""),
+                "schema": t.get("schema", ""), "table": t.get("db_table", "")}
+    tbls = list(coord_by_name.values())
+    out = {}
+    if not tbls:
+        return out
+    _host = opt_env("TS_SOURCE_DBX_HOST") or opt_env("TS_TARGET_DBX_HOST")
+    _whid = opt_env("TS_SOURCE_DBX_WAREHOUSE") or opt_env("TS_TARGET_DBX_WAREHOUSE")
+    _tok  = opt_env("TS_SOURCE_DBX_TOKEN") or opt_env("TS_TARGET_DBX_TOKEN")
+    if _host and _whid and _tok:
+        try:
+            from services.databricks_direct import hive_column_cases
+            out.update(hive_column_cases(_host, _whid, _tok, tbls, opt_env("TS_PROXY")))
+        except Exception:
+            pass
+    _conn = (teams[team_name].get("source_connection", "")
+             or teams[team_name].get("target_connection", ""))
+    _rest = [t for t in tbls if (t.get("name") or "").strip().lower() not in out]
+    if _rest and _conn:
+        try:
+            out.update(source_client().connection_column_cases(_conn, _rest))
+        except Exception:
+            pass
+    return out
+
+def _read_source_type_map():
+    """The SOURCE warehouse's TYPE per column for every promoted table (DESCRIBE), so the
+    promotion can be diffed against source types + casing in one pass. Same creds/coords as
+    _read_source_col_map. Returns {table_lower: {col_lower: type_string}}."""
+    coord_by_name = {}
+    for it in st.session_state.get("_source_raw_items", []):
+        t = _parse_edoc(it.get("edoc", "{}")).get("table") or {}
+        if t.get("name"):
+            coord_by_name[t["name"].strip().lower()] = {
+                "name": t["name"], "database": t.get("db", ""),
+                "schema": t.get("schema", ""), "table": t.get("db_table", "")}
+    tbls = list(coord_by_name.values())
+    out = {}
+    if not tbls:
+        return out
+    _host = opt_env("TS_SOURCE_DBX_HOST") or opt_env("TS_TARGET_DBX_HOST")
+    _whid = opt_env("TS_SOURCE_DBX_WAREHOUSE") or opt_env("TS_TARGET_DBX_WAREHOUSE")
+    _tok  = opt_env("TS_SOURCE_DBX_TOKEN") or opt_env("TS_TARGET_DBX_TOKEN")
+    if _host and _whid and _tok:
+        try:
+            from services.databricks_direct import hive_column_types
+            out.update(hive_column_types(_host, _whid, _tok, tbls, opt_env("TS_PROXY")))
+        except Exception:
+            pass
+    _conn = (teams[team_name].get("source_connection", "")
+             or teams[team_name].get("target_connection", ""))
+    _rest = [t for t in tbls if (t.get("name") or "").strip().lower() not in out]
+    if _rest and _conn:
+        try:
+            out.update(source_client().connection_column_types(_conn, _rest))
+        except Exception:
+            pass
+    return out
+
+
 def _name_slug(name: str) -> str:
     """A stable obj_id slug derived from an object's name (used to pre-fill obj_id suggestions
     for objects that have none). Non-alphanumerics become underscores, repeats collapse."""
@@ -2318,75 +2393,6 @@ elif step == 3:
                                            or {}).get(col.lower(), "")
             return out
 
-        def _read_source_col_map():
-            """The SOURCE warehouse's column SET (names) for every promoted table, so the TML can be
-            diffed against it (columns present in the TML but gone from the source CDW). hive SHOW
-            COLUMNS via the source DBX creds (falling back to target for now), else source
-            connection/search. Source coordinates come from the raw source export, pre-remap.
-            Returns {table_lower: {col_lower: actual_case}} — same shape as the target map."""
-            coord_by_name = {}
-            for it in st.session_state.get("_source_raw_items", []):
-                t = _parse_edoc(it.get("edoc", "{}")).get("table") or {}
-                if t.get("name"):
-                    coord_by_name[t["name"].strip().lower()] = {
-                        "name": t["name"], "database": t.get("db", ""),
-                        "schema": t.get("schema", ""), "table": t.get("db_table", "")}
-            tbls = list(coord_by_name.values())
-            out = {}
-            if not tbls:
-                return out
-            _host = opt_env("TS_SOURCE_DBX_HOST") or opt_env("TS_TARGET_DBX_HOST")
-            _whid = opt_env("TS_SOURCE_DBX_WAREHOUSE") or opt_env("TS_TARGET_DBX_WAREHOUSE")
-            _tok  = opt_env("TS_SOURCE_DBX_TOKEN") or opt_env("TS_TARGET_DBX_TOKEN")
-            if _host and _whid and _tok:
-                try:
-                    from services.databricks_direct import hive_column_cases
-                    out.update(hive_column_cases(_host, _whid, _tok, tbls, opt_env("TS_PROXY")))
-                except Exception:
-                    pass
-            _conn = (teams[team_name].get("source_connection", "")
-                     or teams[team_name].get("target_connection", ""))
-            _rest = [t for t in tbls if (t.get("name") or "").strip().lower() not in out]
-            if _rest and _conn:
-                try:
-                    out.update(source_client().connection_column_cases(_conn, _rest))
-                except Exception:
-                    pass
-            return out
-
-        def _read_source_type_map():
-            """The SOURCE warehouse's TYPE per column for every promoted table (DESCRIBE), so the
-            promotion can be diffed against source types + casing in one pass. Same creds/coords as
-            _read_source_col_map. Returns {table_lower: {col_lower: type_string}}."""
-            coord_by_name = {}
-            for it in st.session_state.get("_source_raw_items", []):
-                t = _parse_edoc(it.get("edoc", "{}")).get("table") or {}
-                if t.get("name"):
-                    coord_by_name[t["name"].strip().lower()] = {
-                        "name": t["name"], "database": t.get("db", ""),
-                        "schema": t.get("schema", ""), "table": t.get("db_table", "")}
-            tbls = list(coord_by_name.values())
-            out = {}
-            if not tbls:
-                return out
-            _host = opt_env("TS_SOURCE_DBX_HOST") or opt_env("TS_TARGET_DBX_HOST")
-            _whid = opt_env("TS_SOURCE_DBX_WAREHOUSE") or opt_env("TS_TARGET_DBX_WAREHOUSE")
-            _tok  = opt_env("TS_SOURCE_DBX_TOKEN") or opt_env("TS_TARGET_DBX_TOKEN")
-            if _host and _whid and _tok:
-                try:
-                    from services.databricks_direct import hive_column_types
-                    out.update(hive_column_types(_host, _whid, _tok, tbls, opt_env("TS_PROXY")))
-                except Exception:
-                    pass
-            _conn = (teams[team_name].get("source_connection", "")
-                     or teams[team_name].get("target_connection", ""))
-            _rest = [t for t in tbls if (t.get("name") or "").strip().lower() not in out]
-            if _rest and _conn:
-                try:
-                    out.update(source_client().connection_column_types(_conn, _rest))
-                except Exception:
-                    pass
-            return out
 
         def _resolve_finding_table(f):
             """A table that fails the CDW type check comes back with header name 'unknown',
