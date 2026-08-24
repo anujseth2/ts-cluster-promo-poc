@@ -1784,9 +1784,205 @@ elif step == 2:
     elif transformed_items is None:
         st.info("Preparing the bundle — if this doesn't clear, check the source connection and retry.")
     else:
-        st.info("Bundle prepared. The source checks (absent columns, type drift, casing) are moving "
-                "onto this page next — for now continue to **TML Validation** to run the target "
-                "validation as before.")
+        import pandas as pd
+        _src_conn = (teams[team_name].get("source_connection", "")
+                     or teams[team_name].get("target_connection", ""))
+
+        # Apply approved drops to the bundle and make them DURABLE via skip_columns, so a later
+        # re-export (e.g. after applying a recasing) re-drops them instead of silently bringing them
+        # back. Prune any table the drop emptied. No target validation here — that's the next page.
+        def _apply_src_drops(_dropset, _tag):
+            _dropset = set(_dropset)
+            if not _dropset:
+                return
+            fixed, _man = drop_columns(st.session_state.transformed_items, _dropset)
+            _record_drop(_man)
+            st.session_state.setdefault("skip_columns", set()).update(_dropset)
+            st.session_state.setdefault("dropped_col_names", set()).update(_dropset)
+            _emptied = {ff["table"] for ff in table_cleanup_findings(fixed)}
+            if _emptied:
+                fixed, _ts = _prune_tables_whole(fixed, _emptied)
+                st.session_state.setdefault("prune_tables", set()).update(_emptied)
+            st.session_state.transformed_items = fixed
+            _log_apply_detail(_tag, _dropset, _man, _emptied, fixed)
+            st.session_state.pop("_source_col_map", None)     # stale after a drop — re-read on demand
+            st.session_state.pop("_source_type_map", None)
+
+        # ── Read the SOURCE warehouse (columns, casing, types) in one pass ──
+        _sh, _sb = st.columns([3, 2])
+        with _sh:
+            st.markdown("**Source warehouse audit**")
+            if st.session_state.get("_source_col_map"):
+                st.caption(f"✅ Read {len(st.session_state['_source_col_map'])} source table(s). "
+                           "Absent columns and type drift are flagged below — nothing changes until "
+                           "you approve and apply. Casing is handled by the recasing panel below.")
+            else:
+                st.caption("Read the **source** warehouse to check the promoted TML against it: "
+                           "columns the source no longer has, and type drift. Everything is flagged "
+                           "for approval — nothing is dropped automatically.")
+        with _sb:
+            if st.button("🔌 Read source warehouse", disabled=not transformed_items,
+                         help="Reads the source warehouse (source DBX creds, falling back to target "
+                              "for now) and diffs the promotion: absent columns, casing, types."):
+                with st.status("Reading the source warehouse (columns, casing, types)… a cold "
+                               "warehouse can take a minute or two.", expanded=True) as _ss:
+                    _sm  = _read_source_col_map()     # names + casing (SHOW COLUMNS)
+                    _ss.write(f"columns/casing: {len(_sm)} table(s)")
+                    _stm = _read_source_type_map()    # types (DESCRIBE)
+                    _ss.write(f"types: {len(_stm)} table(s)")
+                    _ss.update(label=f"Source warehouse read — {len(_sm)} table(s).",
+                               state=("complete" if _sm else "error"), expanded=False)
+                st.session_state._source_col_map  = _sm
+                st.session_state._source_type_map = _stm
+                st.rerun()
+
+        _src_map = st.session_state.get("_source_col_map") or {}
+        if not _src_map:
+            st.caption("The source read hasn't run yet — click **Read source warehouse** to surface "
+                       "absent columns and type drift. (Casing recasing below works without it.)")
+        else:
+            # (A) columns absent from the SOURCE warehouse → approve-drop (out-of-sync TML) ──
+            _src_missing = warehouse_missing_findings(
+                st.session_state.get("transformed_items", []), _src_map, connection=_src_conn)
+            for _f in _src_missing:
+                _f["kind"] = "missing_in_source_warehouse"
+            if not _src_missing:
+                st.caption("✔ No promoted column is missing from the source warehouse.")
+            else:
+                st.warning(f"{len(_src_missing)} promoted column(s) are **absent from the source "
+                           "warehouse** (out-of-sync TML). Tick to drop — nothing drops until you Apply.")
+                _ssel = st.session_state.setdefault("src_drop_selected", set())
+                _srows = []
+                for _f in sorted(_src_missing, key=lambda x: ((x.get("object") or "").lower(),
+                                                              (x.get("column") or "").lower())):
+                    _tbl = _f.get("object") or "(table)"
+                    _sk  = f"{_tbl}::{_f['column']}" if _f.get("object") else _f["column"]
+                    _srows.append({"Table": _tbl, "Column": _f["column"],
+                                   "Drop?": _sk in _ssel, "_scoped": _sk})
+                _sdf = pd.DataFrame(_srows, columns=["Table", "Column", "Drop?", "_scoped"])
+                _ba, _bc, _ = st.columns([1, 1, 3])
+                with _ba:
+                    if st.button(f"Drop all ({len(_sdf)})", key="srcabsent_all",
+                                 use_container_width=True):
+                        _ssel.update(_sdf["_scoped"].tolist()); _bump_editor("srcabsent"); st.rerun()
+                with _bc:
+                    if st.button("Clear all", key="srcabsent_clear", disabled=not _ssel,
+                                 use_container_width=True):
+                        _ssel.clear(); _bump_editor("srcabsent"); st.rerun()
+                _select_editor(
+                    _sdf, ["Drop?"], ["src_drop_selected"], "srcabsent",
+                    column_config={
+                        "Table":  st.column_config.TextColumn("Table", width="medium"),
+                        "Column": st.column_config.TextColumn("Column", width="medium"),
+                        "Drop?":  st.column_config.CheckboxColumn("Drop?", width="small",
+                                    help="Tick to drop this out-of-sync column from the promotion."),
+                    },
+                    disabled=["Table", "Column"])
+                st.caption(f"**{len(_ssel)}** source-absent column(s) approved to drop.")
+                if st.button("Apply source drops", disabled=not _ssel, key="srcabsent_apply"):
+                    _apply_src_drops(_ssel, "source_missing_apply")
+                    _ssel.clear()
+                    st.rerun()
+
+            # (B) type differs from the SOURCE warehouse → approve-drop (realign lives on 2c) ──
+            _src_type = st.session_state.get("_source_type_map") or {}
+            _gone = st.session_state.get("dropped_col_names", set())
+            _stfind = [f for f in warehouse_type_findings(
+                           st.session_state.get("transformed_items", []), _src_type, connection=_src_conn)
+                       if f"{f['object']}::{f['column']}" not in _gone and f["column"] not in _gone]
+            if _stfind:
+                st.markdown("**Type differs from the source warehouse**")
+                st.caption("Drop columns whose type drifted from the source. Realigning a stale TML "
+                           "type to match the warehouse needs the target check, so that lives on the "
+                           "TML Validation step.")
+                _stsel = st.session_state.setdefault("src_type_drop_selected", set())
+                _strows = []
+                for _f in sorted(_stfind, key=lambda x: ((x.get("object") or "").lower(),
+                                                         (x.get("column") or "").lower())):
+                    _tbl = _f["object"]; _sk = f"{_tbl}::{_f['column']}"
+                    _scdw = (_src_type.get(_tbl.strip().lower()) or {}).get(_f["column"].lower(), "")
+                    _strows.append({"Table": _tbl, "Column": _f["column"],
+                                    "Source type": (_scdw.upper() if _scdw else "(?)"),
+                                    "TML type": _f.get("source_type") or "(?)",
+                                    "Drop?": _sk in _stsel, "_scoped": _sk})
+                _stdf = pd.DataFrame(_strows, columns=["Table", "Column", "Source type", "TML type",
+                                                       "Drop?", "_scoped"])
+                _stb1, _ = st.columns([1, 4])
+                with _stb1:
+                    if st.button(f"Drop all ({len(_stdf)})", key="srctype_all",
+                                 use_container_width=True):
+                        _stsel.update(_stdf["_scoped"].tolist()); _bump_editor("srctype"); st.rerun()
+                _select_editor(
+                    _stdf, ["Drop?"], ["src_type_drop_selected"], "srctype",
+                    column_config={
+                        "Table":  st.column_config.TextColumn("Table", width="medium"),
+                        "Column": st.column_config.TextColumn("Column", width="medium"),
+                        "Source type": st.column_config.TextColumn("Source type", width="small"),
+                        "TML type": st.column_config.TextColumn("TML type", width="small"),
+                        "Drop?":  st.column_config.CheckboxColumn("Drop?", width="small",
+                                    help="Drop this column (realign lives on TML Validation)."),
+                    },
+                    disabled=["Table", "Column", "Source type", "TML type"])
+                if _stsel and st.button(f"Apply source-type drops ({len(_stsel)})", key="srctype_apply"):
+                    _apply_src_drops(_stsel, "source_type_apply")
+                    _stsel.clear()
+                    st.rerun()
+
+        st.divider()
+
+        # ── APPROVE-FIRST SOURCE RECASING (no silent mutations) ──
+        # The source warehouse stores some columns under a different casing than the TML (e.g. CID vs
+        # cid). Recasing aligns db_column_name to the source's ACTUAL casing so it binds. Per Anuj this
+        # is NEVER applied silently: every proposed recasing is surfaced and applied only on approval +
+        # Apply. Proposals come from the casing read at export, so this works before the source button.
+        _recase_props = st.session_state.get("_recase_events") or []
+        if not _recase_props:
+            st.caption("No column casing differs from the warehouse — nothing to recase.")
+        else:
+            _rapp = st.session_state.setdefault("recase_approved", set())
+            _applied_set = st.session_state.get("_recase_applied_set", set())
+            _pending = _rapp != _applied_set
+            _hdr = (f"Column recasing — {len(_recase_props)} proposed, {len(_rapp)} approved"
+                    + ("  ·  ⚠ not yet applied" if _pending else ""))
+            with st.expander(_hdr, expanded=bool(_pending or not _applied_set)):
+                st.caption("Approve a recasing to align the promoted `db_column_name` to the source "
+                           "warehouse's **actual** casing (upper/lower/mixed — read live, never "
+                           "assumed). Nothing is recased until you approve and Apply; an unapproved "
+                           "column keeps its source casing and may fail to bind on import.")
+                _rrows = []
+                for _e in sorted(_recase_props, key=lambda x: (x["table"].lower(), x["from"].lower())):
+                    _sk = f"{_e['table'].strip().lower()}::{_e['from'].strip().lower()}"
+                    _rrows.append({"Table": _e["table"], "From": _e["from"], "To": _e["to"],
+                                   "Approve?": _sk in _rapp, "_scoped": _sk})
+                _rdf = pd.DataFrame(_rrows, columns=["Table", "From", "To", "Approve?", "_scoped"])
+                _rba, _rbc = st.columns([1, 1])
+                with _rba:
+                    if st.button(f"Approve all ({len(_rdf)})", key="recase_all",
+                                 use_container_width=True):
+                        _rapp.update(_rdf["_scoped"].tolist()); _bump_editor("recase"); st.rerun()
+                with _rbc:
+                    if st.button("Clear all", key="recase_clear", disabled=not _rapp,
+                                 use_container_width=True):
+                        _rapp.clear(); _bump_editor("recase"); st.rerun()
+                _select_editor(
+                    _rdf, ["Approve?"], ["recase_approved"], "recase",
+                    column_config={
+                        "Table":    st.column_config.TextColumn("Table", width="medium"),
+                        "From":     st.column_config.TextColumn("From (source TML)", width="medium"),
+                        "To":       st.column_config.TextColumn("To (source warehouse)", width="medium"),
+                        "Approve?": st.column_config.CheckboxColumn("Approve?", width="small",
+                                      help="Tick to recase this column to the source warehouse casing."),
+                    },
+                    disabled=["Table", "From", "To"])
+                if _rapp != _applied_set:
+                    st.warning(f"{len(_rapp)} recasing(s) approved but not yet applied to the bundle.")
+                    if st.button("Apply recasings & re-export", type="primary", key="recase_apply"):
+                        st.session_state.pop("transformed_items", None)
+                        for _k in ("pr_url", "validation_errors", "validation_ok"):
+                            st.session_state.pop(_k, None)
+                        st.rerun()
+                elif _rapp:
+                    st.caption(f"✅ {len(_rapp)} recasing(s) applied to the bundle.")
     _nav(2, can_next=True, next_hint="")
 
 
