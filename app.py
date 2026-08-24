@@ -1840,7 +1840,7 @@ elif step == 2:
         _src_map = st.session_state.get("_source_col_map") or {}
         if not _src_map:
             st.caption("The source read hasn't run yet — click **Read source warehouse** to surface "
-                       "absent columns and type drift. (Casing recasing below works without it.)")
+                       "columns the source no longer has, type drift, and casing that needs recasing.")
         else:
             # (A) columns absent from the SOURCE warehouse → approve-drop (out-of-sync TML) ──
             _src_missing = warehouse_missing_findings(
@@ -1929,33 +1929,38 @@ elif step == 2:
                     _stsel.clear()
                     st.rerun()
 
-        st.divider()
-
-        # ── APPROVE-FIRST SOURCE RECASING (no silent mutations) ──
-        # The source warehouse stores some columns under a different casing than the TML (e.g. CID vs
-        # cid). Recasing aligns db_column_name to the source's ACTUAL casing so it binds. Per Anuj this
-        # is NEVER applied silently: every proposed recasing is surfaced and applied only on approval +
-        # Apply. Proposals come from the casing read at export, so this works before the source button.
-        _recase_props = st.session_state.get("_recase_events") or []
-        if not _recase_props:
-            st.caption("No column casing differs from the warehouse — nothing to recase.")
-        else:
+            # (C) casing differs from the SOURCE warehouse → approve-first recasing ──
+            # Same source read as (A)/(B): recasings come from _src_map (the live SHOW COLUMNS), so all
+            # three checks are surfaced by one "Read source warehouse". Approve-first (no silent
+            # mutations); an approved recasing applies on re-export, which re-reads the same warehouse.
             _rapp = st.session_state.setdefault("recase_approved", set())
             _applied_set = st.session_state.get("_recase_applied_set", set())
-            _pending = _rapp != _applied_set
-            _hdr = (f"Column recasing — {len(_recase_props)} proposed, {len(_rapp)} approved"
-                    + ("  ·  ⚠ not yet applied" if _pending else ""))
-            with st.expander(_hdr, expanded=bool(_pending or not _applied_set)):
+            _case_rows = []
+            for _it in st.session_state.get("transformed_items", []):
+                _t = _parse_edoc(_it.get("edoc", "{}")).get("table")
+                if not _t or not _t.get("name"):
+                    continue
+                _cm = _src_map.get(_t["name"].strip().lower())
+                if not _cm:
+                    continue
+                for _c in _t.get("columns", []) or []:
+                    _dbn = (_c.get("db_column_name") or "").strip()
+                    if _dbn and _cm.get(_dbn.lower()) and _cm[_dbn.lower()] != _dbn:
+                        _sk = f"{_t['name'].strip().lower()}::{_dbn.lower()}"
+                        _case_rows.append({"Table": _t["name"], "From": _dbn,
+                                           "To": _cm[_dbn.lower()],
+                                           "Approve?": _sk in _rapp, "_scoped": _sk})
+            if not _case_rows:
+                st.caption("✔ No promoted column's casing differs from the source warehouse.")
+            else:
+                _pending = _rapp != _applied_set
+                st.markdown("**Casing differs from the source warehouse**"
+                            + ("  ·  ⚠ approved recasings not yet applied" if _pending else ""))
                 st.caption("Approve a recasing to align the promoted `db_column_name` to the source "
                            "warehouse's **actual** casing (upper/lower/mixed — read live, never "
                            "assumed). Nothing is recased until you approve and Apply; an unapproved "
                            "column keeps its source casing and may fail to bind on import.")
-                _rrows = []
-                for _e in sorted(_recase_props, key=lambda x: (x["table"].lower(), x["from"].lower())):
-                    _sk = f"{_e['table'].strip().lower()}::{_e['from'].strip().lower()}"
-                    _rrows.append({"Table": _e["table"], "From": _e["from"], "To": _e["to"],
-                                   "Approve?": _sk in _rapp, "_scoped": _sk})
-                _rdf = pd.DataFrame(_rrows, columns=["Table", "From", "To", "Approve?", "_scoped"])
+                _rdf = pd.DataFrame(_case_rows, columns=["Table", "From", "To", "Approve?", "_scoped"])
                 _rba, _rbc = st.columns([1, 1])
                 with _rba:
                     if st.button(f"Approve all ({len(_rdf)})", key="recase_all",
@@ -1982,8 +1987,6 @@ elif step == 2:
                         for _k in ("pr_url", "validation_errors", "validation_ok"):
                             st.session_state.pop(_k, None)
                         st.rerun()
-                elif _rapp:
-                    st.caption(f"✅ {len(_rapp)} recasing(s) applied to the bundle.")
     _nav(2, can_next=True, next_hint="")
 
 
