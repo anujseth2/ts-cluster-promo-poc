@@ -585,6 +585,218 @@ for i, (col, label) in enumerate(zip(cols, STEPS)):
 st.divider()
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Shared bundle prep — export + transform (Source Audit and TML Validation both call this)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _prepare_bundle():
+    """Export the selected assets from source, transform (connection remap, obj_ids, column
+    casing), apply the approved recasings + drops, and stash the promotion bundle in session
+    state. Idempotent: guarded by _need_export, so plain navigation between the Source Audit
+    and TML Validation pages does not re-export. Shared by both pages so the bundle exists
+    before either one audits or validates it."""
+    selected_ids = st.session_state.get("selected_ids", [])
+
+    # Export + transform on entry. This runs AFTER obj_id Setup, so the exported TML carries
+    # the aligned obj_ids. (This replaced the standalone Review page.)
+    # Re-export when the FEEDBACK choice changed since the last export — otherwise a bundle
+    # cached before "Include feedback" was ticked would silently omit feedback (and the commit
+    # would too). Changing the choice also invalidates the already-committed PR/validation.
+    _fb_state = (bool(st.session_state.get("_include_feedback")),
+                 frozenset(st.session_state.get("feedback_selected") or []))
+    # Re-export if we have no bundle yet, the feedback choice changed, or obj_ids/alignment were
+    # changed since the last export (consume the dirty flag). Plain navigation back to this page
+    # (Home / breadcrumb) does none of these, so the last stage is preserved.
+    _objids_dirty = st.session_state.pop("_objids_dirty", False)
+    _need_export = ("transformed_items" not in st.session_state
+                    or st.session_state.get("_export_fb_state") != _fb_state
+                    or _objids_dirty)
+    if selected_ids and _need_export:
+        if "transformed_items" in st.session_state:
+            for _k in ("pr_url", "validation_errors", "validation_ok", "import_phase",
+                       "import_core_results", "import_leaf_files", "import_leaf_errors",
+                       "silent_drops", "_fb_previews", "_nl_previews", "nl_report",
+                       "fb_replace_report", "_casing_diag"):
+                st.session_state.pop(_k, None)
+        with st.status("Preparing the promotion bundle…", expanded=True) as _exp_status:
+            st.write("① Exporting TML from the source cluster…")
+            try:
+                raw = source_client().export_tml(selected_ids)
+            except Exception as _ex:
+                _exp_status.update(label="Export failed — source connection reset", state="error")
+                _h, _a, _ = friendly_error(str(_ex))
+                st.error("Couldn't export from the source cluster — "
+                         + (_h or "the connection was reset by the remote host (WinError 10054)."))
+                st.caption("→ " + (_a or "A transient network reset (proxy/gateway), not related to "
+                           "dropping columns — the client already retried with backoff. Retry below."))
+                if st.button("↻ Retry export"):
+                    st.rerun()
+                st.stop()
+            items = raw if isinstance(raw, list) else raw.get("object", [])
+            # Opt-in: also pull each model's Spotter feedback (reference questions + business
+            # terms) and promote it alongside the model.
+            if st.session_state.get("_include_feedback"):
+                # The model GUID lives in the export wrapper's info.id — the edoc itself does NOT
+                # carry a top-level `guid` under include_obj_id export (Step 1 reads info.id too).
+                model_guids = []
+                for it in items:
+                    d = _parse_edoc(it.get("edoc", "{}"))
+                    if "model" in d or "worksheet" in d:
+                        gid = (it.get("info") or {}).get("id") or d.get("guid")
+                        if gid:
+                            model_guids.append(gid)
+                if model_guids:
+                    fb_items = source_client().export_feedback(model_guids)
+                    # Keep only the reference questions / business terms the operator ticked
+                    # on the Select page (None -> promote all, back-compat).
+                    fb_items = filter_feedback(
+                        fb_items, st.session_state.get("feedback_selected"))
+                    items = items + fb_items
+            # Align promoted table columns to the TARGET warehouse's casing. Some warehouses bind
+            # external columns case-sensitively (e.g. Databricks), so a source column CID cannot
+            # import against a target column cid. Primary source of truth is the TARGET connection
+            # (ThoughtSpot reads the warehouse with its stored credential — no secret needed, works
+            # even when the table isn't a logical table on the target yet). Fall back to reading an
+            # existing target logical table's casing if the connection can't be queried.
+            _dbm = teams[team_name].get("db_map", {})
+            _scm = teams[team_name].get("schema_map", {})
+            _trm = st.session_state.get("table_remap", {})
+            promoted, names = [], []
+            for it in items:
+                t = (_parse_edoc(it.get("edoc", "{}")).get("table") or {})
+                if not t.get("name"):
+                    continue
+                nm = t["name"]; names.append(nm)
+                tr = _trm.get(nm.strip().lower(), {})
+                promoted.append({
+                    "name":     nm,
+                    "database": _dbm.get(t.get("db", ""), t.get("db", "")),
+                    "schema":   _scm.get(t.get("schema", ""), t.get("schema", "")),
+                    "table":    tr.get("db_table") or t.get("db_table", ""),
+                    "connection": (t.get("connection") or {}).get("name", ""),
+                })
+            column_case_map = {}
+            tgt_conn = teams[team_name].get("target_connection", "")
+            st.write("② Reading column casing from tables already on the target (fast)…")
+            # FAST PATH ONLY during export — a TML metadata read of tables already modeled on the
+            # target, no warehouse round-trip. The authoritative CDW column read (via connection/
+            # search) is OPT-IN on this page, because COLUMN introspection can be very slow or time
+            # out on some warehouses (the GSK 504) and must NEVER block the export.
+            try:
+                column_case_map = target_client().table_column_cases(names)
+            except Exception:
+                column_case_map = {}
+            # Snapshot the target's MODELED columns (the logical table as it exists on test right now)
+            # BEFORE the hive merge widens the map to the full physical set. The shape display compares
+            # the promotion to THIS — "what got promoted vs what the target model has" — not the
+            # physical warehouse count (which is far larger and reads like the column count exploded).
+            st.session_state._target_modeled_map = {_t: dict(_c) for _t, _c in column_case_map.items()}
+            # Hive_metastore casing (authoritative, direct). ThoughtSpot's connection/search 504s on
+            # hive_metastore because it introspects columns via <catalog>.information_schema, which
+            # hive lacks. So for a hive target we read the true casing straight from Databricks via
+            # SHOW COLUMNS (works on hive AND Unity Catalog). Gated on target DBX creds in .env; when
+            # present this fills/overrides the map for tables the fast path can't see (not yet on the
+            # target) — e.g. a promoted model whose `CID` must bind to the warehouse's `cid`.
+            _dbx_host = opt_env("TS_TARGET_DBX_HOST")
+            _dbx_wh   = opt_env("TS_TARGET_DBX_WAREHOUSE")
+            _dbx_tok  = opt_env("TS_TARGET_DBX_TOKEN")
+            _hive = {}   # authoritative physical read of the TARGET warehouse (hive/UC), if creds set
+            if _dbx_host and _dbx_wh and _dbx_tok:
+                st.write("②b Reading hive_metastore casing directly from Databricks…")
+                try:
+                    from services.databricks_direct import hive_column_cases
+                    _dbg = []
+                    _hive = hive_column_cases(_dbx_host, _dbx_wh, _dbx_tok, promoted,
+                                              opt_env("TS_PROXY"), debug=_dbg)
+                    for _t, _cols in _hive.items():
+                        column_case_map.setdefault(_t, {}).update(_cols)
+                    _ok = sum(1 for d in _dbg if d.get("state") == "SUCCEEDED")
+                    st.write(f"   warehouse casing resolved for {_ok}/{len(_dbg)} table(s).")
+                except Exception as _e:
+                    st.write(f"   ⚠ direct warehouse casing skipped: {str(_e)[:150]}")
+            st.session_state._column_case_map = column_case_map
+            # The TARGET warehouse is read HERE, at export (the direct hive read that actually works
+            # on GSK — the old connection/search "Verify" button 504'd on hive and was redundant with
+            # this). So the missing-column check treats these as warehouse-verified with no extra
+            # click. Empty when no target DBX creds → the check falls back to modeled columns.
+            st.session_state._warehouse_col_map = _hive
+            # Persist coords + connection so the opt-in "verify against the warehouse" button can
+            # issue the (slow) connection read without re-exporting.
+            st.session_state._promoted_coords = promoted
+            st.session_state._promoted_tgt_conn = tgt_conn
+            # Stash the RAW source export (pre-transform, pre-drop) so a debug bundle carries the
+            # original model+tables — the true joins/columns before any remap or cascade. Captured
+            # here, as it happens; edocs are strings so a shallow per-item copy is enough.
+            # Record the physical columns the transform will recase to the warehouse casing, so the
+            # Import Results report can show it (the recase is otherwise silent). Mirrors the
+            # transformer rule: db_column_name is recased when it differs from the map's casing.
+            _recase_events = []
+            for _it in items:
+                _rt = (_parse_edoc(_it.get("edoc", "{}")).get("table") or {})
+                _rtn = _rt.get("name")
+                _rcc = column_case_map.get((_rtn or "").strip().lower()) if _rtn else None
+                if not _rcc:
+                    continue
+                for _rcol in (_rt.get("columns") or []):
+                    _rdbn = _rcol.get("db_column_name")
+                    if _rdbn:
+                        _rtgt = _rcc.get(_rdbn.strip().lower())
+                        if _rtgt and _rtgt != _rdbn:
+                            _recase_events.append({"table": _rtn, "from": _rdbn, "to": _rtgt})
+            st.session_state._recase_events = _recase_events
+            st.session_state._source_raw_items = [dict(it) for it in items]
+            # APPROVE-FIRST recasing (Anuj 2026-08-18: no silent mutations). Nothing is recased until
+            # the operator approves it in the "Column recasing" panel — the transform sees only the
+            # APPROVED subset of the (full) warehouse casing map. Empty approval set → no recasing, so
+            # unapproved columns keep their source casing. `_column_case_map` stays the FULL map (other
+            # consumers — the missing-column fallback — need it).
+            _rapproved = st.session_state.get("recase_approved", set())
+            applied_case_map = {
+                _t: {_c: _case for _c, _case in (_cols or {}).items()
+                     if f"{_t}::{_c}" in _rapproved}
+                for _t, _cols in column_case_map.items()}
+            st.session_state._recase_applied_set = set(_rapproved)
+            st.write("③ Applying the data-layer transform (connection remap, obj_ids, column casing)…")
+            transformed_items, warnings = transform_items(
+                items,
+                source_connection=teams[team_name].get("source_connection", ""),
+                target_connection=teams[team_name].get("target_connection", ""),
+                db_map=teams[team_name].get("db_map", {}),
+                schema_map=teams[team_name].get("schema_map", {}),
+                table_remap=st.session_state.get("table_remap", {}),
+                column_case_map=applied_case_map,
+            )
+            # Prune any tables the user chose to drop out of the model (not-on-target excludes).
+            prune = st.session_state.get("prune_tables", set())
+            if prune:
+                transformed_items, prune_summary = drop_tables(transformed_items, prune)
+                st.session_state.prune_summary = prune_summary
+            # Skip individual columns the user chose to leave out (persisted across re-exports).
+            skip_cols = st.session_state.get("skip_columns", set())
+            if skip_cols:
+                transformed_items, _man = drop_columns(transformed_items, skip_cols)
+                _record_drop(_man)
+                st.session_state.setdefault("dropped_col_names", set()).update(skip_cols)
+            st.session_state.transformed_items = transformed_items
+            st.session_state.warnings          = warnings
+            st.session_state._export_fb_state  = _fb_state   # what feedback choice this export reflects
+            st.session_state.pop("_fb_previews", None)   # recompute feedback preview vs the fresh export
+            # Flag if a configured source_connection matches NO connection in the exported
+            # tables (the remap would silently skip -> import failure on the target).
+            src_conn   = teams[team_name].get("source_connection", "")
+            conn_names = set()
+            for it in items:
+                c = (_parse_edoc(it.get("edoc", "{}")).get("table", {}) or {}).get("connection", {})
+                if isinstance(c, dict) and c.get("name"):
+                    conn_names.add(c["name"])
+            st.session_state.conn_mismatch = (
+                {"configured": src_conn, "found": sorted(conn_names)}
+                if src_conn and conn_names and src_conn not in conn_names else None)
+            _exp_status.update(
+                label=f"Bundle ready — {len(transformed_items)} object(s) prepared.",
+                state="complete", expanded=False)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # STEP 0 — Select Assets
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1484,8 +1696,22 @@ elif step == 2:
     st.caption("Audit the promotion against the **source** warehouse first — drop columns the source "
                "no longer has, realign or drop source type drift, recase to the source's casing — so "
                "the TML is source-faithful before it's validated against the target on the next step.")
-    st.info("Coming together — the source checks and the export are moving here next. For now, "
-            "continue to **TML Validation** to run the target validation as before.")
+
+    # Build the promotion bundle on entry — the TML has to exist before we can audit it against
+    # the source. Idempotent (guarded by _need_export inside), and shared with TML Validation, so
+    # walking Source Audit → TML Validation does NOT re-export.
+    _prepare_bundle()
+    selected_ids = st.session_state.get("selected_ids", [])
+    transformed_items = st.session_state.get("transformed_items")
+
+    if not selected_ids:
+        st.info("Select assets in Step 1 first.")
+    elif transformed_items is None:
+        st.info("Preparing the bundle — if this doesn't clear, check the source connection and retry.")
+    else:
+        st.info("Bundle prepared. The source checks (absent columns, type drift, casing) are moving "
+                "onto this page next — for now continue to **TML Validation** to run the target "
+                "validation as before.")
     _nav(2, can_next=True, next_hint="")
 
 
@@ -1499,206 +1725,8 @@ elif step == 3:
                "A **cold Databricks SQL warehouse can take a minute or two** to wake and respond — "
                "warm it first for a faster run; a spinner/status box means it's working, not hung.")
 
+    _prepare_bundle()
     selected_ids = st.session_state.get("selected_ids", [])
-
-    # Export + transform on entry. This runs AFTER obj_id Setup, so the exported TML carries
-    # the aligned obj_ids. (This replaced the standalone Review page.)
-    # Re-export when the FEEDBACK choice changed since the last export — otherwise a bundle
-    # cached before "Include feedback" was ticked would silently omit feedback (and the commit
-    # would too). Changing the choice also invalidates the already-committed PR/validation.
-    _fb_state = (bool(st.session_state.get("_include_feedback")),
-                 frozenset(st.session_state.get("feedback_selected") or []))
-    # Re-export if we have no bundle yet, the feedback choice changed, or obj_ids/alignment were
-    # changed since the last export (consume the dirty flag). Plain navigation back to this page
-    # (Home / breadcrumb) does none of these, so the last stage is preserved.
-    _objids_dirty = st.session_state.pop("_objids_dirty", False)
-    _need_export = ("transformed_items" not in st.session_state
-                    or st.session_state.get("_export_fb_state") != _fb_state
-                    or _objids_dirty)
-    if selected_ids and _need_export:
-        if "transformed_items" in st.session_state:
-            for _k in ("pr_url", "validation_errors", "validation_ok", "import_phase",
-                       "import_core_results", "import_leaf_files", "import_leaf_errors",
-                       "silent_drops", "_fb_previews", "_nl_previews", "nl_report",
-                       "fb_replace_report", "_casing_diag"):
-                st.session_state.pop(_k, None)
-        with st.status("Preparing the promotion bundle…", expanded=True) as _exp_status:
-            st.write("① Exporting TML from the source cluster…")
-            try:
-                raw = source_client().export_tml(selected_ids)
-            except Exception as _ex:
-                _exp_status.update(label="Export failed — source connection reset", state="error")
-                _h, _a, _ = friendly_error(str(_ex))
-                st.error("Couldn't export from the source cluster — "
-                         + (_h or "the connection was reset by the remote host (WinError 10054)."))
-                st.caption("→ " + (_a or "A transient network reset (proxy/gateway), not related to "
-                           "dropping columns — the client already retried with backoff. Retry below."))
-                if st.button("↻ Retry export"):
-                    st.rerun()
-                st.stop()
-            items = raw if isinstance(raw, list) else raw.get("object", [])
-            # Opt-in: also pull each model's Spotter feedback (reference questions + business
-            # terms) and promote it alongside the model.
-            if st.session_state.get("_include_feedback"):
-                # The model GUID lives in the export wrapper's info.id — the edoc itself does NOT
-                # carry a top-level `guid` under include_obj_id export (Step 1 reads info.id too).
-                model_guids = []
-                for it in items:
-                    d = _parse_edoc(it.get("edoc", "{}"))
-                    if "model" in d or "worksheet" in d:
-                        gid = (it.get("info") or {}).get("id") or d.get("guid")
-                        if gid:
-                            model_guids.append(gid)
-                if model_guids:
-                    fb_items = source_client().export_feedback(model_guids)
-                    # Keep only the reference questions / business terms the operator ticked
-                    # on the Select page (None -> promote all, back-compat).
-                    fb_items = filter_feedback(
-                        fb_items, st.session_state.get("feedback_selected"))
-                    items = items + fb_items
-            # Align promoted table columns to the TARGET warehouse's casing. Some warehouses bind
-            # external columns case-sensitively (e.g. Databricks), so a source column CID cannot
-            # import against a target column cid. Primary source of truth is the TARGET connection
-            # (ThoughtSpot reads the warehouse with its stored credential — no secret needed, works
-            # even when the table isn't a logical table on the target yet). Fall back to reading an
-            # existing target logical table's casing if the connection can't be queried.
-            _dbm = teams[team_name].get("db_map", {})
-            _scm = teams[team_name].get("schema_map", {})
-            _trm = st.session_state.get("table_remap", {})
-            promoted, names = [], []
-            for it in items:
-                t = (_parse_edoc(it.get("edoc", "{}")).get("table") or {})
-                if not t.get("name"):
-                    continue
-                nm = t["name"]; names.append(nm)
-                tr = _trm.get(nm.strip().lower(), {})
-                promoted.append({
-                    "name":     nm,
-                    "database": _dbm.get(t.get("db", ""), t.get("db", "")),
-                    "schema":   _scm.get(t.get("schema", ""), t.get("schema", "")),
-                    "table":    tr.get("db_table") or t.get("db_table", ""),
-                    "connection": (t.get("connection") or {}).get("name", ""),
-                })
-            column_case_map = {}
-            tgt_conn = teams[team_name].get("target_connection", "")
-            st.write("② Reading column casing from tables already on the target (fast)…")
-            # FAST PATH ONLY during export — a TML metadata read of tables already modeled on the
-            # target, no warehouse round-trip. The authoritative CDW column read (via connection/
-            # search) is OPT-IN on this page, because COLUMN introspection can be very slow or time
-            # out on some warehouses (the GSK 504) and must NEVER block the export.
-            try:
-                column_case_map = target_client().table_column_cases(names)
-            except Exception:
-                column_case_map = {}
-            # Snapshot the target's MODELED columns (the logical table as it exists on test right now)
-            # BEFORE the hive merge widens the map to the full physical set. The shape display compares
-            # the promotion to THIS — "what got promoted vs what the target model has" — not the
-            # physical warehouse count (which is far larger and reads like the column count exploded).
-            st.session_state._target_modeled_map = {_t: dict(_c) for _t, _c in column_case_map.items()}
-            # Hive_metastore casing (authoritative, direct). ThoughtSpot's connection/search 504s on
-            # hive_metastore because it introspects columns via <catalog>.information_schema, which
-            # hive lacks. So for a hive target we read the true casing straight from Databricks via
-            # SHOW COLUMNS (works on hive AND Unity Catalog). Gated on target DBX creds in .env; when
-            # present this fills/overrides the map for tables the fast path can't see (not yet on the
-            # target) — e.g. a promoted model whose `CID` must bind to the warehouse's `cid`.
-            _dbx_host = opt_env("TS_TARGET_DBX_HOST")
-            _dbx_wh   = opt_env("TS_TARGET_DBX_WAREHOUSE")
-            _dbx_tok  = opt_env("TS_TARGET_DBX_TOKEN")
-            _hive = {}   # authoritative physical read of the TARGET warehouse (hive/UC), if creds set
-            if _dbx_host and _dbx_wh and _dbx_tok:
-                st.write("②b Reading hive_metastore casing directly from Databricks…")
-                try:
-                    from services.databricks_direct import hive_column_cases
-                    _dbg = []
-                    _hive = hive_column_cases(_dbx_host, _dbx_wh, _dbx_tok, promoted,
-                                              opt_env("TS_PROXY"), debug=_dbg)
-                    for _t, _cols in _hive.items():
-                        column_case_map.setdefault(_t, {}).update(_cols)
-                    _ok = sum(1 for d in _dbg if d.get("state") == "SUCCEEDED")
-                    st.write(f"   warehouse casing resolved for {_ok}/{len(_dbg)} table(s).")
-                except Exception as _e:
-                    st.write(f"   ⚠ direct warehouse casing skipped: {str(_e)[:150]}")
-            st.session_state._column_case_map = column_case_map
-            # The TARGET warehouse is read HERE, at export (the direct hive read that actually works
-            # on GSK — the old connection/search "Verify" button 504'd on hive and was redundant with
-            # this). So the missing-column check treats these as warehouse-verified with no extra
-            # click. Empty when no target DBX creds → the check falls back to modeled columns.
-            st.session_state._warehouse_col_map = _hive
-            # Persist coords + connection so the opt-in "verify against the warehouse" button can
-            # issue the (slow) connection read without re-exporting.
-            st.session_state._promoted_coords = promoted
-            st.session_state._promoted_tgt_conn = tgt_conn
-            # Stash the RAW source export (pre-transform, pre-drop) so a debug bundle carries the
-            # original model+tables — the true joins/columns before any remap or cascade. Captured
-            # here, as it happens; edocs are strings so a shallow per-item copy is enough.
-            # Record the physical columns the transform will recase to the warehouse casing, so the
-            # Import Results report can show it (the recase is otherwise silent). Mirrors the
-            # transformer rule: db_column_name is recased when it differs from the map's casing.
-            _recase_events = []
-            for _it in items:
-                _rt = (_parse_edoc(_it.get("edoc", "{}")).get("table") or {})
-                _rtn = _rt.get("name")
-                _rcc = column_case_map.get((_rtn or "").strip().lower()) if _rtn else None
-                if not _rcc:
-                    continue
-                for _rcol in (_rt.get("columns") or []):
-                    _rdbn = _rcol.get("db_column_name")
-                    if _rdbn:
-                        _rtgt = _rcc.get(_rdbn.strip().lower())
-                        if _rtgt and _rtgt != _rdbn:
-                            _recase_events.append({"table": _rtn, "from": _rdbn, "to": _rtgt})
-            st.session_state._recase_events = _recase_events
-            st.session_state._source_raw_items = [dict(it) for it in items]
-            # APPROVE-FIRST recasing (Anuj 2026-08-18: no silent mutations). Nothing is recased until
-            # the operator approves it in the "Column recasing" panel — the transform sees only the
-            # APPROVED subset of the (full) warehouse casing map. Empty approval set → no recasing, so
-            # unapproved columns keep their source casing. `_column_case_map` stays the FULL map (other
-            # consumers — the missing-column fallback — need it).
-            _rapproved = st.session_state.get("recase_approved", set())
-            applied_case_map = {
-                _t: {_c: _case for _c, _case in (_cols or {}).items()
-                     if f"{_t}::{_c}" in _rapproved}
-                for _t, _cols in column_case_map.items()}
-            st.session_state._recase_applied_set = set(_rapproved)
-            st.write("③ Applying the data-layer transform (connection remap, obj_ids, column casing)…")
-            transformed_items, warnings = transform_items(
-                items,
-                source_connection=teams[team_name].get("source_connection", ""),
-                target_connection=teams[team_name].get("target_connection", ""),
-                db_map=teams[team_name].get("db_map", {}),
-                schema_map=teams[team_name].get("schema_map", {}),
-                table_remap=st.session_state.get("table_remap", {}),
-                column_case_map=applied_case_map,
-            )
-            # Prune any tables the user chose to drop out of the model (not-on-target excludes).
-            prune = st.session_state.get("prune_tables", set())
-            if prune:
-                transformed_items, prune_summary = drop_tables(transformed_items, prune)
-                st.session_state.prune_summary = prune_summary
-            # Skip individual columns the user chose to leave out (persisted across re-exports).
-            skip_cols = st.session_state.get("skip_columns", set())
-            if skip_cols:
-                transformed_items, _man = drop_columns(transformed_items, skip_cols)
-                _record_drop(_man)
-                st.session_state.setdefault("dropped_col_names", set()).update(skip_cols)
-            st.session_state.transformed_items = transformed_items
-            st.session_state.warnings          = warnings
-            st.session_state._export_fb_state  = _fb_state   # what feedback choice this export reflects
-            st.session_state.pop("_fb_previews", None)   # recompute feedback preview vs the fresh export
-            # Flag if a configured source_connection matches NO connection in the exported
-            # tables (the remap would silently skip -> import failure on the target).
-            src_conn   = teams[team_name].get("source_connection", "")
-            conn_names = set()
-            for it in items:
-                c = (_parse_edoc(it.get("edoc", "{}")).get("table", {}) or {}).get("connection", {})
-                if isinstance(c, dict) and c.get("name"):
-                    conn_names.add(c["name"])
-            st.session_state.conn_mismatch = (
-                {"configured": src_conn, "found": sorted(conn_names)}
-                if src_conn and conn_names and src_conn not in conn_names else None)
-            _exp_status.update(
-                label=f"Bundle ready — {len(transformed_items)} object(s) prepared.",
-                state="complete", expanded=False)
 
     transformed_items = st.session_state.get("transformed_items")
     cm = st.session_state.get("conn_mismatch")
