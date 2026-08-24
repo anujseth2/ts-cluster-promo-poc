@@ -317,6 +317,27 @@ def test_realign_column_types_sets_scoped_type_only():
     assert a == "BIGINT" and b == "VARCHAR"      # scoped: tableB untouched
 
 
+def test_source_audit_realign_resolves_stale_hcp_id():
+    # The Source Audit (2b) realign contract: a stale HCP_ID (TML VARCHAR, source warehouse bigint)
+    # is flagged, the realign token comes from the SOURCE type (bigint -> INT64, never 'bigint'),
+    # and after realigning it no longer flags (INT64 vs bigint are the same family).
+    from services.import_diagnostics import (
+        warehouse_type_findings, warehouse_type_to_ts, realign_column_types)
+    doc = {"table": {"name": "fact_x", "db": "d", "schema": "s", "db_table": "fact_x", "columns": [
+        {"name": "HCP ID", "db_column_name": "HCP_ID",
+         "db_column_properties": {"data_type": "VARCHAR"}}]}}
+    src_types = {"fact_x": {"hcp_id": "bigint"}}
+    found = warehouse_type_findings([{"edoc": json.dumps(doc)}], src_types)
+    assert [(f["object"], f["column"]) for f in found] == [("fact_x", "HCP_ID")]
+    tok = warehouse_type_to_ts(src_types["fact_x"]["hcp_id"])
+    assert tok == "INT64"                                   # NOT the raw 'bigint' (would break import)
+    sk = f"{found[0]['object']}::{found[0]['column']}"
+    out, n = realign_column_types([{"edoc": json.dumps(doc)}], {sk: tok})
+    assert n == 1
+    # after realign the column is INT64, and it no longer flags against the same source read
+    assert warehouse_type_findings(out, src_types) == []
+
+
 def test_warehouse_type_findings_one_pass():
     from services.import_diagnostics import warehouse_type_findings
     doc = {"table": {"name": "t", "db": "d", "schema": "s", "db_table": "t", "columns": [

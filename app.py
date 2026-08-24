@@ -851,6 +851,12 @@ def _prepare_bundle():
                 transformed_items, _man = drop_columns(transformed_items, skip_cols)
                 _record_drop(_man)
                 st.session_state.setdefault("dropped_col_names", set()).update(skip_cols)
+            # Realign stale TML types the operator approved on Source Audit — persisted across
+            # re-exports (a fresh export would otherwise re-import the stale type). Scoped
+            # `table::col` -> TS token; already-dropped columns are gone, so this is a no-op for them.
+            realign_map = st.session_state.get("realign_types", {})
+            if realign_map:
+                transformed_items, _rn = realign_column_types(transformed_items, realign_map)
             st.session_state.transformed_items = transformed_items
             st.session_state.warnings          = warnings
             st.session_state._export_fb_state  = _fb_state   # what feedback choice this export reflects
@@ -902,7 +908,8 @@ if step == 0:
                         # source-CDW validation state (Increments 2 & 3) — reset for new content
                         "recase_approved", "_recase_applied_set", "_recase_events",
                         "_source_col_map", "_source_type_map", "src_drop_selected",
-                        "src_type_drop_selected", "wh_drop_selected",
+                        "src_type_drop_selected", "src_type_realign_selected", "_src_realign_to",
+                        "realign_types", "wh_drop_selected",
                         "tm_drop_selected", "tm_realign_selected", "_tm_realign_to",
                         "_tm_target_full", "_tm_source_full", "_target_modeled_map"):
                 st.session_state.pop(key, None)
@@ -1885,7 +1892,11 @@ elif step == 2:
                     _ssel.clear()
                     st.rerun()
 
-            # (B) type differs from the SOURCE warehouse → approve-drop (realign lives on 2c) ──
+            # (B) type differs from the SOURCE warehouse → realign to source, or drop ──
+            # Prefer REALIGN: the TML is usually just stale (e.g. an ID column exported as VARCHAR
+            # while the warehouse has it as bigint) — rewrite the TML type to the source warehouse's
+            # type token (INT64, never the raw 'bigint'). The target check on TML Validation confirms
+            # the realigned type binds; if the two warehouses genuinely disagree, it surfaces there.
             _src_type = st.session_state.get("_source_type_map") or {}
             _gone = st.session_state.get("dropped_col_names", set())
             _stfind = [f for f in warehouse_type_findings(
@@ -1893,40 +1904,88 @@ elif step == 2:
                        if f"{f['object']}::{f['column']}" not in _gone and f["column"] not in _gone]
             if _stfind:
                 st.markdown("**Type differs from the source warehouse**")
-                st.caption("Drop columns whose type drifted from the source. Realigning a stale TML "
-                           "type to match the warehouse needs the target check, so that lives on the "
-                           "TML Validation step.")
-                _stsel = st.session_state.setdefault("src_type_drop_selected", set())
+                st.caption("The TML type disagrees with the source warehouse. **Realign** rewrites the "
+                           "TML type to match the source (preferred when the TML is just stale — the "
+                           "HCP_ID case); **drop** only as a last resort. Nothing changes until you Apply.")
+                _stsel  = st.session_state.setdefault("src_type_drop_selected", set())
+                _strsel = st.session_state.setdefault("src_type_realign_selected", set())
+                _src_realign_to = {}   # scoped key -> TS token, from the SOURCE warehouse type
                 _strows = []
                 for _f in sorted(_stfind, key=lambda x: ((x.get("object") or "").lower(),
                                                          (x.get("column") or "").lower())):
                     _tbl = _f["object"]; _sk = f"{_tbl}::{_f['column']}"
                     _scdw = (_src_type.get(_tbl.strip().lower()) or {}).get(_f["column"].lower(), "")
+                    _tml  = _f.get("source_type") or ""
+                    # Realign only when the source maps to a real token that differs from the TML.
+                    # VOID/unknown source (no token) → drop only.
+                    _tok  = warehouse_type_to_ts(_scdw) if _scdw else ""
+                    _ral  = _tok if (_tok and _tok.strip().lower() != _tml.strip().lower()) else ""
+                    if _ral:
+                        _src_realign_to[_sk] = _ral
                     _strows.append({"Table": _tbl, "Column": _f["column"],
                                     "Source type": (_scdw.upper() if _scdw else "(?)"),
-                                    "TML type": _f.get("source_type") or "(?)",
+                                    "TML type": _tml or "(?)",
+                                    "Realign to": _ral if _ral else "—",
+                                    "Realign?": _sk in _strsel,
                                     "Drop?": _sk in _stsel, "_scoped": _sk})
+                st.session_state._src_realign_to = _src_realign_to
                 _stdf = pd.DataFrame(_strows, columns=["Table", "Column", "Source type", "TML type",
-                                                       "Drop?", "_scoped"])
-                _stb1, _ = st.columns([1, 4])
+                                                       "Realign to", "Realign?", "Drop?", "_scoped"])
+                _realignable = [r["_scoped"] for _, r in _stdf.iterrows()
+                                if r.get("Realign to") not in ("—", "", None)]
+                _stb1, _stb2, _stb3, _ = st.columns([1.3, 1, 1, 2])
                 with _stb1:
-                    if st.button(f"Drop all ({len(_stdf)})", key="srctype_all",
-                                 use_container_width=True):
-                        _stsel.update(_stdf["_scoped"].tolist()); _bump_editor("srctype"); st.rerun()
+                    if st.button(f"Realign all ({len(_realignable)})", key="srctype_re_all",
+                                 use_container_width=True, disabled=not _realignable):
+                        _strsel.update(_realignable)
+                        for _sk in _realignable:
+                            _stsel.discard(_sk)
+                        _bump_editor("srctype"); st.rerun()
+                with _stb2:
+                    if st.button(f"Drop rest ({len(set(_stdf['_scoped']) - set(_realignable))})",
+                                 key="srctype_drop_all", use_container_width=True, disabled=_stdf.empty):
+                        for _sk in _stdf["_scoped"].tolist():
+                            if _sk not in _strsel:
+                                _stsel.add(_sk)
+                        _bump_editor("srctype"); st.rerun()
+                with _stb3:
+                    if st.button("Clear all", key="srctype_clear", use_container_width=True,
+                                 disabled=not (_stsel or _strsel)):
+                        _stsel.clear(); _strsel.clear(); _bump_editor("srctype"); st.rerun()
                 _select_editor(
-                    _stdf, ["Drop?"], ["src_type_drop_selected"], "srctype",
+                    _stdf, ["Realign?", "Drop?"], ["src_type_realign_selected", "src_type_drop_selected"],
+                    "srctype",
                     column_config={
                         "Table":  st.column_config.TextColumn("Table", width="medium"),
                         "Column": st.column_config.TextColumn("Column", width="medium"),
                         "Source type": st.column_config.TextColumn("Source type", width="small"),
                         "TML type": st.column_config.TextColumn("TML type", width="small"),
+                        "Realign to": st.column_config.TextColumn("Realign to", width="small",
+                                        help="The TS token a realign writes to the TML, from the source "
+                                             "warehouse's type. '—' when the source has no usable type "
+                                             "(drop instead)."),
+                        "Realign?": st.column_config.CheckboxColumn("Realign?", width="small",
+                                      help="Rewrite the TML type to match the source (approve-first)."),
                         "Drop?":  st.column_config.CheckboxColumn("Drop?", width="small",
-                                    help="Drop this column (realign lives on TML Validation)."),
+                                    help="Last resort: drop this column (scoped to this table)."),
                     },
-                    disabled=["Table", "Column", "Source type", "TML type"])
-                if _stsel and st.button(f"Apply source-type drops ({len(_stsel)})", key="srctype_apply"):
-                    _apply_src_drops(_stsel, "source_type_apply")
+                    disabled=["Table", "Column", "Source type", "TML type", "Realign to"],
+                    exclusive=True)   # Realign? wins over Drop? per row
+                st.caption(f"**{len(_strsel)}** to realign, **{len(_stsel)}** to drop.")
+                if (_stsel or _strsel) and st.button("Apply source type fixes", key="srctype_apply"):
+                    _items = st.session_state.transformed_items
+                    _re   = {k: _src_realign_to[k] for k in _strsel if _src_realign_to.get(k)}
+                    _drop = {k for k in _stsel if k not in _strsel}   # compute before any clearing
+                    if _re:
+                        _items, _rn = realign_column_types(_items, _re)
+                        st.session_state.setdefault("realign_types", {}).update(_re)   # durable
+                    st.session_state.transformed_items = _items
+                    _strsel.clear()
+                    if _drop:
+                        _apply_src_drops(_drop, "source_type_apply")   # durable drop + prune + map clear
                     _stsel.clear()
+                    st.session_state.pop("_source_col_map", None)
+                    st.session_state.pop("_source_type_map", None)
                     st.rerun()
 
             # (C) casing differs from the SOURCE warehouse → approve-first recasing ──
@@ -3109,6 +3168,7 @@ elif step == 3:
                     _re = {k: _realign_to[k] for k in _tmrsel if _realign_to.get(k)}
                     if _re:
                         _items, _rn = realign_column_types(_items, _re)
+                        st.session_state.setdefault("realign_types", {}).update(_re)   # durable
                     _drop = {k for k in _tmsel if k not in _tmrsel}   # SCOPED; never bare
                     if _drop:
                         _items, _man = drop_columns(_items, _drop)
@@ -3369,6 +3429,7 @@ elif step == 3:
                     if _all_realign:
                         fixed, _rn = realign_column_types(st.session_state.transformed_items, _all_realign)
                         st.session_state.transformed_items = fixed
+                        st.session_state.setdefault("realign_types", {}).update(_all_realign)   # durable
                     if _all_drop:
                         fixed, _man = drop_columns(st.session_state.transformed_items, _all_drop)
                         st.session_state.transformed_items = fixed
