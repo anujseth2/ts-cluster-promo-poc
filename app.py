@@ -1769,8 +1769,9 @@ elif step == 1:
 elif step == 2:
     st.subheader("Source Audit")
     st.caption("Audit the promotion against the **source** warehouse first — drop columns the source "
-               "no longer has, realign or drop source type drift, recase to the source's casing — so "
-               "the TML is source-faithful before it's validated against the target on the next step.")
+               "no longer has, drop columns whose type drifted from the source, recase to the source's "
+               "casing — so the TML is source-faithful before it's validated against the target on the "
+               "next step. (Type *realignment* needs the target check, so it lives on TML Validation.)")
 
     # Build the promotion bundle on entry — the TML has to exist before we can audit it against
     # the source. Idempotent (guarded by _need_export inside), and shared with TML Validation, so
@@ -1992,9 +1993,10 @@ elif step == 2:
 
 elif step == 3:
     st.subheader("TML Validation")
-    st.caption("⏱ This step reads columns from the warehouse and validates the TML against it. "
-               "A **cold Databricks SQL warehouse can take a minute or two** to wake and respond — "
-               "warm it first for a faster run; a spinner/status box means it's working, not hung.")
+    st.caption("⏱ With source drift handled on **Source Audit**, this step validates the TML against "
+               "the **target** warehouse and reads its columns. A **cold Databricks SQL warehouse can "
+               "take a minute or two** to wake and respond — warm it first for a faster run; a "
+               "spinner/status box means it's working, not hung.")
 
     _prepare_bundle()
     selected_ids = st.session_state.get("selected_ids", [])
@@ -2109,9 +2111,15 @@ elif step == 3:
                 help="Pick columns to exclude from this promotion; the rest of each table promotes "
                      "normally, and any viz that uses a skipped column is dropped too.")
             _picked = {_skip_label_to_key[_l] for _l in _picked_lbls}
-            if _picked or _skip_now:
-                if st.button("Apply column skips & re-export", disabled=(_picked == _skip_now)):
-                    st.session_state.skip_columns = _picked
+            # Preserve skip entries this dropdown can't show. A column already dropped from the bundle
+            # isn't in the options (it's gone from the promoted set), so `= _picked` alone would
+            # silently un-skip it and bring it back on re-export. That covers manual skips applied on
+            # an earlier pass AND the Source Audit's source-absent drops (both live in skip_columns).
+            _shown_keys = set(_skip_label_to_key.values())
+            _new_skip = _picked | (_skip_now - _shown_keys)
+            if _new_skip or _skip_now:
+                if st.button("Apply column skips & re-export", disabled=(_new_skip == _skip_now)):
+                    st.session_state.skip_columns = _new_skip
                     # Force a clean re-export so the skip set is applied from a fresh bundle
                     # (avoids compounding drops on an already-edited bundle).
                     st.session_state.pop("transformed_items", None)
