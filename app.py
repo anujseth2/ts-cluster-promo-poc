@@ -917,7 +917,7 @@ if step == 0:
                         "recase_approved", "_recase_applied_set", "_recase_events",
                         "_source_col_map", "_source_type_map", "src_drop_selected",
                         "src_type_drop_selected", "src_type_realign_selected", "_src_realign_to",
-                        "realign_types", "_source_audit_dirty", "wh_drop_selected",
+                        "realign_types", "_source_audit_dirty", "skip_selected", "wh_drop_selected",
                         "tm_drop_selected", "tm_realign_selected", "_tm_realign_to",
                         "_tm_target_full", "_tm_source_full", "_target_modeled_map"):
                 st.session_state.pop(key, None)
@@ -2177,6 +2177,12 @@ elif step == 3:
                 st.dataframe(_sno(pd.DataFrame(_shape_rows)), use_container_width=True, hide_index=True)
 
         # ── Skip specific columns (leave a column out without touching the rest) ──
+        # Same checkbox-table style as the Source Audit drops, and applied IN PLACE (no re-export):
+        # ticked columns are dropped straight from the bundle and recorded in skip_columns (durable),
+        # so a later re-export re-applies them. Scoped `table::col`, so skipping a shared name only
+        # drops it from that one table. Additive — applying only ADDS the ticked columns, so existing
+        # skips (and the Source Audit's source-absent drops) are preserved automatically.
+        import pandas as pd
         _tbl_cols = {}   # table name -> [column display names]  (shared _display_cols → counts match)
         for i in filtered_items:
             d = _parse_edoc(i.get("edoc", "{}"))
@@ -2184,42 +2190,63 @@ elif step == 3:
             if t and t.get("name"):
                 _tbl_cols[t["name"]] = _display_cols(t)
         if _tbl_cols:
-            _skip_now = st.session_state.get("skip_columns", set())
-            # One dropdown (multiselect) of every promoted column, labelled "N. table · column" so it
-            # lines up with the count table's S.No. A multiselect is a dropdown that stays open and
-            # persists cleanly (no expander to collapse, no double-click). Values are SCOPED
-            # `table::col`, so skipping a shared name only drops it from that one table.
-            _skip_label_to_key, _skip_opts = {}, []
+            st.markdown("**Skip specific columns** — leave a column out, keep the rest (optional)")
+            _skip_sel = st.session_state.setdefault("skip_selected", set())
+            _skrows = []
             for _tn in sorted(_tbl_cols, key=lambda n: _tbl_serial.get(n.strip().lower(), 1e9)):
                 _sn = _tbl_serial.get(_tn.strip().lower())
                 for _c in sorted(_tbl_cols[_tn]):
-                    _lbl = f"{_sn}. {_tn} · {_c}" if _sn else f"{_tn} · {_c}"
-                    _skip_label_to_key[_lbl] = f"{_tn.strip().lower()}::{_c.strip().lower()}"
-                    _skip_opts.append(_lbl)
-            _picked_lbls = st.multiselect(
-                "Skip specific columns (optional) — leave a column out, keep the rest",
-                options=_skip_opts,
-                default=[_l for _l, _k in _skip_label_to_key.items() if _k in _skip_now],
-                key="skip_ms",
-                help="Pick columns to exclude from this promotion; the rest of each table promotes "
-                     "normally, and any viz that uses a skipped column is dropped too.")
-            _picked = {_skip_label_to_key[_l] for _l in _picked_lbls}
-            # Preserve skip entries this dropdown can't show. A column already dropped from the bundle
-            # isn't in the options (it's gone from the promoted set), so `= _picked` alone would
-            # silently un-skip it and bring it back on re-export. That covers manual skips applied on
-            # an earlier pass AND the Source Audit's source-absent drops (both live in skip_columns).
-            _shown_keys = set(_skip_label_to_key.values())
-            _new_skip = _picked | (_skip_now - _shown_keys)
-            if _new_skip or _skip_now:
-                if st.button("Apply column skips & re-export", disabled=(_new_skip == _skip_now)):
-                    st.session_state.skip_columns = _new_skip
-                    # Force a clean re-export so the skip set is applied from a fresh bundle
-                    # (avoids compounding drops on an already-edited bundle).
-                    st.session_state.pop("transformed_items", None)
-                    for _k in ("pr_url", "validation_errors", "validation_ok", "dropped_col_names",
-                               "dropped_cols_count", "dropped_vizs_count"):
-                        st.session_state.pop(_k, None)
-                    st.rerun()
+                    _sk = f"{_tn.strip().lower()}::{_c.strip().lower()}"
+                    _skrows.append({"#": str(_sn) if _sn else "", "Table": _tn, "Column": _c,
+                                    "Skip?": _sk in _skip_sel, "_scoped": _sk})
+            _skdf = pd.DataFrame(_skrows, columns=["#", "Table", "Column", "Skip?", "_scoped"])
+            _skq = st.text_input("Filter columns to skip", key="skip_search",
+                                 label_visibility="collapsed",
+                                 placeholder="🔎 Filter by table or column name").strip().lower()
+            _skview = _skdf
+            if _skq and not _skdf.empty:
+                _skview = _skdf[_skdf.apply(lambda r: _skq in str(r["Table"]).lower()
+                                            or _skq in str(r["Column"]).lower(), axis=1)]
+            _seb = f"skipcol::{_skq}"
+            _ska, _skb, _ = st.columns([1.4, 1, 3])
+            with _ska:
+                if st.button(f"Skip all shown ({len(_skview)})", key="skip_all_shown",
+                             use_container_width=True, disabled=_skview.empty):
+                    _skip_sel.update(_skview["_scoped"].tolist()); _bump_editor(_seb); st.rerun()
+            with _skb:
+                if st.button("Clear all", key="skip_clear", use_container_width=True,
+                             disabled=not _skip_sel):
+                    _skip_sel.clear(); _bump_editor(_seb); st.rerun()
+            _select_editor(
+                _skview, ["Skip?"], ["skip_selected"], _seb,
+                column_config={
+                    "#":      st.column_config.TextColumn("#", width="small",
+                                help="Matches the S.No in the count table above."),
+                    "Table":  st.column_config.TextColumn("Table", width="medium"),
+                    "Column": st.column_config.TextColumn("Column", width="medium"),
+                    "Skip?":  st.column_config.CheckboxColumn("Skip?", width="small",
+                                help="Leave this column out of the promotion (and any viz that uses it)."),
+                },
+                disabled=["#", "Table", "Column"])
+            st.caption(f"**{len(_skip_sel)}** column(s) marked to skip.")
+            if _skip_sel and st.button("Apply column skips", key="skip_apply_cols"):
+                _sdrop = set(_skip_sel)
+                _fixed, _sman = drop_columns(st.session_state.transformed_items, _sdrop)
+                _record_drop(_sman)
+                st.session_state.setdefault("skip_columns", set()).update(_sdrop)       # durable
+                st.session_state.setdefault("dropped_col_names", set()).update(_sdrop)
+                _semptied = {ff["table"] for ff in table_cleanup_findings(_fixed)}
+                if _semptied:
+                    _fixed, _sts = _prune_tables_whole(_fixed, _semptied)
+                    st.session_state.setdefault("prune_tables", set()).update(_semptied)
+                st.session_state.transformed_items = _fixed
+                _log_apply_detail("skip_columns_apply", _sdrop, _sman, _semptied, _fixed)
+                _skip_sel.clear()
+                # the bundle changed — invalidate any current validation / discovery
+                for _k in ("pr_url", "validation_errors", "validation_ok",
+                           "discovered_findings", "discovered_meta"):
+                    st.session_state.pop(_k, None)
+                st.rerun()
 
 
         def _run_validation(items, step=None):
