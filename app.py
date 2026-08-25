@@ -917,7 +917,8 @@ if step == 0:
                         "recase_approved", "_recase_applied_set", "_recase_events",
                         "_source_col_map", "_source_type_map", "src_drop_selected",
                         "src_type_drop_selected", "src_type_realign_selected", "_src_realign_to",
-                        "realign_types", "_source_audit_dirty", "skip_selected", "wh_drop_selected",
+                        "realign_types", "_source_audit_dirty", "skip_selected", "skip_expanded",
+                        "_skip_gen", "wh_drop_selected",
                         "tm_drop_selected", "tm_realign_selected", "_tm_realign_to",
                         "_tm_target_full", "_tm_source_full", "_target_modeled_map"):
                 st.session_state.pop(key, None)
@@ -2190,46 +2191,59 @@ elif step == 3:
             if t and t.get("name"):
                 _tbl_cols[t["name"]] = _display_cols(t)
         if _tbl_cols:
-            st.markdown("**Skip specific columns** — leave a column out, keep the rest (optional)")
+            st.markdown("**Skip specific columns** — leave a column out, keep the rest (optional). "
+                        "Tables start collapsed; expand one to tick its columns.")
             _skip_sel = st.session_state.setdefault("skip_selected", set())
-            _skrows = []
-            for _tn in sorted(_tbl_cols, key=lambda n: _tbl_serial.get(n.strip().lower(), 1e9)):
-                _sn = _tbl_serial.get(_tn.strip().lower())
-                for _c in sorted(_tbl_cols[_tn]):
-                    _sk = f"{_tn.strip().lower()}::{_c.strip().lower()}"
-                    _skrows.append({"#": str(_sn) if _sn else "", "Table": _tn, "Column": _c,
-                                    "Skip?": _sk in _skip_sel, "_scoped": _sk})
-            _skdf = pd.DataFrame(_skrows, columns=["#", "Table", "Column", "Skip?", "_scoped"])
+            _skexp = st.session_state.setdefault("skip_expanded", set())   # expanded table names
+            _skgen = st.session_state.get("_skip_gen", 0)                  # bump = reset all editors
             _skq = st.text_input("Filter columns to skip", key="skip_search",
                                  label_visibility="collapsed",
                                  placeholder="🔎 Filter by table or column name").strip().lower()
-            _skview = _skdf
-            if _skq and not _skdf.empty:
-                _skview = _skdf[_skdf.apply(lambda r: _skq in str(r["Table"]).lower()
-                                            or _skq in str(r["Column"]).lower(), axis=1)]
-            _seb = f"skipcol::{_skq}"
-            _ska, _skb, _ = st.columns([1.4, 1, 3])
-            with _ska:
-                if st.button(f"Skip all shown ({len(_skview)})", key="skip_all_shown",
-                             use_container_width=True, disabled=_skview.empty):
-                    _skip_sel.update(_skview["_scoped"].tolist()); _bump_editor(_seb); st.rerun()
-            with _skb:
-                if st.button("Clear all", key="skip_clear", use_container_width=True,
-                             disabled=not _skip_sel):
-                    _skip_sel.clear(); _bump_editor(_seb); st.rerun()
-            _select_editor(
-                _skview, ["Skip?"], ["skip_selected"], _seb,
-                column_config={
-                    "#":      st.column_config.TextColumn("#", width="small",
-                                help="Matches the S.No in the count table above."),
-                    "Table":  st.column_config.TextColumn("Table", width="medium"),
-                    "Column": st.column_config.TextColumn("Column", width="medium"),
-                    "Skip?":  st.column_config.CheckboxColumn("Skip?", width="small",
-                                help="Leave this column out of the promotion (and any viz that uses it)."),
-                },
-                disabled=["#", "Table", "Column"])
-            st.caption(f"**{len(_skip_sel)}** column(s) marked to skip.")
-            if _skip_sel and st.button("Apply column skips", key="skip_apply_cols"):
+            _any_shown = False
+            for _tn in sorted(_tbl_cols, key=lambda n: _tbl_serial.get(n.strip().lower(), 1e9)):
+                _tn_l = _tn.strip().lower()
+                _cols = [c for c in sorted(_tbl_cols[_tn])
+                         if (not _skq) or (_skq in _tn_l) or (_skq in c.lower())]
+                if not _cols:
+                    continue
+                _any_shown = True
+                _sn = _tbl_serial.get(_tn_l)
+                _marks = sum(1 for c in _cols if f"{_tn_l}::{c.strip().lower()}" in _skip_sel)
+                _open = (_tn in _skexp) or bool(_skq)      # auto-open while filtering
+                _hdr = (f"{'▾' if _open else '▸'}  {(str(_sn) + '. ') if _sn else ''}{_tn}"
+                        f"  ·  {len(_cols)} column(s)"
+                        + (f"  ·  {_marks} to skip" if _marks else ""))
+                if st.button(_hdr, key=f"skexp_{_tn_l}", use_container_width=True):
+                    (_skexp.discard if _tn in _skexp else _skexp.add)(_tn)
+                    st.rerun()
+                if _open:
+                    _rows = [{"Column": c, "Skip?": f"{_tn_l}::{c.strip().lower()}" in _skip_sel,
+                              "_scoped": f"{_tn_l}::{c.strip().lower()}"} for c in _cols]
+                    _df = pd.DataFrame(_rows, columns=["Column", "Skip?", "_scoped"])
+                    _seb = f"skipcol::{_tn_l}::{_skq}::{_skgen}"   # global gen in base → Clear resets all
+                    if st.button(f"Skip all in this table ({len(_df)})", key=f"skall_{_tn_l}"):
+                        _skip_sel.update(_df["_scoped"].tolist())
+                        st.session_state._skip_gen = _skgen + 1
+                        st.rerun()
+                    _select_editor(
+                        _df, ["Skip?"], ["skip_selected"], _seb,
+                        column_config={
+                            "Column": st.column_config.TextColumn("Column", width="large"),
+                            "Skip?":  st.column_config.CheckboxColumn("Skip?", width="small",
+                                        help="Leave this column out of the promotion (and any viz using it)."),
+                        },
+                        disabled=["Column"])
+            if not _any_shown:
+                st.caption("No columns match the filter.")
+            _skf1, _skf2, _ = st.columns([1.4, 1, 3])
+            with _skf1:
+                _apply_skip = st.button(f"Apply column skips ({len(_skip_sel)})", key="skip_apply_cols",
+                                        disabled=not _skip_sel, use_container_width=True)
+            with _skf2:
+                if st.button("Clear all", key="skip_clear", disabled=not _skip_sel,
+                             use_container_width=True):
+                    _skip_sel.clear(); st.session_state._skip_gen = _skgen + 1; st.rerun()
+            if _apply_skip and _skip_sel:
                 _sdrop = set(_skip_sel)
                 _fixed, _sman = drop_columns(st.session_state.transformed_items, _sdrop)
                 _record_drop(_sman)
