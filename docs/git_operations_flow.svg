@@ -1,0 +1,63 @@
+<svg viewBox="0 0 680 648" xmlns="http://www.w3.org/2000/svg" font-family="Arial, Helvetica, sans-serif">
+<rect x="0" y="0" width="680" height="648" fill="#ffffff"/>
+<text x="30" y="30" font-size="17" font-weight="600" fill="#18181b">Git operations — source cluster to target cluster via the Git repository</text>
+
+<!-- source cluster -->
+<rect x="30" y="52" width="270" height="180" rx="12" fill="#f4f4f5" stroke="#d4d4d8"/>
+<text x="165" y="82" text-anchor="middle" font-size="15" font-weight="600" fill="#18181b">Source cluster</text>
+<text x="165" y="101" text-anchor="middle" font-size="12" fill="#71717a">export via REST</text>
+<text x="54" y="130" font-size="13" fill="#18181b">Tables</text>
+<text x="54" y="152" font-size="13" fill="#18181b">Models</text>
+<text x="54" y="174" font-size="13" fill="#18181b">Feedback</text>
+<text x="54" y="196" font-size="13" fill="#18181b">NL instructions</text>
+<text x="54" y="218" font-size="13" fill="#18181b">Liveboards / answers</text>
+
+<!-- target cluster -->
+<rect x="380" y="52" width="270" height="180" rx="12" fill="#f4f4f5" stroke="#d4d4d8"/>
+<text x="515" y="82" text-anchor="middle" font-size="15" font-weight="600" fill="#18181b">Target cluster</text>
+<text x="515" y="101" text-anchor="middle" font-size="12" fill="#71717a">import via REST</text>
+<text x="404" y="130" font-size="13" fill="#18181b">Tables</text>
+<text x="404" y="152" font-size="13" fill="#18181b">Models</text>
+<text x="404" y="174" font-size="13" fill="#18181b">Feedback</text>
+<text x="404" y="196" font-size="13" fill="#18181b">NL instructions</text>
+<text x="404" y="218" font-size="13" fill="#18181b">Liveboards / answers</text>
+
+<text x="340" y="258" text-anchor="middle" font-size="12" fill="#71717a">before merge: validate on the target (VALIDATE_ONLY)</text>
+
+<!-- git repo -->
+<rect x="30" y="316" width="620" height="262" rx="12" fill="none" stroke="#d4d4d8"/>
+<text x="52" y="344" font-size="16" font-weight="600" fill="#18181b">Git repository</text>
+
+<rect x="52" y="408" width="60" height="26" rx="6" fill="#e08a2b"/>
+<text x="82" y="426" text-anchor="middle" font-size="13" fill="#ffffff">dev</text>
+<line x1="120" y1="422" x2="632" y2="422" stroke="#e08a2b" stroke-width="3"/>
+<circle cx="165" cy="422" r="8" fill="#e08a2b"/>
+
+<rect x="52" y="502" width="60" height="26" rx="6" fill="#2e7d32"/>
+<text x="82" y="520" text-anchor="middle" font-size="13" fill="#ffffff">main</text>
+<line x1="120" y1="516" x2="632" y2="516" stroke="#2e7d32" stroke-width="3"/>
+<circle cx="515" cy="516" r="8" fill="#2e7d32"/>
+<text x="515" y="500" text-anchor="middle" font-size="12" fill="#71717a">merge (squash)</text>
+
+<text x="52" y="552" font-size="12" fill="#71717a">one folder per team: commercial sbu/  (tables, models, feedback, liveboards, answers)</text>
+
+<!-- connectors -->
+<path d="M165,232 L165,412" stroke="#71717a" stroke-dasharray="4 3" fill="none"/>
+<polygon points="161,410 169,410 165,418" fill="#71717a"/>
+<text x="180" y="300" font-size="12" fill="#71717a">1 · commit → dev</text>
+
+<path d="M165,430 L515,506" stroke="#71717a" stroke-dasharray="4 3" fill="none"/>
+<polygon points="509,500 517,504 508,509" fill="#71717a"/>
+<text x="442" y="468" font-size="12" fill="#71717a">2 · PR dev → main + merge</text>
+
+<path d="M515,508 L515,234" stroke="#71717a" stroke-dasharray="4 3" fill="none"/>
+<polygon points="511,240 519,240 515,232" fill="#71717a"/>
+<text x="505" y="288" text-anchor="end" font-size="12" fill="#71717a">3 · deploy to target</text>
+<text x="505" y="304" text-anchor="end" font-size="12" fill="#71717a">REST import from main</text>
+
+<!-- legend -->
+<rect x="30" y="600" width="14" height="10" rx="2" fill="#e08a2b"/>
+<text x="50" y="609" font-size="12" fill="#71717a">dev branch</text>
+<rect x="140" y="600" width="14" height="10" rx="2" fill="#2e7d32"/>
+<text x="160" y="609" font-size="12" fill="#71717a">main branch</text>
+</svg>

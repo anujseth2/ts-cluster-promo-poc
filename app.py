@@ -28,6 +28,7 @@ from services.import_diagnostics import (
     drop_vizzes, table_drop_preview, drop_tables, warehouse_missing_findings, friendly_error,
     column_drop_cascade, finding_key, dangling_reference_findings, table_cleanup_findings,
     realign_column_types, warehouse_type_to_ts, warehouse_type_findings, type_family,
+    recase_columns,
 )
 from services.table_matcher import column_signature
 from services.feedback_replace import feedback_preview, replace_prep, replace_finalize
@@ -541,7 +542,8 @@ def _go(step: int):
     st.rerun()
 
 
-def _nav(step: int, can_next: bool = True, next_hint: str = ""):
+def _nav(step: int, can_next: bool = True, next_hint: str = "",
+         next_label: str = "Next →", next_reexport: bool = False):
     st.divider()
     col_back, col_mid, col_next = st.columns([1, 6, 1])
     with col_back:
@@ -550,12 +552,18 @@ def _nav(step: int, can_next: bool = True, next_hint: str = ""):
     with col_next:
         if step < len(STEPS) - 1:
             if can_next:
-                if st.button("Next →", type="primary", key=f"next_{step}"):
+                if st.button(next_label, type="primary", key=f"next_{step}"):
+                    # next_reexport: force ONE clean re-export on advance when this page made changes
+                    # (the durable intent — skip/realign/recase — is re-applied from a fresh source
+                    # pull). Only when something actually changed, so a pass-through stays fast.
+                    if next_reexport and st.session_state.pop("_source_audit_dirty", False):
+                        for _k in ("transformed_items", "pr_url", "validation_errors", "validation_ok"):
+                            st.session_state.pop(_k, None)
                     _go(step + 1)
             else:
                 # Show a disabled Next so the control never just vanishes, and
                 # explain WHY it's blocked instead of leaving the user stuck.
-                st.button("Next →", key=f"next_{step}", disabled=True)
+                st.button(next_label, key=f"next_{step}", disabled=True)
     if step < len(STEPS) - 1 and not can_next and next_hint:
         with col_mid:
             st.caption(f"⛔ {next_hint}")
@@ -909,7 +917,7 @@ if step == 0:
                         "recase_approved", "_recase_applied_set", "_recase_events",
                         "_source_col_map", "_source_type_map", "src_drop_selected",
                         "src_type_drop_selected", "src_type_realign_selected", "_src_realign_to",
-                        "realign_types", "wh_drop_selected",
+                        "realign_types", "_source_audit_dirty", "wh_drop_selected",
                         "tm_drop_selected", "tm_realign_selected", "_tm_realign_to",
                         "_tm_target_full", "_tm_source_full", "_target_modeled_map"):
                 st.session_state.pop(key, None)
@@ -1812,6 +1820,7 @@ elif step == 2:
                 fixed, _ts = _prune_tables_whole(fixed, _emptied)
                 st.session_state.setdefault("prune_tables", set()).update(_emptied)
             st.session_state.transformed_items = fixed
+            st.session_state._source_audit_dirty = True   # leaving 2b re-exports a clean bundle
             _log_apply_detail(_tag, _dropset, _man, _emptied, fixed)
             # Keep the source read (_source_col_map/_source_type_map) — it's a read of the WAREHOUSE,
             # not the bundle, so a drop doesn't stale it. The findings below recompute against the
@@ -1981,19 +1990,21 @@ elif step == 2:
                     if _re:
                         _items, _rn = realign_column_types(_items, _re)
                         st.session_state.setdefault("realign_types", {}).update(_re)   # durable
+                        st.session_state._source_audit_dirty = True
                     st.session_state.transformed_items = _items
                     _strsel.clear()
                     if _drop:
-                        _apply_src_drops(_drop, "source_type_apply")   # durable drop + prune
+                        _apply_src_drops(_drop, "source_type_apply")   # durable drop + prune (sets dirty)
                     _stsel.clear()
                     st.rerun()
 
             # (C) casing differs from the SOURCE warehouse → approve-first recasing ──
             # Same source read as (A)/(B): recasings come from _src_map (the live SHOW COLUMNS), so all
             # three checks are surfaced by one "Read source warehouse". Approve-first (no silent
-            # mutations); an approved recasing applies on re-export, which re-reads the same warehouse.
+            # mutations); "Apply recasings" rewrites db_column_name IN PLACE (no re-export) so the row
+            # resolves immediately, exactly like the drop/realign buttons. The single re-export happens
+            # only when you leave this page (see the nav button below).
             _rapp = st.session_state.setdefault("recase_approved", set())
-            _applied_set = st.session_state.get("_recase_applied_set", set())
             _case_rows = []
             for _it in st.session_state.get("transformed_items", []):
                 _t = _parse_edoc(_it.get("edoc", "{}")).get("table")
@@ -2012,9 +2023,12 @@ elif step == 2:
             if not _case_rows:
                 st.caption("✔ No promoted column's casing differs from the source warehouse.")
             else:
-                _pending = _rapp != _applied_set
+                # approved rows still showing = approved but not yet applied (in-place apply resolves
+                # a row, so it leaves this list once done).
+                _approved_here = [r["_scoped"] for r in _case_rows if r["_scoped"] in _rapp]
                 st.markdown("**Casing differs from the source warehouse**"
-                            + ("  ·  ⚠ approved recasings not yet applied" if _pending else ""))
+                            + (f"  ·  ⚠ {len(_approved_here)} approved, not yet applied"
+                               if _approved_here else ""))
                 st.caption("Approve a recasing to align the promoted `db_column_name` to the source "
                            "warehouse's **actual** casing (upper/lower/mixed — read live, never "
                            "assumed). Nothing is recased until you approve and Apply; an unapproved "
@@ -2039,14 +2053,31 @@ elif step == 2:
                                       help="Tick to recase this column to the source warehouse casing."),
                     },
                     disabled=["Table", "From", "To"])
-                if _rapp != _applied_set:
-                    st.warning(f"{len(_rapp)} recasing(s) approved but not yet applied to the bundle.")
-                    if st.button("Apply recasings & re-export", type="primary", key="recase_apply"):
-                        st.session_state.pop("transformed_items", None)
-                        for _k in ("pr_url", "validation_errors", "validation_ok"):
-                            st.session_state.pop(_k, None)
+                if _approved_here:
+                    st.warning(f"{len(_approved_here)} recasing(s) approved but not yet applied.")
+                    if st.button("Apply recasings", type="primary", key="recase_apply"):
+                        # In-place: rewrite db_column_name for the approved subset of the source casing
+                        # map. recase_approved stays (durable), so the final re-export reproduces it.
+                        _applied_map = {_t: {_c: _case for _c, _case in (_cols or {}).items()
+                                             if f"{_t}::{_c}" in _rapp}
+                                        for _t, _cols in _src_map.items()}
+                        _applied_map = {_t: _sub for _t, _sub in _applied_map.items() if _sub}
+                        _fixed, _rn = recase_columns(st.session_state.transformed_items, _applied_map)
+                        st.session_state.transformed_items = _fixed
+                        # Mark approved recasings as applied so the Import Results report lists them
+                        # even before the final re-export (the re-export re-asserts the same set).
+                        st.session_state.setdefault("_recase_applied_set", set()).update(_rapp)
+                        st.session_state._source_audit_dirty = True
                         st.rerun()
-    _nav(2, can_next=True, next_hint="")
+
+    # The ONE re-export: leaving Source Audit rebuilds a clean bundle from source with every approved
+    # drop / realign / recasing applied deterministically, then validates THAT. The section buttons
+    # above only preview in place — this is the single authoritative re-export. (At 4-space so the nav
+    # renders for every branch: no assets, preparing, or ready.)
+    _sa_dirty = st.session_state.get("_source_audit_dirty", False)
+    _nav(2, can_next=True,
+         next_label=("Re-export & continue →" if _sa_dirty else "Continue →"),
+         next_reexport=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

@@ -927,6 +927,32 @@ def realign_column_types(items, realign):
     return out, n
 
 
+def recase_columns(items, case_map):
+    """In-place physical-name recasing: set each table column's db_column_name to the warehouse's
+    actual casing. Mirrors the transformer's recasing rule (transform_doc) but applied to an
+    already-built bundle, so an approved recasing takes effect WITHOUT a full re-export.
+
+    `case_map`: {table_name_lower: {db_column_name_lower: actual_case}} — already filtered to the
+    approved subset. Only the physical `db_column_name` is touched; the logical `name` is left alone
+    so references by name still resolve. Returns (new_items, count_changed)."""
+    out, n = [], 0
+    for item in items:
+        doc = _parse_edoc(item)
+        t = doc.get("table")
+        if t and t.get("columns"):
+            cc = case_map.get((t.get("name", "") or "").strip().lower())
+            if cc:
+                for col in t["columns"]:
+                    dbn = col.get("db_column_name")
+                    if dbn:
+                        tgt = cc.get(dbn.strip().lower())
+                        if tgt and tgt != dbn:
+                            col["db_column_name"] = tgt
+                            n += 1
+        out.append({**item, "edoc": json.dumps(doc)})
+    return out, n
+
+
 def drop_vizzes(items, viz_ids):
     """Remove specific visualizations (by id) from any liveboard in `items`, and prune any
     layout tiles that referenced them (flat layout.tiles or tabbed layout.tabs[].tiles).

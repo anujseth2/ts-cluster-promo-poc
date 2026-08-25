@@ -338,6 +338,23 @@ def test_source_audit_realign_resolves_stale_hcp_id():
     assert warehouse_type_findings(out, src_types) == []
 
 
+def test_recase_columns_inplace_matches_transformer_rule():
+    # In-place recasing (Source Audit "Apply recasings", no re-export) rewrites db_column_name to
+    # the warehouse casing and leaves the logical name alone — same rule as the export transform.
+    from services.import_diagnostics import recase_columns
+    doc = {"table": {"name": "commerce", "columns": [
+        {"name": "revenue", "db_column_name": "revenue",
+         "db_column_properties": {"data_type": "DOUBLE"}}]}}
+    out, n = recase_columns([{"edoc": json.dumps(doc)}], {"commerce": {"revenue": "REVENUE"}})
+    col = json.loads(out[0]["edoc"])["table"]["columns"][0]
+    assert n == 1
+    assert col["db_column_name"] == "REVENUE"        # recased to warehouse casing
+    assert col["name"] == "revenue"                  # logical name untouched
+    # idempotent: applying the same casing again changes nothing
+    out2, n2 = recase_columns(out, {"commerce": {"revenue": "REVENUE"}})
+    assert n2 == 0
+
+
 def test_warehouse_type_findings_one_pass():
     from services.import_diagnostics import warehouse_type_findings
     doc = {"table": {"name": "t", "db": "d", "schema": "s", "db_table": "t", "columns": [

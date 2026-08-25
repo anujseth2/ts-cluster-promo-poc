@@ -1,0 +1,77 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  @page { size: A4; margin: 18mm 16mm; }
+  * { box-sizing: border-box; }
+  body { font-family: Arial, Helvetica, sans-serif; color: #18181b; font-size: 12.5px;
+         line-height: 1.55; margin: 0; }
+  h1 { font-size: 20px; font-weight: 600; margin: 0 0 4px; }
+  h2 { font-size: 15px; font-weight: 600; margin: 20px 0 6px; }
+  p  { margin: 0 0 8px; }
+  ul, ol { margin: 0 0 8px; padding-left: 20px; }
+  li { margin: 0 0 5px; }
+  code { font-family: "SFMono-Regular", Consolas, monospace; font-size: 11.5px;
+         background: #f4f4f5; padding: 1px 4px; border-radius: 3px; }
+  .sub { color: #71717a; margin: 0 0 14px; }
+  .fig { text-align: center; margin: 8px 0 4px; page-break-inside: avoid; }
+  .fig img { width: 100%; max-width: 640px; height: auto; }
+  .cap { color: #71717a; font-size: 11px; text-align: center; margin: 0 0 12px; }
+</style>
+</head>
+<body>
+  <h1>ThoughtSpot cross-cluster promotion</h1>
+  <p class="sub">Git operations overview</p>
+
+  <p>This tool copies ThoughtSpot content (tables, models, answers, liveboards, Spotter feedback,
+  and Spotter instructions) from one cluster or org to another. It uses a GitHub repository in the
+  middle: every promotion is written there first (staged on <code>dev</code>, reviewed via a pull
+  request, recorded on <code>main</code>) before it lands on the target. The tool reads from the
+  source and writes to the target over the REST API; it does not rely on ThoughtSpot's built-in
+  Git integration to deploy.</p>
+
+  <div class="fig"><img src="git_operations_flow.svg" alt="Git operations flow diagram"></div>
+  <p class="cap">Source cluster to target cluster, staged and recorded through the Git repository.</p>
+
+  <h2>Identity: obj_id</h2>
+  <p>Every object carries an <code>obj_id</code>, a stable name that stays the same across clusters.
+  On import, ThoughtSpot matches by <code>obj_id</code> first: if the target already has an object
+  with that <code>obj_id</code> it is updated in place, otherwise a new one is created. This is what
+  keeps promotions from making duplicates.</p>
+
+  <h2>The steps</h2>
+  <ol>
+    <li><b>Select what to promote.</b> Pick the models, answers, and liveboards on the source. The
+    tool works out their dependencies and shows what will be included, and what would be dropped if
+    a table is not on the target.</li>
+    <li><b>Set and align obj_ids.</b> The tool checks each object has an <code>obj_id</code> that
+    matches its counterpart on the target, suggests one where missing, and applies it on your click.
+    This is what makes an update land in place instead of creating a copy.</li>
+    <li><b>Export and validate.</b> The tool exports from the source, remaps the data layer
+    (connection, database, schema) to the target warehouse, commits the files to the <code>dev</code>
+    branch under the team folder, opens a <code>dev</code> to <code>main</code> pull request, and
+    runs a dry-run validation against the target (a VALIDATE_ONLY import) to catch problems before
+    anything is committed for real.</li>
+    <li><b>Merge and import.</b> The pull request is squash-merged into <code>main</code> (the record
+    of what was promoted), then the tool imports from <code>main</code> into the target over REST, in
+    order: tables and models, then feedback, then NL instructions, then liveboards and answers.</li>
+    <li><b>Reconcile and report.</b> The tool re-reads the target and confirms, per object, whether it
+    was updated in place, newly created, a duplicate, or missing.</li>
+  </ol>
+
+  <h2>Order and dependencies</h2>
+  <p>Order matters. Feedback and NL instructions attach to a model, so they are applied only after
+  that model exists on the target. Liveboards and answers come last because they reference the models.</p>
+
+  <h2>Quick glossary</h2>
+  <ul>
+    <li><b>Source / target cluster</b> - where content comes from and goes to; different clusters or orgs.</li>
+    <li><b>dev branch</b> - disposable staging branch; every export is written here first.</li>
+    <li><b>main branch</b> - the reviewed, merged record of what has been promoted.</li>
+    <li><b>Pull request</b> - the review step that proposes moving <code>dev</code> into <code>main</code>.</li>
+    <li><b>obj_id</b> - the stable cross-cluster identity that decides update-in-place versus create-new.</li>
+    <li><b>VALIDATE_ONLY</b> - a dry-run import that checks for errors without changing anything.</li>
+  </ul>
+</body>
+</html>
