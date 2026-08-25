@@ -1813,8 +1813,10 @@ elif step == 2:
                 st.session_state.setdefault("prune_tables", set()).update(_emptied)
             st.session_state.transformed_items = fixed
             _log_apply_detail(_tag, _dropset, _man, _emptied, fixed)
-            st.session_state.pop("_source_col_map", None)     # stale after a drop — re-read on demand
-            st.session_state.pop("_source_type_map", None)
+            # Keep the source read (_source_col_map/_source_type_map) — it's a read of the WAREHOUSE,
+            # not the bundle, so a drop doesn't stale it. The findings below recompute against the
+            # updated bundle, so the resolved rows drop off while the section stays visible (no
+            # collapse back to the "Read source warehouse" button).
 
         # ── Read the SOURCE warehouse (columns, casing, types) in one pass ──
         _sh, _sb = st.columns([3, 2])
@@ -1982,10 +1984,8 @@ elif step == 2:
                     st.session_state.transformed_items = _items
                     _strsel.clear()
                     if _drop:
-                        _apply_src_drops(_drop, "source_type_apply")   # durable drop + prune + map clear
+                        _apply_src_drops(_drop, "source_type_apply")   # durable drop + prune
                     _stsel.clear()
-                    st.session_state.pop("_source_col_map", None)
-                    st.session_state.pop("_source_type_map", None)
                     st.rerun()
 
             # (C) casing differs from the SOURCE warehouse → approve-first recasing ──
