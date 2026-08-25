@@ -2193,6 +2193,12 @@ elif step == 3:
         if _tbl_cols:
             st.markdown("**Skip specific columns** — leave a column out, keep the rest (optional). "
                         "Tables start collapsed; expand one to tick its columns.")
+            # Left-align the collapsible table headers (Streamlit centres button labels by default).
+            # Scoped to the skexp_ header buttons via their per-key class, so other buttons are untouched.
+            st.markdown(
+                "<style>[class*='st-key-skexp_'] button{justify-content:flex-start!important;}"
+                "[class*='st-key-skexp_'] button p{text-align:left!important;margin:0;}</style>",
+                unsafe_allow_html=True)
             _skip_sel = st.session_state.setdefault("skip_selected", set())
             _skexp = st.session_state.setdefault("skip_expanded", set())   # expanded table names
             _skgen = st.session_state.get("_skip_gen", 0)                  # bump = reset all editors
