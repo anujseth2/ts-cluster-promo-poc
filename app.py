@@ -488,6 +488,40 @@ def _read_source_type_map():
     return out
 
 
+def _warehouse_columns(coords, host, warehouse_id, token, proxy=""):
+    """Read SHOW COLUMNS + DESCRIBE for each table coord and return
+    {coord_name_lower: [ {db_column_name, name, db_column_properties:{data_type}} ]}, i.e. TML-shaped
+    column lists built from the ACTUAL warehouse. coords: list of {"name","database","schema","table"};
+    the result is keyed by coord['name'], so pass a UNIQUE name (e.g. the db.schema.table FQN) to avoid
+    collisions across schemas. Tables that can't be read are simply omitted. Never raises."""
+    from services.databricks_direct import hive_column_cases, hive_column_types
+    if not (host and warehouse_id and token and coords):
+        return {}
+    try:
+        cases = hive_column_cases(host, warehouse_id, token, coords, proxy)
+    except Exception:
+        cases = {}
+    try:
+        types = hive_column_types(host, warehouse_id, token, coords, proxy)
+    except Exception:
+        types = {}
+    out = {}
+    for _nml, _wcols in cases.items():
+        _wtypes = types.get(_nml, {})
+        out[_nml] = [{"db_column_name": _actual, "name": _actual,
+                      "db_column_properties": {"data_type": _wtypes.get(_cl, "")}}
+                     for _cl, _actual in _wcols.items()]
+    return out
+
+
+def _override_doc_columns(doc, cols):
+    """Shallow-copy a table doc with its table.columns replaced by `cols` (the warehouse read),
+    leaving name / db / schema / db_table / obj_id untouched so physical_coords is unaffected."""
+    _t = dict(doc.get("table") or {})
+    _t["columns"] = cols
+    return {**doc, "table": _t}
+
+
 def _name_slug(name: str) -> str:
     """A stable obj_id slug derived from an object's name (used to pre-fill obj_id suggestions
     for objects that have none). Non-alphanumerics become underscores, repeats collapse."""
@@ -1627,7 +1661,11 @@ elif step == 1:
         st.caption("Finds each source table's counterpart on the target by **column structure + "
                    "physical coordinates** (not just name), with a confidence score and column "
                    "drift. Use it to align tables the name-based step above can't match (e.g. a "
-                   "table renamed on the target). Re-run after changing the selection or obj_ids.")
+                   "table renamed on the target). With Databricks creds set it reads the **actual "
+                   "warehouse**: real columns for the modeled tables, plus warehouse tables that "
+                   "aren't modeled yet as candidates (reading many tables can take a minute or two); "
+                   "without creds it falls back to the modeled tables only. Re-run after changing "
+                   "the selection or obj_ids.")
 
         def _derive_oid(coords):
             base = (str(coords.get("schema", "")) + "_" + str(coords.get("db_table", ""))).lower()
@@ -1635,7 +1673,23 @@ elif step == 1:
 
         if st.button("Run table matcher"):
             from services.table_matcher import match_tables
-            with st.spinner("Exporting source + target tables and matching…"):
+            from services.databricks_direct import list_tables
+            cfg       = teams[team_name]
+            _proxy    = opt_env("TS_PROXY")
+            _dbm, _scm = cfg.get("db_map", {}), cfg.get("schema_map", {})
+            _tgt_conn = cfg.get("target_connection", "")
+            _t_host = opt_env("TS_TARGET_DBX_HOST"); _t_wh = opt_env("TS_TARGET_DBX_WAREHOUSE")
+            _t_tok  = opt_env("TS_TARGET_DBX_TOKEN")
+            _s_host = opt_env("TS_SOURCE_DBX_HOST") or _t_host
+            _s_wh   = opt_env("TS_SOURCE_DBX_WAREHOUSE") or _t_wh
+            _s_tok  = opt_env("TS_SOURCE_DBX_TOKEN") or _t_tok
+
+            def _fqn(db, sch, tbl):
+                return ".".join([(db or ""), (sch or ""), (tbl or "")]).lower()
+
+            with st.spinner("Exporting source, reading the warehouse, and matching…"):
+                # 1) Source docs (+ GUIDs). Enrich each table's columns from the SOURCE warehouse when
+                #    source DBX creds are set, so matching compares the REAL structure, not the TML.
                 raw_s   = source_client().export_tml(selected_ids)
                 s_items = raw_s if isinstance(raw_s, list) else raw_s.get("object", [])
                 src_docs, src_g = [], {}
@@ -1644,26 +1698,80 @@ elif step == 1:
                     if "table" in d and d["table"].get("name"):
                         src_docs.append(d)
                         src_g[d["table"]["name"]] = (it.get("info") or {}).get("id")
+                if _s_host and _s_wh and _s_tok and src_docs:
+                    _scoords = []
+                    for d in src_docs:
+                        t = d.get("table") or {}
+                        if t.get("db_table"):
+                            _scoords.append({"name": _fqn(t.get("db"), t.get("schema"), t.get("db_table")),
+                                             "database": t.get("db", ""), "schema": t.get("schema", ""),
+                                             "table": t.get("db_table", "")})
+                    _swh = _warehouse_columns(_scoords, _s_host, _s_wh, _s_tok, _proxy)
+                    _new_src = []
+                    for d in src_docs:
+                        t = d.get("table") or {}
+                        _k = _fqn(t.get("db"), t.get("schema"), t.get("db_table"))
+                        _new_src.append(_override_doc_columns(d, _swh[_k]) if _k in _swh else d)
+                    src_docs = _new_src
 
+                # 2) Target: the MODELED logical tables stay candidates (their GUIDs drive obj_id
+                #    alignment and the no-duplicate behaviour). Export gives each one's db_table so a
+                #    warehouse table can be linked back to it.
                 metas     = target_client().list_metadata("LOGICAL_TABLE")
                 truncated = len(metas) > 500
                 metas     = metas[:500]
                 tgt_g     = {m["name"]: m["id"] for m in metas if m.get("name")}
-                tgt_docs  = []
+                modeled   = []
                 if metas:
                     raw_t   = target_client().export_tml([m["id"] for m in metas])
                     t_items = raw_t if isinstance(raw_t, list) else raw_t.get("object", [])
                     for it in t_items:
                         td = _parse_edoc(it.get("edoc", "{}"))
-                        if "table" in td:
-                            tgt_docs.append(td)
+                        if "table" in td and td["table"].get("name"):
+                            modeled.append(td)
 
-                cfg = teams[team_name]
+                # 3) TARGET WAREHOUSE (gated on target DBX creds): enumerate the tables in the schema(s)
+                #    this promotion targets, read their real columns, enrich the matching modeled
+                #    candidate, and add any warehouse table that ISN'T modeled as a fresh candidate
+                #    (GUID-less → import creates it, bound via table_remap). No creds → today's path.
+                tgt_docs = list(modeled)
+                if _t_host and _t_wh and _t_tok:
+                    _pairs = sorted({(_dbm.get(t.get("db", ""), t.get("db", "")),
+                                      _scm.get(t.get("schema", ""), t.get("schema", "")))
+                                     for t in (d.get("table") or {} for d in src_docs)
+                                     if t.get("db") and t.get("schema")})
+                    _wtables = []                       # (cat, sch, table_name) present in the warehouse
+                    for _cat, _sch in _pairs:
+                        try:
+                            for _tn in list_tables(_t_host, _t_wh, _t_tok, _cat, _sch, _proxy):
+                                _wtables.append((_cat, _sch, _tn))
+                        except Exception:
+                            pass
+                    if len(_wtables) > 500:
+                        truncated = True
+                    _wtables = _wtables[:500]
+                    _wcoords = [{"name": _fqn(c, s, n), "database": c, "schema": s, "table": n}
+                                for c, s, n in _wtables]
+                    _wcols   = _warehouse_columns(_wcoords, _t_host, _t_wh, _t_tok, _proxy)
+                    _modeled_fqns, _new_tgt = set(), []
+                    for d in modeled:
+                        t = d.get("table") or {}
+                        _k = _fqn(t.get("db"), t.get("schema"), t.get("db_table"))
+                        _modeled_fqns.add(_k)
+                        _new_tgt.append(_override_doc_columns(d, _wcols[_k]) if _k in _wcols else d)
+                    for c, s, n in _wtables:
+                        _k = _fqn(c, s, n)
+                        if _k in _modeled_fqns or _k not in _wcols:
+                            continue                    # already a modeled candidate, or unreadable
+                        _new_tgt.append({"table": {"name": n, "db": c, "schema": s, "db_table": n,
+                                                   "connection": {"name": _tgt_conn}, "columns": _wcols[_k]}})
+                    tgt_docs = _new_tgt
+
                 st.session_state.match_results    = match_tables(
                     src_docs, tgt_docs,
-                    db_map=cfg.get("db_map", {}), schema_map=cfg.get("schema_map", {}),
+                    db_map=_dbm, schema_map=_scm,
                     source_connection=cfg.get("source_connection", ""),
-                    target_connection=cfg.get("target_connection", ""))
+                    target_connection=_tgt_conn)
                 st.session_state.src_name_to_guid = src_g
                 st.session_state.tgt_name_to_guid = tgt_g
                 st.session_state.tgt_truncated    = truncated
