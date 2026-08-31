@@ -1680,6 +1680,10 @@ elif step == 1:
             _tgt_conn = cfg.get("target_connection", "")
             _t_host = opt_env("TS_TARGET_DBX_HOST"); _t_wh = opt_env("TS_TARGET_DBX_WAREHOUSE")
             _t_tok  = opt_env("TS_TARGET_DBX_TOKEN")
+            # Source == target for now (Anuj): the source read uses the TARGET Databricks creds unless
+            # a separate TS_SOURCE_DBX_* is set. Leave those unset and both reads hit the same
+            # warehouse; set them later to split source/target with no code change. Same pattern as
+            # the Source Audit reads.
             _s_host = opt_env("TS_SOURCE_DBX_HOST") or _t_host
             _s_wh   = opt_env("TS_SOURCE_DBX_WAREHOUSE") or _t_wh
             _s_tok  = opt_env("TS_SOURCE_DBX_TOKEN") or _t_tok
