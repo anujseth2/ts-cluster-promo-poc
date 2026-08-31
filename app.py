@@ -1963,16 +1963,36 @@ elif step == 2:
                     _ss.write(f"columns/casing: {len(_sm)} table(s)")
                     _stm = _read_source_type_map()    # types (DESCRIBE)
                     _ss.write(f"types: {len(_stm)} table(s)")
+                    # Stay expanded when the read came back empty, so the "0 table(s)" outcome is
+                    # visible instead of silently collapsing to nothing.
                     _ss.update(label=f"Source warehouse read — {len(_sm)} table(s).",
-                               state=("complete" if _sm else "error"), expanded=False)
+                               state=("complete" if _sm else "error"), expanded=not bool(_sm))
                 st.session_state._source_col_map  = _sm
                 st.session_state._source_type_map = _stm
                 st.rerun()
 
+        _src_ran = "_source_col_map" in st.session_state    # a read has happened this session
         _src_map = st.session_state.get("_source_col_map") or {}
         if not _src_map:
-            st.caption("The source read hasn't run yet — click **Read source warehouse** to surface "
-                       "columns the source no longer has, type drift, and casing that needs recasing.")
+            if not _src_ran:
+                st.caption("The source read hasn't run yet — click **Read source warehouse** to surface "
+                           "columns the source no longer has, type drift, and casing that needs recasing.")
+            else:
+                # Ran, but came back empty — say WHY instead of reverting to "hasn't run yet".
+                _has_dbx = bool((opt_env("TS_SOURCE_DBX_HOST") or opt_env("TS_TARGET_DBX_HOST"))
+                                and (opt_env("TS_SOURCE_DBX_WAREHOUSE") or opt_env("TS_TARGET_DBX_WAREHOUSE"))
+                                and (opt_env("TS_SOURCE_DBX_TOKEN") or opt_env("TS_TARGET_DBX_TOKEN")))
+                if not _has_dbx:
+                    st.error("The source read came back with **0 tables** — no direct Databricks creds are "
+                             "set, so it fell back to the connection's column read, which times out on "
+                             "hive_metastore. Add `TS_TARGET_DBX_HOST`, `TS_TARGET_DBX_WAREHOUSE`, and "
+                             "`TS_TARGET_DBX_TOKEN` to `.env` (the same creds the rest of the audit uses), "
+                             "then read again.")
+                else:
+                    st.error("The source read came back with **0 tables** even though Databricks creds are "
+                             "set. The SQL warehouse may be cold or stopped (retry), or the promoted "
+                             "tables' db / schema / db_table don't resolve in that warehouse. Retry; if it "
+                             "persists, confirm the warehouse is running and the table coordinates match.")
         else:
             # (A) columns absent from the SOURCE warehouse → approve-drop (out-of-sync TML) ──
             _src_missing = warehouse_missing_findings(
