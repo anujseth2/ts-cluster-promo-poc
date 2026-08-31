@@ -1785,9 +1785,10 @@ elif step == 1:
 elif step == 2:
     st.subheader("Source Audit")
     st.caption("Audit the promotion against the **source** warehouse first — drop columns the source "
-               "no longer has, drop columns whose type drifted from the source, recase to the source's "
-               "casing — so the TML is source-faithful before it's validated against the target on the "
-               "next step. (Type *realignment* needs the target check, so it lives on TML Validation.)")
+               "no longer has, realign or drop columns whose type drifted from the source, recase to "
+               "the source's casing — so the TML is source-faithful before it's validated against the "
+               "target on the next step. (The target check on TML Validation confirms a realigned "
+               "type actually binds.)")
 
     # Build the promotion bundle on entry — the TML has to exist before we can audit it against
     # the source. Idempotent (guarded by _need_export inside), and shared with TML Validation, so
@@ -1838,8 +1839,8 @@ elif step == 2:
                            "you approve and apply. Casing is handled by the recasing panel below.")
             else:
                 st.caption("Read the **source** warehouse to check the promoted TML against it: "
-                           "columns the source no longer has, and type drift. Everything is flagged "
-                           "for approval — nothing is dropped automatically.")
+                           "columns the source no longer has, type drift, and casing. Everything is "
+                           "flagged for approval — nothing changes automatically.")
         with _sb:
             if st.button("🔌 Read source warehouse", disabled=not transformed_items,
                          help="Reads the source warehouse (source DBX creds, falling back to target "
