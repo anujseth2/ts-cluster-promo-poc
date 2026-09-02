@@ -2152,36 +2152,29 @@ elif step == 3:
 
 
         def _run_validation(items, step=None):
-            """Commit items to dev, create/update PR, validate models from dev. Returns (pr_url, errors, ok).
+            """VALIDATE-ONLY against the target — NO Git commit and NO PR (those moved to the Git
+            Operations step). Returns (None, errors, ok) so callers keep the same 3-tuple shape.
             step: optional callable(str) to report progress to the UI."""
             _tick = step or (lambda _m: None)
             # Any re-export invalidates a partial import in progress — reset the import phase.
             for _k in ("import_phase", "import_core_results", "import_leaf_files", "import_leaf_errors"):
                 st.session_state.pop(_k, None)
-            _tick("① Writing TML files to the dev branch…")
             files  = items_to_files(items)
-            gc     = git_client()
-            sha    = gc.commit_tml(team_name, files)
-            _tick("② Opening / updating the pull request…")
-            pr_url = gc.create_pr(team_name, sha)
-
-            # Validate ONLY this run's files (what we just committed), not the whole team
-            # folder — the repo accumulates TML across promotions, and reading the folder
-            # would re-validate/re-import unrelated tables from earlier runs. Tables first:
-            # table validation surfaces a missing column (err 14536) / drop-blocked deps;
-            # models catch the rest.
+            # Validate ONLY this run's files (not the whole team folder — the repo accumulates TML
+            # across promotions). Tables first (a missing column / drop-blocked dep surfaces as 14536),
+            # then models. Validation runs on the TML strings directly, so no commit is needed.
             val_strings = ([c for p, c in files.items() if p.startswith("tables/")]
                            + [c for p, c in files.items() if p.startswith("models/")])
             if not val_strings:
-                return pr_url, [], []
-            _tick(f"③ Validating {len(val_strings)} table/model file(s) against the target…")
+                return None, [], []
+            _tick(f"Validating {len(val_strings)} table/model file(s) against the target…")
             results = target_client().import_tml(val_strings, policy="VALIDATE_ONLY")
             # Record the raw run so consecutive validates are diffable (why did the finding set
             # change?) — persisted to logs/validate_runs.jsonl and kept for the inline expander.
             st.session_state._last_validate = _log_validate(files, results)
             ok  = [r for r in results if r["status"] == "OK"]
             err = [r for r in results if r["status"] != "OK"]
-            return pr_url, err, ok
+            return None, err, ok
 
         def _discover_all_issues(items, progress=None):
             """Probe: VALIDATE_ONLY a throwaway COPY, neutralize each pass's issues (drop the
@@ -2588,33 +2581,22 @@ elif step == 3:
 
         st.divider()
 
-        # ── Stage 1: Export → commit/PR → discover ALL issues in one action ─────
-        # No separate single-validate step: the primary button commits the TML + opens the PR,
-        # then loops VALIDATE_ONLY (on a throwaway copy) until clean, surfacing every issue at
-        # once. It never touches the connection/search COLUMN path that 504s.
+        # ── Stage 1: dry-run validate + discover ALL issues (no Git, no import) ─────
+        # Validate-only: loops VALIDATE_ONLY (on a throwaway copy) against the target until it stops
+        # finding new issues, surfacing every one at once. It does NOT commit or open a PR — the
+        # commit, PR, merge and import all live on Git Operations (Step 3). Never touches the
+        # connection/search COLUMN path that 504s.
         _dm = st.session_state.get("discovered_meta")
-        st.caption("One dry-run validation: it writes the TML to the dev branch, opens the PR, and "
-                   "checks it against the target **without importing**, surfacing every issue in one "
-                   "pass. Fix what it flags and re-validate here; the actual merge and import happen "
-                   "in Step 3.")
+        st.caption("Dry-run validation only: it checks the TML against the target **without importing "
+                   "and without touching Git**, surfacing every issue in one pass. Fix what it flags "
+                   "and re-validate here; the commit, PR, merge and import all happen on Git Operations.")
         _lbl = "🔎 Re-validate against target" if _dm else "🔎 Validate against target"
         if st.button(_lbl, type="primary", disabled=not filtered_items,
-                     help="Commits the TML + opens the PR, then dry-run validates against the target "
-                          "repeatedly until it stops finding new issues. Nothing is imported."):
-            with st.status("Committing & validating against the target…", expanded=True) as _disc:
-                try:
-                    st.write("Committing TML + opening the PR…")
-                    _gc = git_client()
-                    _sha = _gc.commit_tml(team_name, items_to_files(filtered_items))
-                    st.session_state.pr_url = _gc.create_pr(team_name, _sha)
-                except Exception as _e:
-                    _disc.update(label=f"Couldn't open the PR: {str(_e)[:150]}",
-                                 state="error", expanded=False)
-                    st.stop()
+                     help="Dry-run validates against the target repeatedly until it stops finding new "
+                          "issues. Nothing is committed, pushed, or imported."):
+            with st.status("Validating against the target…", expanded=True) as _disc:
                 _run_discover(filtered_items, _disc)
             st.rerun()
-        if "pr_url" in st.session_state:
-            st.markdown(f"**PR:** [{st.session_state.pr_url}]({st.session_state.pr_url})")
         if _dm:
             _rtail = {"clean": " · validated clean",
                       "no_progress": " · stopped before clean (remaining errors can't be auto-resolved)",
@@ -2863,12 +2845,11 @@ elif step == 3:
                         _sel.clear()   # selection consumed; the columns are gone from wh_missing now
                     filtered_fixed = [i for i in st.session_state.transformed_items
                                       if i.get("info", {}).get("name") not in skip_objects]
-                    with st.status("Re-committing & re-validating…", expanded=True) as _rv:
+                    with st.status("Re-validating…", expanded=True) as _rv:
                         _res = _safe_validate(filtered_fixed, step=lambda _m: _rv.write(_m))
                         _rv.update(state=("complete" if _res else "error"), expanded=False)
                         if _res:
-                            pr_url, err, ok = _res
-                            st.session_state.pr_url            = pr_url
+                            _, err, ok = _res
                             st.session_state.validation_errors = err
                             st.session_state.validation_ok     = ok
                             st.session_state.pop("silent_drops", None)
@@ -3138,12 +3119,11 @@ elif step == 3:
                     _tmsel.clear(); _tmrsel.clear()
                     filtered_fixed = [i for i in st.session_state.transformed_items
                                       if i.get("info", {}).get("name") not in skip_objects]
-                    with st.status("Re-committing & re-validating…", expanded=True) as _rv:
+                    with st.status("Re-validating…", expanded=True) as _rv:
                         _res = _safe_validate(filtered_fixed, step=lambda _m: _rv.write(_m))
                         _rv.update(state=("complete" if _res else "error"), expanded=False)
                         if _res:
-                            pr_url, err, ok = _res
-                            st.session_state.pr_url            = pr_url
+                            _, err, ok = _res
                             st.session_state.validation_errors = err
                             st.session_state.validation_ok     = ok
                             st.session_state.pop("silent_drops", None)
@@ -3171,12 +3151,11 @@ elif step == 3:
                         st.session_state.setdefault("dropped_col_names", set()).update(fml_drop)
                     filtered_fixed = [i for i in st.session_state.transformed_items
                                       if i.get("info", {}).get("name") not in skip_objects]
-                    with st.status("Re-committing & re-validating…", expanded=True) as _rv:
+                    with st.status("Re-validating…", expanded=True) as _rv:
                         _res = _safe_validate(filtered_fixed, step=lambda _m: _rv.write(_m))
                         _rv.update(state=("complete" if _res else "error"), expanded=False)
                         if _res:
-                            pr_url, err, ok = _res
-                            st.session_state.pr_url            = pr_url
+                            _, err, ok = _res
                             st.session_state.validation_errors = err
                             st.session_state.validation_ok     = ok
                             st.session_state.pop("silent_drops", None)
@@ -3348,12 +3327,11 @@ elif step == 3:
                         st.session_state.pop("discovered_meta", None)
                         _ff = [i for i in st.session_state.transformed_items
                                if i.get("info", {}).get("name") not in st.session_state["skip_objects"]]
-                        with st.status("Re-committing & re-validating…", expanded=True) as _rv:
+                        with st.status("Re-validating…", expanded=True) as _rv:
                             _res = _safe_validate(_ff, step=lambda _m: _rv.write(_m))
                             _rv.update(state=("complete" if _res else "error"), expanded=False)
                             if _res:
-                                pr_url, err, ok = _res
-                                st.session_state.pr_url            = pr_url
+                                _, err, ok = _res
                                 st.session_state.validation_errors = err
                                 st.session_state.validation_ok     = ok
                                 st.session_state.pop("silent_drops", None)
@@ -3403,12 +3381,11 @@ elif step == 3:
                         st.session_state.setdefault("prune_tables", set()).update(_tbl_now)
                     filtered_fixed = [i for i in st.session_state.transformed_items
                                       if i.get("info", {}).get("name") not in skip_objects]
-                    with st.status("Re-committing & re-validating…", expanded=True) as _rv:
+                    with st.status("Re-validating…", expanded=True) as _rv:
                         _res = _safe_validate(filtered_fixed, step=lambda _m: _rv.write(_m))
                         _rv.update(state=("complete" if _res else "error"), expanded=False)
                         if _res:
-                            pr_url, err, ok = _res
-                            st.session_state.pr_url            = pr_url
+                            _, err, ok = _res
                             st.session_state.validation_errors = err
                             st.session_state.validation_ok     = ok
                             st.session_state.pop("silent_drops", None)
@@ -3446,8 +3423,8 @@ elif step == 3:
                 msg += f" {leaves} liveboard/answer(s) will import after."
             st.success(msg)
 
-    _nav(3, can_next="pr_url" in st.session_state,
-          next_hint="Validate & stage the PR to continue")
+    _nav(3, can_next="discovered_meta" in st.session_state,
+          next_hint="Validate against the target to continue")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3458,11 +3435,27 @@ elif step == 4:
     skip_objects   = st.session_state.get("skip_objects", set())
     filtered_items = [i for i in (transformed_items or [])
                       if i.get("info", {}).get("name") not in skip_objects]
-    if "pr_url" not in st.session_state or not transformed_items:
-        st.info("Finish Step 2b (TML Validation) first — validate and stage the PR, "
-                "then return here to merge & promote.")
+    if not transformed_items:
+        st.info("Finish TML Validation first — validate the promotion there, then return here to "
+                "commit, open the PR, and merge & promote.")
     else:
         st.subheader("Git Operations")
+        # The commit + PR live HERE (moved off the validation step, which is now a pure dry-run that
+        # touches no Git). Commit only when the bundle CHANGED since the last commit — keyed on a
+        # content signature — so a rerun doesn't re-commit, but going back to fix a column and
+        # returning updates the PR instead of merging a stale one. create_pr reuses the open PR.
+        import hashlib
+        _pr_sig = hashlib.md5("\n".join(sorted(it.get("edoc", "") for it in filtered_items)).encode()).hexdigest()
+        if "pr_url" not in st.session_state or st.session_state.get("_pr_bundle_sig") != _pr_sig:
+            with st.spinner("Committing the validated TML to the dev branch and opening the PR…"):
+                try:
+                    _gc  = git_client()
+                    _sha = _gc.commit_tml(team_name, items_to_files(filtered_items))
+                    st.session_state.pr_url = _gc.create_pr(team_name, _sha)
+                    st.session_state._pr_bundle_sig = _pr_sig
+                except Exception as _e:
+                    st.error(f"Couldn't commit / open the PR: {str(_e)[:200]}")
+                    st.stop()
         st.markdown(f"**PR:** [{st.session_state.pr_url}]({st.session_state.pr_url})")
         validation_passed = "pr_url" in st.session_state
         if validation_passed:
