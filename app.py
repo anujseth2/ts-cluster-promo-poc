@@ -2111,8 +2111,15 @@ elif step == 3:
             # Left-align the collapsible table headers (Streamlit centres button labels by default).
             # Scoped to the skexp_ header buttons via their per-key class, so other buttons are untouched.
             st.markdown(
-                "<style>[class*='st-key-skexp_'] button{justify-content:flex-start!important;}"
-                "[class*='st-key-skexp_'] button p{text-align:left!important;margin:0;}</style>",
+                "<style>"
+                "[class*='st-key-skexp_'] button{justify-content:flex-start!important;"
+                "text-align:left!important;}"
+                # the markdown container is the flex child and spans the full width, so it has to be
+                # left-aligned too or the label stays centred no matter what the button does
+                "[class*='st-key-skexp_'] button [data-testid='stMarkdownContainer']"
+                "{width:100%!important;text-align:left!important;}"
+                "[class*='st-key-skexp_'] button p{text-align:left!important;margin:0!important;}"
+                "</style>",
                 unsafe_allow_html=True)
             _skip_sel = st.session_state.setdefault("skip_selected", set())
             _skexp = st.session_state.setdefault("skip_expanded", set())   # expanded table names
@@ -3445,7 +3452,12 @@ elif step == 3:
                     mdls += 1
                 elif "liveboard" in d or "answer" in d:
                     leaves += 1
-            dropped_count = st.session_state.get("dropped_cols_count", 0)
+            # Count the DISTINCT columns you chose to drop, not the running removal tally.
+            # dropped_cols_count sums every removal manifest, so it (a) counts the cascade — the
+            # dependent model columns and formulas a drop takes with it — and (b) re-counts the same
+            # drops each time a re-export re-applies the durable skip set. That's how 9 dropped
+            # columns reported as 40. The cascade is still shown in Import Results.
+            dropped_count = len(st.session_state.get("dropped_col_names", set()) or set())
             dropped_vizs  = st.session_state.get("dropped_vizs_count", 0)
             msg = f"Validation passed — {tbls} table(s) + {mdls} model(s) OK."
             if dropped_count:
@@ -3941,7 +3953,15 @@ elif step == 5:
                     if casc:
                         st.caption("cascade removed: " + casc)
                 if dropped_cols:
-                    st.markdown("**Columns dropped:** " + ", ".join(f"`{c}`" for c in dropped_cols))
+                    # Tabular, not a run-on list: these are scoped `table::col`, so split them so you
+                    # can actually scan which table each dropped column came from.
+                    st.markdown(f"**Columns dropped ({len(dropped_cols)})**")
+                    _dc_rows = []
+                    for _c in dropped_cols:
+                        _t, _cn = _c.split("::", 1) if "::" in _c else ("(unscoped)", _c)
+                        _dc_rows.append({"Table": _t, "Column": _cn})
+                    st.dataframe(_sno(pd.DataFrame(_dc_rows, columns=["Table", "Column"])),
+                                 use_container_width=True, hide_index=True)
                 if dropped_vizs:
                     st.markdown(f"**Visualizations dropped:** {dropped_vizs}")
 
