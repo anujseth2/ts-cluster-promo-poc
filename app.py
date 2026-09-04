@@ -947,6 +947,7 @@ if step == 0:
                         "_promo_id2name", "_promo_present", "obj_id_status",
                         "table_alignment", "transformed_items", "import_results", "recon_report",
                         "pre_import_index", "dropped_col_names", "dropped_cols_count",
+                        "_landed_col_map",
                         "dropped_vizs_count", "prune_summary",
                         "_fb_previews", "feedback_mode", "ack_replace", "fb_replace_report",
                         "_include_feedback", "_export_fb_state",
@@ -3978,6 +3979,102 @@ elif step == 5:
                 _rc = pd.DataFrame([{"Table": r["table"], "From": r["from"], "To": r["to"]}
                                     for r in _recases])
                 st.dataframe(_sno(_rc), use_container_width=True, hide_index=True)
+
+        # ── Column-level detail: source TML → promoted → target (CDW + TML) ──────────────
+        # The working-session ask: per column, two target flags (is it in the target CDW, is it in
+        # the target TML), with the source TML checked against the source CDW FIRST so a stale source
+        # column reads as stale rather than as a failed promotion. Plus the journey Anuj asked for:
+        # what the source had, what the promotion carried, what actually landed on the target.
+        st.markdown("#### Column detail — source → promoted → target")
+        st.caption("For every column the source TML started with: was it still in the **source "
+                   "warehouse** (if not, it was stale, not a promotion failure), did the promotion "
+                   "**carry** it, and did it land in the **target warehouse** and the **target "
+                   "model**. `—` means that side was never read, so nothing is asserted.")
+        if st.button("Load column detail (reads the target's modeled columns)", key="coljourney_load"):
+            _pi = st.session_state.get("transformed_items") or []
+            _nms = sorted({(_parse_edoc(i.get("edoc", "{}")).get("table") or {}).get("name")
+                           for i in _pi
+                           if (_parse_edoc(i.get("edoc", "{}")).get("table") or {}).get("name")})
+            with st.spinner("Reading the target's modeled columns…"):
+                try:
+                    st.session_state._landed_col_map = target_client().table_column_cases(_nms)
+                except Exception as _e:
+                    st.session_state._landed_col_map = {}
+                    st.warning("Couldn't read the target's modeled columns: " + str(_e)[:200])
+            st.rerun()
+
+        if "_landed_col_map" in st.session_state:
+            _src_items = st.session_state.get("_source_raw_items") or []
+            _src_cdw   = st.session_state.get("_source_col_map") or {}
+            _tgt_cdw   = st.session_state.get("_warehouse_col_map") or {}
+            _landed    = st.session_state.get("_landed_col_map") or {}
+            _dropped_n = {str(d).strip().lower() for d in
+                          (st.session_state.get("dropped_col_names") or set())}
+            _recased_n = {str(r).strip().lower() for r in
+                          (st.session_state.get("_recase_applied_set") or set())}
+            _realign_n = {str(k).strip().lower(): v for k, v in
+                          (st.session_state.get("realign_types") or {}).items()}
+            # what the promotion actually carried, per table
+            _promo_cols = {}
+            for _it in (st.session_state.get("transformed_items") or []):
+                _t = _parse_edoc(_it.get("edoc", "{}")).get("table") or {}
+                if _t.get("name"):
+                    _promo_cols[_t["name"].strip().lower()] = {
+                        (_c.get("db_column_name") or _c.get("name") or "").strip().lower()
+                        for _c in (_t.get("columns") or [])}
+
+            def _flag(_map, _tl, _cl):
+                """✓/✗ against a read map; — when that table was never read (assert nothing)."""
+                if _tl not in _map:
+                    return "—"
+                return "✓" if _cl in (_map.get(_tl) or {}) else "✗"
+
+            _cj_rows = []
+            for _it in _src_items:
+                _t = _parse_edoc(_it.get("edoc", "{}")).get("table") or {}
+                _nm = (_t.get("name") or "").strip()
+                if not _nm:
+                    continue
+                _tl = _nm.lower()
+                for _c in (_t.get("columns") or []):
+                    _dbn = (_c.get("db_column_name") or _c.get("name") or "").strip()
+                    if not _dbn:
+                        continue
+                    _cl, _scoped = _dbn.lower(), f"{_tl}::{_dbn.lower()}"
+                    _notes = []
+                    if _scoped in _dropped_n or _cl in _dropped_n:
+                        _notes.append("dropped")
+                    if _scoped in _recased_n:
+                        _notes.append("recased")
+                    if _scoped in _realign_n:
+                        _notes.append(f"realigned→{_realign_n[_scoped]}")
+                    _cj_rows.append({
+                        "Table":        _nm,
+                        "Column":       _dbn,
+                        "Source TML":   "✓",
+                        "Source CDW":   _flag(_src_cdw, _tl, _cl),
+                        "Promoted":     "✓" if _cl in _promo_cols.get(_tl, set()) else "✗",
+                        "Target CDW":   _flag(_tgt_cdw, _tl, _cl),
+                        "Target TML":   _flag(_landed, _tl, _cl),
+                        "Note":         ", ".join(_notes),
+                    })
+            if not _cj_rows:
+                st.caption("No source columns to report (the raw source export isn't in this session).")
+            else:
+                _cjdf = pd.DataFrame(_cj_rows, columns=["Table", "Column", "Source TML", "Source CDW",
+                                                        "Promoted", "Target CDW", "Target TML", "Note"])
+                _cjq = st.text_input("Filter column detail", key="coljourney_filter",
+                                     label_visibility="collapsed",
+                                     placeholder="🔎 Filter by table or column name").strip().lower()
+                if _cjq:
+                    _cjdf = _cjdf[_cjdf.apply(lambda r: _cjq in str(r["Table"]).lower()
+                                              or _cjq in str(r["Column"]).lower(), axis=1)]
+                _n_land = sum(1 for r in _cj_rows if r["Target TML"] == "✓")
+                _n_drop = sum(1 for r in _cj_rows if r["Note"].startswith("dropped"))
+                _n_stale = sum(1 for r in _cj_rows if r["Source CDW"] == "✗")
+                st.markdown(f"**{len(_cj_rows)} source column(s)** · {_n_land} landed on target · "
+                            f"{_n_drop} dropped · {_n_stale} stale in the source warehouse")
+                st.dataframe(_sno(_cjdf), use_container_width=True, hide_index=True)
 
         # Feedback Replace report (only when Replace mode rebuilt a model).
         fb_rep = st.session_state.get("fb_replace_report")
