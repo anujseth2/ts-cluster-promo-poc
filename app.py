@@ -325,6 +325,11 @@ def _record_drop(man):
     st.session_state.dropped_cols_count = st.session_state.get("dropped_cols_count", 0) + man.get("columns", 0)
     st.session_state.dropped_vizs_count = st.session_state.get("dropped_vizs_count", 0) + man.get("vizzes", 0)
     st.session_state.dropped_joins_count = st.session_state.get("dropped_joins_count", 0) + man.get("joins", 0)
+    # Every name the drop actually removed — the physical table columns AND the model columns /
+    # formulas that came out with them. A set, because a re-export re-applies the durable skip set
+    # and would otherwise pile up duplicates. Drives the cascade rows in the column-detail table.
+    if man.get("column_names"):
+        st.session_state.setdefault("dropped_cascade_names", set()).update(man["column_names"])
     if man.get("formulas"):
         st.session_state.setdefault("dropped_formula_names", []).extend(man["formulas"])
 
@@ -947,7 +952,7 @@ if step == 0:
                         "_promo_id2name", "_promo_present", "obj_id_status",
                         "table_alignment", "transformed_items", "import_results", "recon_report",
                         "pre_import_index", "dropped_col_names", "dropped_cols_count",
-                        "_landed_col_map",
+                        "_landed_col_map", "dropped_cascade_names",
                         "dropped_vizs_count", "prune_summary",
                         "_fb_previews", "feedback_mode", "ack_replace", "fb_replace_report",
                         "_include_feedback", "_export_fb_state",
@@ -4058,6 +4063,41 @@ elif step == 5:
                         "Target TML":   _flag(_landed, _tl, _cl),
                         "Note":         ", ".join(_notes),
                     })
+            # Cascade rows: the MODEL columns and formulas removed because a source column they
+            # depended on was dropped. They aren't columns of any source TABLE, so without this they'd
+            # be invisible here — yet they're most of what a drop actually removes (your 9 ticked
+            # columns took 11 of these with them).
+            _casc = {str(n).strip() for n in (st.session_state.get("dropped_cascade_names") or set())}
+            _phys_ids = set()
+            # Only the QUALIFIED `table.column` forms count as "already listed above". drop_columns
+            # records physical table columns dotted and model/formula columns bare, so matching bare
+            # names here would swallow the very cascade rows we want (a model column often shares its
+            # display name with the table column it came from).
+            for _it in _src_items:
+                _t = _parse_edoc(_it.get("edoc", "{}")).get("table") or {}
+                _tn = (_t.get("name") or "").strip()
+                for _c in (_t.get("columns") or []):
+                    for _d in {(_c.get("db_column_name") or "").strip(),
+                               (_c.get("name") or "").strip()}:
+                        if _d:
+                            _phys_ids.add(f"{_tn}.{_d}".lower())
+            _model_nm = "(model)"
+            for _it in (st.session_state.get("transformed_items") or []):
+                _d = _parse_edoc(_it.get("edoc", "{}"))
+                _m = _d.get("model") or _d.get("worksheet")
+                if _m and _m.get("name"):
+                    _model_nm = _m["name"]
+                    break
+            for _n in sorted(_casc):
+                if _n.lower() in _phys_ids:
+                    continue                      # a physical table column — already a row above
+                _cj_rows.append({
+                    "Table": _model_nm, "Column": _n,
+                    "Source TML": "✓", "Source CDW": "n/a", "Promoted": "✗",
+                    "Target CDW": "n/a", "Target TML": "✗",
+                    "Note": "removed — depended on a dropped column",
+                })
+
             if not _cj_rows:
                 st.caption("No source columns to report (the raw source export isn't in this session).")
             else:
@@ -4069,11 +4109,13 @@ elif step == 5:
                 if _cjq:
                     _cjdf = _cjdf[_cjdf.apply(lambda r: _cjq in str(r["Table"]).lower()
                                               or _cjq in str(r["Column"]).lower(), axis=1)]
-                _n_land = sum(1 for r in _cj_rows if r["Target TML"] == "✓")
-                _n_drop = sum(1 for r in _cj_rows if r["Note"].startswith("dropped"))
+                _n_land  = sum(1 for r in _cj_rows if r["Target TML"] == "✓")
+                _n_drop  = sum(1 for r in _cj_rows if r["Note"].startswith("dropped"))
+                _n_casc  = sum(1 for r in _cj_rows if r["Note"].startswith("removed"))
                 _n_stale = sum(1 for r in _cj_rows if r["Source CDW"] == "✗")
-                st.markdown(f"**{len(_cj_rows)} source column(s)** · {_n_land} landed on target · "
-                            f"{_n_drop} dropped · {_n_stale} stale in the source warehouse")
+                st.markdown(f"**{len(_cj_rows)} row(s)** · {_n_land} landed on target · "
+                            f"{_n_drop} dropped (your choice) · {_n_casc} removed as dependents · "
+                            f"{_n_stale} stale in the source warehouse")
                 st.dataframe(_sno(_cjdf), use_container_width=True, hide_index=True)
 
         # Feedback Replace report (only when Replace mode rebuilt a model).
