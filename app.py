@@ -2114,21 +2114,7 @@ elif step == 3:
         if _tbl_cols:
             st.markdown("**Skip specific columns** — leave a column out, keep the rest (optional). "
                         "Tables start collapsed; expand one to tick its columns.")
-            # Left-align the collapsible table headers (Streamlit centres button labels by default).
-            # Scoped to the skexp_ header buttons via their per-key class, so other buttons are untouched.
-            st.markdown(
-                "<style>"
-                "[class*='st-key-skexp_'] button{justify-content:flex-start!important;"
-                "text-align:left!important;}"
-                # the markdown container is the flex child and spans the full width, so it has to be
-                # left-aligned too or the label stays centred no matter what the button does
-                "[class*='st-key-skexp_'] button [data-testid='stMarkdownContainer']"
-                "{width:100%!important;text-align:left!important;}"
-                "[class*='st-key-skexp_'] button p{text-align:left!important;margin:0!important;}"
-                "</style>",
-                unsafe_allow_html=True)
             _skip_sel = st.session_state.setdefault("skip_selected", set())
-            _skexp = st.session_state.setdefault("skip_expanded", set())   # expanded table names
             _skgen = st.session_state.get("_skip_gen", 0)                  # bump = reset all editors
             _skq = st.text_input("Filter columns to skip", key="skip_search",
                                  label_visibility="collapsed",
@@ -2143,13 +2129,13 @@ elif step == 3:
                 _any_shown = True
                 _sn = _tbl_serial.get(_tn_l)
                 _marks = sum(1 for c in _cols if f"{_tn_l}::{c.strip().lower()}" in _skip_sel)
-                _open = (_tn in _skexp) or bool(_skq)      # auto-open while filtering
-                _hdr = (f"{'▾' if _open else '▸'}  {(str(_sn) + '. ') if _sn else ''}{_tn}"
-                        f"  ·  {len(_cols)} column(s)"
+                _hdr = (f"{(str(_sn) + '. ') if _sn else ''}{_tn}  ·  {len(_cols)} column(s)"
                         + (f"  ·  {_marks} to skip" if _marks else ""))
-                if st.button(_hdr, key=f"skexp_{_tn_l}", use_container_width=True):
-                    (_skexp.discard if _tn in _skexp else _skexp.add)(_tn)
-                    st.rerun()
+                # A CHECKBOX, not a button: Streamlit centres a button's label and resists being
+                # restyled, whereas a checkbox label is left-aligned natively. Its own key also
+                # persists the expanded state across the reruns that ticking a column causes.
+                _checked = st.checkbox(_hdr, key=f"skexp_{_tn_l}")
+                _open = _checked or bool(_skq)             # a filter force-opens matching tables
                 if _open:
                     _rows = [{"Column": c, "Skip?": f"{_tn_l}::{c.strip().lower()}" in _skip_sel,
                               "_scoped": f"{_tn_l}::{c.strip().lower()}"} for c in _cols]
@@ -3464,10 +3450,18 @@ elif step == 3:
             # drops each time a re-export re-applies the durable skip set. That's how 9 dropped
             # columns reported as 40. The cascade is still shown in Import Results.
             dropped_count = len(st.session_state.get("dropped_col_names", set()) or set())
+            # Total distinct removals = the columns you chose PLUS the model columns / formulas that
+            # came out with them. Showing both makes the two numbers reconcile instead of looking
+            # like a discrepancy (the old single figure double-counted on every re-export).
+            _total_removed = len(st.session_state.get("dropped_cascade_names", set()) or set())
             dropped_vizs  = st.session_state.get("dropped_vizs_count", 0)
             msg = f"Validation passed — {tbls} table(s) + {mdls} model(s) OK."
             if dropped_count:
-                msg += f" {dropped_count} column(s) dropped."
+                msg += f" {dropped_count} column(s) dropped"
+                if _total_removed > dropped_count:
+                    msg += (f" ({_total_removed} removed in total, including dependent "
+                            "model columns/formulas)")
+                msg += "."
             if dropped_vizs:
                 msg += f" {dropped_vizs} dependent viz(s) removed from liveboard(s)."
             if leaves:
@@ -4101,22 +4095,45 @@ elif step == 5:
             if not _cj_rows:
                 st.caption("No source columns to report (the raw source export isn't in this session).")
             else:
-                _cjdf = pd.DataFrame(_cj_rows, columns=["Table", "Column", "Source TML", "Source CDW",
-                                                        "Promoted", "Target CDW", "Target TML", "Note"])
-                _cjq = st.text_input("Filter column detail", key="coljourney_filter",
-                                     label_visibility="collapsed",
-                                     placeholder="🔎 Filter by table or column name").strip().lower()
-                if _cjq:
-                    _cjdf = _cjdf[_cjdf.apply(lambda r: _cjq in str(r["Table"]).lower()
-                                              or _cjq in str(r["Column"]).lower(), axis=1)]
+                # ONE ROW PER TABLE with counts — how many columns the source TML had, how many the
+                # promotion carried, and how many landed in the target model. The per-column rows are
+                # kept underneath for drill-down rather than being the default view.
+                _per_tbl = {}
+                for _r in _cj_rows:
+                    if _r["Note"].startswith("removed"):
+                        continue          # cascade rows belong to the model, not a source table
+                    _e = _per_tbl.setdefault(_r["Table"], {"src": 0, "promo": 0, "land": 0})
+                    _e["src"] += 1
+                    _e["promo"] += 1 if _r["Promoted"] == "✓" else 0
+                    _e["land"] += 1 if _r["Target TML"] == "✓" else 0
+                _tbl_rows = [{"Table": _t,
+                              "Source TML cols": _v["src"],
+                              "Promoted cols":   _v["promo"],
+                              "Landed cols":     _v["land"],
+                              "Not promoted":    _v["src"] - _v["promo"]}
+                             for _t, _v in sorted(_per_tbl.items())]
                 _n_land  = sum(1 for r in _cj_rows if r["Target TML"] == "✓")
                 _n_drop  = sum(1 for r in _cj_rows if r["Note"].startswith("dropped"))
                 _n_casc  = sum(1 for r in _cj_rows if r["Note"].startswith("removed"))
                 _n_stale = sum(1 for r in _cj_rows if r["Source CDW"] == "✗")
-                st.markdown(f"**{len(_cj_rows)} row(s)** · {_n_land} landed on target · "
-                            f"{_n_drop} dropped (your choice) · {_n_casc} removed as dependents · "
-                            f"{_n_stale} stale in the source warehouse")
-                st.dataframe(_sno(_cjdf), use_container_width=True, hide_index=True)
+                st.markdown(f"**{len(_tbl_rows)} table(s)** · {_n_drop} column(s) dropped by choice · "
+                            f"{_n_casc} removed as dependents · {_n_stale} stale in the source "
+                            f"warehouse · {_n_land} landed on target")
+                st.dataframe(_sno(pd.DataFrame(_tbl_rows, columns=[
+                    "Table", "Source TML cols", "Promoted cols", "Landed cols", "Not promoted"])),
+                    use_container_width=True, hide_index=True)
+
+                with st.expander(f"Per-column detail ({len(_cj_rows)} row(s))", expanded=False):
+                    _cjdf = pd.DataFrame(_cj_rows, columns=["Table", "Column", "Source TML",
+                                                            "Source CDW", "Promoted", "Target CDW",
+                                                            "Target TML", "Note"])
+                    _cjq = st.text_input("Filter column detail", key="coljourney_filter",
+                                         label_visibility="collapsed",
+                                         placeholder="🔎 Filter by table or column name").strip().lower()
+                    if _cjq:
+                        _cjdf = _cjdf[_cjdf.apply(lambda r: _cjq in str(r["Table"]).lower()
+                                                  or _cjq in str(r["Column"]).lower(), axis=1)]
+                    st.dataframe(_sno(_cjdf), use_container_width=True, hide_index=True)
 
         # Feedback Replace report (only when Replace mode rebuilt a model).
         fb_rep = st.session_state.get("fb_replace_report")
