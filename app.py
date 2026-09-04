@@ -151,9 +151,35 @@ def _run_validation(items, step=None):
     return pr_url, err, ok
 
 
+def _is_github_error(exc) -> bool:
+    """True when the exception came from the GITHUB side (PyGithub / the GitHub API) rather than
+    the target cluster. Without this a bad GITHUB_TOKEN reports as 'couldn't reach the target',
+    which sends you debugging the wrong system entirely."""
+    if (type(exc).__module__ or "").split(".")[0] == "github":
+        return True
+    _m = str(exc).lower()
+    return "api.github.com" in _m or "bad credentials" in _m
+
+
+def _git_error_hint(exc) -> str:
+    """A plain-English cause for a GitHub failure, so the fix is obvious from the message."""
+    _m = str(exc).lower()
+    if "bad credentials" in _m or "401" in _m:
+        return ("GitHub rejected the credentials (401). The token is invalid, revoked, or not the "
+                "one you think it is.")
+    if "403" in _m:
+        return ("GitHub refused the request (403). The token lacks permission on this repo, or you "
+                "hit a rate limit.")
+    if "404" in _m:
+        return ("GitHub returned 404. GITHUB_REPO may be wrong, or the token can't see that repo.")
+    return str(exc)[:200]
+
+
 def _safe_validate(items, step=None):
-    """_run_validation, but a hard connection failure becomes a friendly message + a logged run —
-    not a raw traceback. Returns (pr_url, err, ok) on success, or None on failure (caller stops)."""
+    """_run_validation, but a hard failure becomes a friendly message + a logged run, not a raw
+    traceback. Distinguishes a GITHUB failure (commit / PR, usually a bad GITHUB_TOKEN) from a
+    TARGET-cluster failure so an auth problem never masquerades as 'couldn't reach the target'.
+    Returns (pr_url, err, ok) on success, or None on failure (caller stops)."""
     try:
         return _run_validation(items, step=step)
     except Exception as _e:
@@ -162,9 +188,16 @@ def _safe_validate(items, step=None):
             "ts": "(request failed)", "files": [],
             "results": [{"name": "(validation request)", "status": "ERROR",
                          "error": _msg[:1500]}]}
-        _h, _a, _ = friendly_error(_msg)
-        st.error("Validation couldn't reach the target — " + (_h or "the connection failed."))
-        st.caption("→ " + (_a or "Try again; the client auto-retries transient resets."))
+        if _is_github_error(_e):
+            st.error("**The GitHub step failed** (commit / pull request), not the target cluster. "
+                     + _git_error_hint(_e))
+            st.caption("Check `GITHUB_TOKEN` and `GITHUB_REPO` in `.env`, and make sure no stale "
+                       "`GITHUB_TOKEN` is exported in your shell (it would shadow `.env`). "
+                       "Nothing was committed or promoted.")
+        else:
+            _h, _a, _ = friendly_error(_msg)
+            st.error("Validation couldn't reach the target — " + (_h or "the connection failed."))
+            st.caption("→ " + (_a or "Try again; the client auto-retries transient resets."))
         return None
 
 
@@ -3440,24 +3473,64 @@ elif step == 4:
                 "commit, open the PR, and merge & promote.")
     else:
         st.subheader("Git Operations")
-        # The commit + PR live HERE (moved off the validation step, which is now a pure dry-run that
-        # touches no Git). Commit only when the bundle CHANGED since the last commit — keyed on a
-        # content signature — so a rerun doesn't re-commit, but going back to fix a column and
-        # returning updates the PR instead of merging a stale one. create_pr reuses the open PR.
-        import hashlib
-        _pr_sig = hashlib.md5("\n".join(sorted(it.get("edoc", "") for it in filtered_items)).encode()).hexdigest()
-        if "pr_url" not in st.session_state or st.session_state.get("_pr_bundle_sig") != _pr_sig:
-            with st.spinner("Committing the validated TML to the dev branch and opening the PR…"):
-                try:
-                    _gc  = git_client()
-                    _sha = _gc.commit_tml(team_name, items_to_files(filtered_items))
-                    st.session_state.pr_url = _gc.create_pr(team_name, _sha)
-                    st.session_state._pr_bundle_sig = _pr_sig
-                except Exception as _e:
-                    st.error(f"Couldn't commit / open the PR: {str(_e)[:200]}")
-                    st.stop()
-        st.markdown(f"**PR:** [{st.session_state.pr_url}]({st.session_state.pr_url})")
-        validation_passed = "pr_url" in st.session_state
+        # Diff what we're about to promote against what's already on main BEFORE committing. A no-op
+        # promotion then says so plainly instead of silently producing an empty commit + PR (which is
+        # indistinguishable from a change that got lost), and a lost change shows up as "0 changed".
+        _new_files  = items_to_files(filtered_items)
+        _main_files = None
+        try:
+            _main_files = git_client().get_tml_files(team_name)
+        except Exception as _e:
+            st.warning("Couldn't read `main` to compare — "
+                       + (_git_error_hint(_e) if _is_github_error(_e) else str(_e)[:200]))
+        if _main_files is None:
+            _added, _changed = sorted(_new_files), []     # can't compare → treat everything as new
+        else:
+            _added   = sorted(p for p in _new_files if p not in _main_files)
+            _changed = sorted(p for p in _new_files
+                              if p in _main_files and _main_files[p] != _new_files[p])
+        _unchanged = len(_new_files) - len(_added) - len(_changed)
+        _nochange  = (_main_files is not None and not _added and not _changed)
+        st.session_state._git_nochange = _nochange
+
+        if _nochange:
+            st.info(f"**Nothing to commit.** All {len(_new_files)} promoted file(s) are already "
+                    "byte-identical on `main`, so no commit and no PR are needed. (An unchanged "
+                    "re-promotion is why earlier runs produced empty PRs.) If you *did* change "
+                    "something, it never reached the bundle — go back and check. You can still "
+                    "re-import to the target below.")
+        else:
+            st.markdown(f"**{len(_added)} new · {len(_changed)} changed · {_unchanged} unchanged**")
+            for _p in _added:
+                st.markdown(f"-  🆕 `{_p}`")
+            for _p in _changed:
+                st.markdown(f"-  ✏️ `{_p}`")
+            import hashlib
+            _pr_sig = hashlib.md5(
+                "\n".join(sorted(it.get("edoc", "") for it in filtered_items)).encode()).hexdigest()
+            # Commit only when the bundle CHANGED since the last commit (content signature), so a
+            # rerun doesn't re-commit, but going back to fix a column and returning updates the PR.
+            if "pr_url" not in st.session_state or st.session_state.get("_pr_bundle_sig") != _pr_sig:
+                with st.spinner("Committing the validated TML to the dev branch and opening the PR…"):
+                    try:
+                        _gc  = git_client()
+                        _sha = _gc.commit_tml(team_name, _new_files)
+                        st.session_state.pr_url = _gc.create_pr(team_name, _sha)
+                        st.session_state._pr_bundle_sig = _pr_sig
+                    except Exception as _e:
+                        if _is_github_error(_e):
+                            st.error("**The GitHub step failed** (commit / pull request). "
+                                     + _git_error_hint(_e))
+                            st.caption("Check `GITHUB_TOKEN` / `GITHUB_REPO` in `.env`, and that no "
+                                       "stale `GITHUB_TOKEN` is exported in your shell. Nothing was "
+                                       "committed or promoted.")
+                        else:
+                            st.error(f"Couldn't commit / open the PR: {str(_e)[:200]}")
+                        st.stop()
+            st.markdown(f"**PR:** [{st.session_state.pr_url}]({st.session_state.pr_url})")
+
+        # Import proceeds either way: with a fresh PR, or when main already matches (the no-op case).
+        validation_passed = _nochange or ("pr_url" in st.session_state)
         if validation_passed:
             st.divider()
             import_phase = st.session_state.get("import_phase")
@@ -3557,24 +3630,31 @@ elif step == 4:
                              disabled=not (proceed and replace_ack and nl_ack)):
                     gc = git_client()
 
-                    with st.spinner("Merging PR…"):
-                        merged = gc.merge_pr()
-                        if not merged:
-                            # PR was already merged — re-commit and open a fresh PR
-                            _res = _safe_validate(filtered_items)
-                            if not _res:
-                                st.stop()
-                            pr_url, err, ok = _res
-                            st.session_state.pr_url = pr_url
-                            if err:
-                                st.session_state.validation_errors = err
-                                st.session_state.validation_ok = ok
-                                st.session_state.pop("silent_drops", None)
-                                st.rerun()
+                    if st.session_state.get("_git_nochange"):
+                        # main already holds this exact TML — there is nothing to merge. Skip the
+                        # merge (and don't manufacture an empty PR just to merge it) and import
+                        # straight from what main already has.
+                        st.info("No Git changes to merge — `main` already has this exact TML. "
+                                "Importing from it directly.")
+                    else:
+                        with st.spinner("Merging PR…"):
                             merged = gc.merge_pr()
-                        if not merged:
-                            st.error("Could not find or create a PR to merge.")
-                            st.stop()
+                            if not merged:
+                                # PR was already merged — re-commit and open a fresh PR
+                                _res = _safe_validate(filtered_items)
+                                if not _res:
+                                    st.stop()
+                                pr_url, err, ok = _res
+                                st.session_state.pr_url = pr_url
+                                if err:
+                                    st.session_state.validation_errors = err
+                                    st.session_state.validation_ok = ok
+                                    st.session_state.pop("silent_drops", None)
+                                    st.rerun()
+                                merged = gc.merge_pr()
+                            if not merged:
+                                st.error("Could not find or create a PR to merge.")
+                                st.stop()
 
                     # Feedback REPLACE (opt-in): free each existing target model's obj_id BEFORE import
                     # so the import creates a fresh model (clean feedback). Deps are re-pointed and the
