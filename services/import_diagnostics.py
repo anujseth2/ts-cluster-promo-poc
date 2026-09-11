@@ -801,6 +801,11 @@ _WH_TO_TS_TYPE = {
     "string": "VARCHAR", "text": "VARCHAR",
     "date": "DATE",
     "timestamp": "DATE_TIME", "timestamp_ntz": "DATE_TIME", "datetime": "DATE_TIME",
+    # TS TOKENS round-trip to themselves. Not every type source hands back a raw warehouse string:
+    # the connection/search COLUMN path reports the connection's own token (GSK's PATIENT_AGE reads
+    # as INT64, not bigint) and the modeled fallback reads TML data_type. Without these the mapping
+    # returns "" for those sources, and a caller that compares tokens would silently stop flagging.
+    "int32": "INT32", "int64": "INT64", "int16": "INT32", "date_time": "DATE_TIME",
 }
 
 # Coarse type FAMILY. Kept for VOID detection and for describing a mismatch ("string vs number");

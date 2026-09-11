@@ -380,7 +380,9 @@ def test_within_family_type_drift_is_flagged_not_swallowed():
                      "db": "hive_metastore", "schema": "us_speciality_analytics",
                      "db_table": "fact_subnational_patient_bridge_respbio_br", "columns": [
         {"db_column_name": "PATIENT_AGE", "db_column_properties": {"data_type": "DOUBLE"}}]}}
-    for _cdw in ("int", "bigint", "smallint"):
+    # bigint is what Databricks DESCRIBE returns; INT64 is what the connection/search COLUMN path
+    # and the modeled fallback return for the same column. Both must flag against DOUBLE.
+    for _cdw in ("int", "bigint", "smallint", "INT64"):
         found = warehouse_type_findings(
             [{"edoc": json.dumps(doc)}],
             {"fact_subnational_patient_bridge_respbio_br": {"patient_age": _cdw}})
@@ -428,6 +430,10 @@ def test_warehouse_type_to_ts_tokens():
     assert warehouse_type_to_ts("string") == "VARCHAR"
     assert warehouse_type_to_ts("boolean") == "BOOL"
     assert warehouse_type_to_ts("double") == "DOUBLE"
+    # TS tokens round-trip, because some type sources report tokens rather than warehouse strings
+    for _tok in ("INT32", "INT64", "DOUBLE", "FLOAT", "VARCHAR", "BOOL", "DATE", "DATE_TIME"):
+        assert warehouse_type_to_ts(_tok) == _tok
+    assert warehouse_type_to_ts("struct<a:int>") == ""     # unmappable stays unmappable
     assert warehouse_type_to_ts("decimal(10,2)") == "DOUBLE"
     assert warehouse_type_to_ts("timestamp") == "DATE_TIME"
     assert warehouse_type_to_ts("void") == ""             # not a real type -> no realign
