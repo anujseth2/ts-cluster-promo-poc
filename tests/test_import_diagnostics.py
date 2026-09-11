@@ -370,6 +370,29 @@ def test_warehouse_type_findings_one_pass():
     assert all(f["kind"] == "type_mismatch" and f["source_type"] for f in found)
 
 
+def test_pruning_a_table_takes_its_formula_column_with_it():
+    # Found by the property suite (test_tml_properties.py), not in the field. drop_tables removed a
+    # formula that referenced a pruned table, but left the model column that surfaced it, because it
+    # only recognised a `formula_id` binding — real TML also binds via column_id `formula_<name>`,
+    # or by name alone. The leftover column then dangles, which ThoughtSpot reports as "Unable to
+    # create model column(s) ... incorrect" or as an opaque schema validation failure.
+    from services.import_diagnostics import prune_tables_whole, dangling_reference_findings
+    tbl = {"table": {"name": "t_gone", "columns": [
+        {"name": "Amount", "db_column_name": "AMOUNT",
+         "db_column_properties": {"data_type": "DOUBLE"}}]}}
+    for binding in ({"column_id": "formula_Total"}, {"name": "Total"}, {"formula_id": "formula_total"}):
+        model = {"model": {"name": "m", "model_tables": [{"name": "t_gone"}],
+                           "formulas": [{"name": "Total", "expr": "sum([t_gone::AMOUNT])"}],
+                           "columns": [{"name": "Total", **binding}]}}
+        items = [{"info": {"name": "t_gone"}, "edoc": json.dumps(tbl)},
+                 {"info": {"name": "m"}, "edoc": json.dumps(model)}]
+        out, _s = prune_tables_whole(items, {"t_gone"})
+        left = json.loads(out[0]["edoc"])["model"]
+        assert left["formulas"] == [], f"formula survived for binding {binding}"
+        assert left["columns"] == [], f"orphaned formula column survived for binding {binding}"
+        assert dangling_reference_findings(out) == []
+
+
 def test_model_column_unresolved_is_named_not_unknown():
     # GSK 2026-09-11, the second error on screen. ThoughtSpot sends no object name for it, so it
     # rendered as "unknown" under Other validation errors with nothing to act on — even though the

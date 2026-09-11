@@ -28,7 +28,7 @@ from services.import_diagnostics import (
     drop_vizzes, table_drop_preview, drop_tables, warehouse_missing_findings, friendly_error,
     column_drop_cascade, finding_key, dangling_reference_findings, table_cleanup_findings,
     realign_column_types, warehouse_type_to_ts, warehouse_type_findings, type_family,
-    recase_columns,
+    recase_columns, model_tables_without_columns, prune_tables_whole,
 )
 from services.table_matcher import column_signature
 from services.feedback_replace import feedback_preview, replace_prep, replace_finalize
@@ -357,22 +357,13 @@ def _log_validate(files, results):
 
 
 def _prune_tables_whole(items, table_names):
-    """Drop whole tables from the promotion: prune them from the model(s) (drop_tables cascades the
-    model_tables entry, joins, surfaced columns, formulas, vizzes) AND remove each table's own TML
-    item so it is not committed/validated/imported. Returns (new_items, summary)."""
-    names = {(n or "").strip().lower() for n in table_names if n}
-    if not names:
-        return items, {"tables": 0, "columns": 0, "joins": 0, "formulas": 0, "vizzes": 0}
-    pruned, summary = drop_tables(items, table_names)
-    # remove the pruned tables' own TML items (drop_tables only cleans references, not the item)
-    out = []
-    for it in pruned:
-        d = _parse_edoc(it.get("edoc", "{}"))
-        t = d.get("table")
-        if t and (t.get("name") or "").strip().lower() in names:
-            continue   # this IS one of the dropped tables — drop its item entirely
-        out.append(it)
-    return out, summary
+    """Drop whole tables from the promotion: prune them from the model(s) AND remove each table's
+    own TML item so it is not committed/validated/imported.
+
+    The implementation now lives in services.import_diagnostics.prune_tables_whole, so the same
+    contract is used by the app and covered by the property tests. Kept as a thin alias because
+    every call site in this page refers to it by this name."""
+    return prune_tables_whole(items, table_names)
 
 
 def _log_discovery_pass(passes, errs, found, drop_set, viz_set, man, removed):
@@ -2294,6 +2285,12 @@ elif step == 3:
                         viz_set.update(f.get("vizzes", []))
                     elif f["kind"] == "invalid_formula_ids":
                         drop_set.update(f.get("formulas", []))   # drop by formula name
+                    elif f["kind"] == "formula_broken_ref":
+                        # The column this formula computes on is gone, so the formula cannot work.
+                        # Drop it by name (cascading anything built on it) — it is reported by name
+                        # in the drop summary, never removed silently.
+                        if f.get("formula"):
+                            drop_set.add(f["formula"])
                     elif f["kind"] == "dangling_ref":
                         drop_set.add(f["name"])   # drop the referrer (formula/column) by name
                     elif f["kind"] == "drop_table":
@@ -2666,6 +2663,14 @@ elif step == 3:
             join_unres   = [f for f in findings if f["kind"] == "join_unresolved"]
             model_col_bad = [f for f in findings if f["kind"] == "model_column_unresolved"]
             formula_bad  = [f for f in findings if f["kind"] == "formula_broken_ref"]
+            # Static check, not only the platform's complaint: a model table whose last surfaced
+            # column was dropped fails on the NEXT validate, so find it now and show it with the
+            # drop that caused it. Deduped against whatever validate already reported.
+            _nc_seen = {finding_key(f) for f in findings if f["kind"] == "model_table_no_columns"}
+            for _f in model_tables_without_columns(st.session_state.get("transformed_items", [])):
+                if finding_key(_f) not in _nc_seen:
+                    findings.append(_f); _nc_seen.add(finding_key(_f))
+            bare_tables  = [f for f in findings if f["kind"] == "model_table_no_columns"]
             other        = [f for f in findings if f["kind"] == "other"]
 
             # VALIDATE_ONLY reports only the FIRST missing column per table, so the reviewer
@@ -2869,7 +2874,13 @@ elif step == 3:
                         _names = ", ".join(f"`{s.replace('::', '.')}`" for s in sorted(drop_set))
                         _casc  = []
                         if _man.get("joins"):    _casc.append(f"{_man['joins']} join(s)")
-                        if _man.get("formulas"): _casc.append(f"{len(_man['formulas'])} formula(s)")
+                        if _man.get("formulas"):
+                            # NAME the formulas. A formula is something a person wrote; if the tool
+                            # removes one because its column went, the operator has to be told which.
+                            _fn = sorted({str(x) for x in _man["formulas"]})
+                            _casc.append(f"{len(_fn)} formula(s) (" +
+                                         ", ".join(f"`{x}`" for x in _fn[:6]) +
+                                         (", …" if len(_fn) > 6 else "") + ")")
                         if _man.get("vizzes"):   _casc.append(f"{_man['vizzes']} viz(s)")
                         if _emptied:             _casc.append(f"{len(_emptied)} emptied table(s) pruned")
                         _msg = f"Dropped {len(drop_set)} column(s): {_names}."
@@ -3289,6 +3300,20 @@ elif step == 3:
                            "Audit page if it is no longer wanted.")
                 for _f in sorted(formula_bad, key=lambda x: (x.get("formula") or "").lower()):
                     st.markdown(f"- **{_f['formula']}** needs `{_f['missing_ref']}`")
+
+            # ── model tables left with no selected columns (needs a decision, not an auto-prune) ──
+            if bare_tables:
+                st.markdown("#### Model tables with no columns selected")
+                st.caption("ThoughtSpot rejects a model that keeps a table on the canvas without "
+                           "surfacing any of its columns, because it can produce unintended cross "
+                           "joins between fact tables. This is usually the tail of a drop cascade. "
+                           "Two ways out, and the tool won't choose for you: keep one column of "
+                           "that table (un-drop it on the Source Audit page), or remove the table "
+                           "from the model. Removing a bridge table changes the join graph, so it "
+                           "changes the numbers.")
+                for _f in sorted(bare_tables, key=lambda x: (x.get("model") or "").lower()):
+                    _tl = ", ".join(f"`{t}`" for t in (_f.get("tables") or [])) or "(not named)"
+                    st.warning(f"**{_f.get('model') or _f.get('object')}** — {_tl}")
 
             # ── anything unrecognised ──
             if other:

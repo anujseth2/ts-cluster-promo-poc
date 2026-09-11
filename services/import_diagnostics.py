@@ -65,14 +65,30 @@ _FORMULA_BAD_REF = re.compile(
     r"Formula addition failed\.\s*Formula:\s*([^,]+?)\s*,\s*Error:\s*Search did not find\s*"
     r"[\"“]?([^\"”]+?)[\"”]?\s+in your data or metadata", re.I | re.S)
 _SCOPED_REF = re.compile(r"([A-Za-z0-9_\-. ]+?)\s*::\s*([A-Za-z0-9_\-. ]+)")
+# "One or more tables have been added to the model without selecting any of their columns. … select
+#  at least one column or formula from each of the following tables or remove them from the canvas:
+#  <br/><li>dim_territory_bridge_lupus</li>"
+# A model table left on the canvas with none of its columns surfaced — usually the tail end of a
+# drop cascade. ThoughtSpot refuses the model, because such a table can produce unintended cross
+# joins between facts.
+_NO_COLS_SELECTED = re.compile(
+    r"tables have been added to the model without selecting any of their columns(.*)$", re.I | re.S)
 
 
 def _clean(msg: str) -> str:
-    """Strip ThoughtSpot's HTML flecks: <br/> -> newline, <b>..</b> -> **..**."""
+    """Strip ThoughtSpot's HTML flecks: <br/> -> newline, <b>..</b> -> **..**, list items -> lines.
+
+    List markup matters: the "tables without selected columns" error carries the table names inside
+    <li>…</li>, and without this they render to the operator as the literal text
+    "<li>dim_territory_bridge_lupus</li>" (seen on screen, GSK 2026-09-11)."""
     s = str(msg or "")
-    for br in ("<br/>", "<br />", "<br>"):
+    for br in ("<br/>", "<br />", "<br>", "</li>", "</ul>", "</ol>"):
         s = s.replace(br, "\n")
-    return s.replace("<b>", "**").replace("</b>", "**").strip()
+    for drop in ("<ul>", "<ol>"):
+        s = s.replace(drop, "")
+    s = s.replace("<li>", "- ")
+    s = s.replace("<b>", "**").replace("</b>", "**")
+    return "\n".join(ln.rstrip() for ln in s.split("\n")).strip()
 
 
 # Plain-language translations for the error shapes ThoughtSpot returns verbatim. Each entry:
@@ -204,12 +220,23 @@ def classify_import_errors(results):
         for _fml, _ref in _FORMULA_BAD_REF.findall(msg):
             matched = True
             _rp = [x.strip() for x in _ref.split("::")]
-            # Surfaced, NOT auto-dropped: the formula is real customer content, and the operator
-            # may prefer to restore the missing column over deleting their formula.
+            # Dropped, and named in the drop report. A formula whose column is gone cannot compute;
+            # leaving it in place just fails the import again. drop_columns already cascades
+            # formulas when the operator drops a column, so reaching this means one slipped through
+            # (e.g. the column went missing in the warehouse rather than being dropped here).
             findings.append({"kind": "formula_broken_ref", "object": r.get("name"),
                              "formula": _fml.strip(), "missing_ref": _ref.strip(),
                              "ref_table": _rp[0] if len(_rp) > 1 else "",
                              "ref_column": _rp[-1] if _rp else "", "error": msg.strip()})
+        _nc = _NO_COLS_SELECTED.search(msg)
+        if _nc:
+            matched = True
+            # Table names arrive as <li> items after the "following tables" preamble.
+            _tail = _clean(_nc.group(1))
+            _tbls = [ln.lstrip("- ").strip() for ln in _tail.split("\n")
+                     if ln.strip().startswith("- ") and ln.lstrip("- ").strip()]
+            findings.append({"kind": "model_table_no_columns", "object": r.get("name"),
+                             "model": r.get("name"), "tables": _tbls, "error": msg.strip()})
         _mc = _MODEL_COL_BAD.search(msg)
         if _mc:
             matched = True
@@ -255,6 +282,8 @@ def finding_key(f):
     if k == "formula_broken_ref":
         return (k, (f.get("formula") or "").strip().lower(),
                 (f.get("missing_ref") or "").strip().lower())
+    if k == "model_table_no_columns":
+        return (k, obj, tuple(sorted((t or "").lower() for t in f.get("tables", []))))
     if k == "dangling_ref":
         return (k, obj, (f.get("name") or "").strip().lower())
     if k == "drop_table":
@@ -312,6 +341,83 @@ def table_cleanup_findings(items):
                                   f"join-key column in the target warehouse to keep it.")}
     out = list(empty.values())
     out += [f for k, f in disconnected.items() if k not in empty]
+    return out
+
+
+def prune_tables_whole(items, table_names):
+    """Drop whole tables from a promotion, completely: clean every reference to them out of the
+    model(s) AND remove each table's own TML item from the set.
+
+    Both halves are required and neither is optional. drop_tables() alone cleans references but
+    leaves the table's own document in place, so an emptied table keeps being re-reported as a
+    hazard forever — a cleanup loop built on drop_tables() alone never reaches a fixed point.
+    That obligation used to live in the caller, where it is easy to forget; it lives here now so
+    a table drop is one operation with one contract. Returns (new_items, summary)."""
+    names = {(n or "").strip().lower() for n in table_names if n}
+    if not names:
+        return items, {"tables": 0, "columns": 0, "joins": 0, "formulas": 0, "vizzes": 0}
+    pruned, summary = drop_tables(items, table_names)
+    out = []
+    for it in pruned:
+        t = (_parse_edoc(it) or {}).get("table")
+        if t and (t.get("name") or "").strip().lower() in names:
+            continue
+        out.append(it)
+    return out, summary
+
+
+def model_tables_without_columns(items):
+    """Model tables still on the canvas with NONE of their columns surfaced — detected statically,
+    before the cluster is asked.
+
+    ThoughtSpot refuses a model in this state ("One or more tables have been added to the model
+    without selecting any of their columns … unintended cross joins"), and it is normally the tail
+    of a drop cascade: the last surfaced column of a bridge table gets dropped, the table stays on
+    the canvas, and the model fails on the NEXT validate. Catching it here means the operator sees
+    it with the drop that caused it.
+
+    Deliberately NOT returned as 'drop_table' (which the discovery loop auto-prunes). Removing a
+    bridge table silently changes the join graph and therefore the numbers — the very failure mode
+    the platform is warning about — so this is surfaced for a decision: restore a column, or remove
+    the table. Returns findings kind 'model_table_no_columns' with tables[] per model."""
+    out = []
+    for item in items:
+        try:
+            doc = _parse_edoc(item)
+        except Exception:
+            continue
+        for key in ("model", "worksheet"):
+            node = doc.get(key)
+            if not node:
+                continue
+            mts = node.get("model_tables") or []
+            if not mts:
+                continue
+            # Which tables does the model actually surface a column (or formula) from?
+            used = set()
+            for c in node.get("columns") or []:
+                cid = (c.get("column_id") or "").strip().lower()
+                if "::" in cid:
+                    used.add(cid.split("::")[0].strip())
+            for expr in _iter_strings(node.get("formulas") or []):
+                for inner in _BRACKET_REF.findall(expr):
+                    if "::" in inner:
+                        used.add(inner.split("::")[0].strip().lower())
+            bare = []
+            for mt in mts:
+                nm = (mt.get("name") or "").strip()
+                # A model table may be aliased on the canvas; the alias is what column_ids use.
+                alias = (mt.get("alias") or nm).strip()
+                if nm and alias.lower() not in used and nm.lower() not in used:
+                    bare.append(nm)
+            if bare:
+                out.append({"kind": "model_table_no_columns",
+                            "object": node.get("name") or doc.get("name"),
+                            "model": node.get("name"), "tables": sorted(bare),
+                            "error": ("Model table(s) " + ", ".join(bare) + " are on the canvas "
+                                      "with none of their columns selected. ThoughtSpot rejects "
+                                      "this (risk of unintended cross joins between facts): keep "
+                                      "at least one column, or remove the table from the model.")})
     return out
 
 
@@ -1092,6 +1198,31 @@ def _formula_id(f):
     return (f.get("id") or ("formula_" + (f.get("name", "") or ""))).strip().lower()
 
 
+def _surfaces_dropped_formula(col, dropped_fids, dropped_fnames):
+    """True when a model column exists only to surface one of the dropped formulas.
+
+    A formula-backed column binds to its formula in three different ways depending on how the TML
+    was written: an explicit `formula_id`, a `column_id` of `formula_<name>`, or nothing at all but
+    a matching `name`. drop_columns() has always handled all three; drop_tables() checked only
+    `formula_id`, so pruning a whole table removed the formula and left its column behind pointing
+    at nothing. ThoughtSpot reports that as "Unable to create model column(s). These column_id/
+    formula_id values are incorrect" — the same shape as the GSK failure — or as an opaque schema
+    validation error. Found by the property suite, not in the field."""
+    fid = (col.get("formula_id", "") or "").strip().lower()
+    if fid and fid in dropped_fids:
+        return True
+    cid = (col.get("column_id", "") or "").strip().lower()
+    if cid and cid in dropped_fids:
+        return True
+    if cid.startswith("formula_") and cid[len("formula_"):] in dropped_fnames:
+        return True
+    # No binding of any kind: a column is a formula column only if its NAME is a dropped formula's
+    # AND it carries no physical `table::col` id.
+    if not cid and not fid:
+        return (col.get("name", "") or "").strip().lower() in dropped_fnames
+    return False
+
+
 def _table_drop_plan(items, table_names):
     """Full transitive closure of what pruning `table_names` removes from the model(s): the
     tables + attaching joins + their physical columns, then by FIXPOINT every formula that
@@ -1123,6 +1254,8 @@ def _table_drop_plan(items, table_names):
 
     dropped_formula_names = [f.get("name") or f.get("id") for f in all_formulas
                              if _formula_id(f) in dropped_fids]
+    # The NAMES of the dropped formulas, for the column that surfaces one purely by name.
+    _dropped_fnames = {(n or "").strip().lower() for n in dropped_formula_names if n}
 
     formula_col_names = []
     for doc in docs:
@@ -1131,8 +1264,9 @@ def _table_drop_plan(items, table_names):
             if not node:
                 continue
             for c in node.get("columns", []) or []:
-                if (c.get("formula_id", "") or "").strip().lower() in dropped_fids:
-                    formula_col_names.append(c.get("name") or c.get("formula_id"))
+                if _surfaces_dropped_formula(c, dropped_fids, _dropped_fnames):
+                    formula_col_names.append(c.get("name") or c.get("formula_id")
+                                             or c.get("column_id"))
 
     dropped_col_names = set(phys_keys) | {(n or "").strip().lower() for n in formula_col_names if n}
 
@@ -1218,6 +1352,9 @@ def drop_tables(items, table_names):
                         mt["joins"] = kj
                     kept_mt.append(mt)
                 node["model_tables"] = kept_mt
+            _dropped_fnames = {(f.get("name") or "").strip().lower()
+                               for f in (node.get("formulas") or [])
+                               if _formula_id(f) in dropped_fids and f.get("name")}
             if isinstance(node.get("formulas"), list):
                 before = len(node["formulas"])
                 node["formulas"] = [f for f in node["formulas"] if _formula_id(f) not in dropped_fids]
@@ -1228,7 +1365,8 @@ def drop_tables(items, table_names):
                     c for c in node["columns"]
                     if not (("::" in (c.get("column_id", "") or "")
                              and (c.get("column_id", "")).split("::")[0].strip().lower() in targets)
-                            or (c.get("formula_id", "") or "").strip().lower() in dropped_fids)
+                            # every way a column can bind to a dropped formula, not just formula_id
+                            or _surfaces_dropped_formula(c, dropped_fids, _dropped_fnames))
                 ]
                 summary["columns"] += before - len(node["columns"])
         lb = doc.get("liveboard")
