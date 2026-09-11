@@ -370,6 +370,26 @@ def test_warehouse_type_findings_one_pass():
     assert all(f["kind"] == "type_mismatch" and f["source_type"] for f in found)
 
 
+def test_model_column_unresolved_is_named_not_unknown():
+    # GSK 2026-09-11, the second error on screen. ThoughtSpot sends no object name for it, so it
+    # rendered as "unknown" under Other validation errors with nothing to act on — even though the
+    # body names the culprit exactly. It is the downstream half of the PATIENT_AGE type failure.
+    from services.import_diagnostics import classify_import_errors
+    msg = ("Unable to create model column(s). These column_id/formula_id values are incorrect:"
+           "<br/>fact_subnational_patient_bridge_respbio_br::PATIENT_AGE")
+    found = classify_import_errors([{"name": "unknown", "type": None,
+                                     "status": "ERROR", "error": msg}])
+    assert [f["kind"] for f in found] == ["model_column_unresolved"]
+    assert found[0]["object"] == "fact_subnational_patient_bridge_respbio_br"
+    assert found[0]["column"] == "PATIENT_AGE"
+    # several columns in one message are each named
+    many = ("Unable to create model column(s). These column_id/formula_id values are incorrect:"
+            "<br/>t_one::COL_A<br/>t_two::COL_B")
+    got = classify_import_errors([{"name": "m", "status": "ERROR", "error": many}])
+    assert sorted((f["object"], f["column"]) for f in got) == [("t_one", "COL_A"),
+                                                              ("t_two", "COL_B")]
+
+
 def test_within_family_type_drift_is_flagged_not_swallowed():
     # GSK 2026-09-11 regression. PATIENT_AGE was DOUBLE in the TML and an integer in Databricks.
     # Both are the "num" family, so the old family-level rule stayed silent — the drift table

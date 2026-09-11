@@ -2664,6 +2664,8 @@ elif step == 3:
             dangling     = [f for f in findings if f["kind"] == "dangling_ref"]
             drop_table_find = [f for f in findings if f["kind"] == "drop_table"]
             join_unres   = [f for f in findings if f["kind"] == "join_unresolved"]
+            model_col_bad = [f for f in findings if f["kind"] == "model_column_unresolved"]
+            formula_bad  = [f for f in findings if f["kind"] == "formula_broken_ref"]
             other        = [f for f in findings if f["kind"] == "other"]
 
             # VALIDATE_ONLY reports only the FIRST missing column per table, so the reviewer
@@ -3263,6 +3265,30 @@ elif step == 3:
                     st.markdown("Affected join(s) on: " + ", ".join(f"`{t}`" for t in _jt))
                 else:
                     st.caption("(ThoughtSpot didn't name the table — apply the drops and re-validate.)")
+
+            # ── model-column cascade: the table column it needs never got created (downstream) ──
+            if model_col_bad:
+                st.markdown("#### Model columns waiting on a table column (downstream)")
+                st.caption("Not separate problems. Each of these model columns points at a table "
+                           "column that failed its own check above, so resolve the column there "
+                           "(realign the type where the warehouse is right, drop only as a last "
+                           "resort) and these clear on the next validate.")
+                for _f in sorted(model_col_bad, key=lambda x: ((x.get("object") or "").lower(),
+                                                               (x.get("column") or "").lower())):
+                    _where = f"`{_f['object']}`" + (f".`{_f['column']}`" if _f.get("column") else "")
+                    _in = f" (in model **{_f['model']}**)" if _f.get("model") \
+                        and _f["model"] not in (None, "unknown") else ""
+                    st.markdown(f"- {_where}{_in}")
+
+            # ── formulas whose expression lost a column (downstream of a drop) ──
+            if formula_bad:
+                st.markdown("#### Formulas that lost a column they reference")
+                st.caption("Each formula below uses a column that is no longer in the promotion, "
+                           "usually one dropped earlier. Nothing is removed for you: keep the "
+                           "formula by restoring the column, or drop the formula on the Source "
+                           "Audit page if it is no longer wanted.")
+                for _f in sorted(formula_bad, key=lambda x: (x.get("formula") or "").lower()):
+                    st.markdown(f"- **{_f['formula']}** needs `{_f['missing_ref']}`")
 
             # ── anything unrecognised ──
             if other:

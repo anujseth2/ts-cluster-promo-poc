@@ -48,6 +48,23 @@ _BOLD = re.compile(r"<b>(.*?)</b>", re.I | re.S)
 _LI = re.compile(r"<li>(.*?)</li>", re.I | re.S)
 _VIZ_ERR = re.compile(r"Visualization\s*<b>\s*(.*?)\s*</b>\s*has following errors", re.I | re.S)
 _FORMULA = re.compile(r"Formula:\s*([^,<]+)", re.I)
+# "Unable to create model column(s). These column_id/formula_id values are incorrect:<br/>
+#  fact_subnational_patient_bridge_respbio_br::PATIENT_AGE"
+# A model column whose underlying table column never got created. Always a CONSEQUENCE of the
+# table's own failure (GSK 2026-09-11: PATIENT_AGE failed its type check, so the model referencing
+# it failed too). The header carries no object name, so this used to land in "other" as an
+# unactionable "unknown" — while the body names the culprit precisely, as table::column.
+_MODEL_COL_BAD = re.compile(r"Unable to create model column\(s\).*?column_id/formula_id values are "
+                            r"incorrect\s*:?(.*)$", re.I | re.S)
+# "Formula addition failed. Formula: test_promotion_tool, Error: Search did not find
+#  "fact_subnational_patient_features_respbio_br::SUA_PATIENTS" in your data or metadata."
+# A formula whose expression references a column that is no longer in the promotion (usually one
+# the operator dropped). Names both halves, so say which formula and which column rather than
+# dumping it in "other". Distinct from dangling_ref, which is formula-references-formula.
+_FORMULA_BAD_REF = re.compile(
+    r"Formula addition failed\.\s*Formula:\s*([^,]+?)\s*,\s*Error:\s*Search did not find\s*"
+    r"[\"“]?([^\"”]+?)[\"”]?\s+in your data or metadata", re.I | re.S)
+_SCOPED_REF = re.compile(r"([A-Za-z0-9_\-. ]+?)\s*::\s*([A-Za-z0-9_\-. ]+)")
 
 
 def _clean(msg: str) -> str:
@@ -112,6 +129,7 @@ def classify_import_errors(results):
       drop_blocked_by_dependents   -> columns[], dependents[]
       type_mismatch                -> column, column_fqn, source_type, connection
       viz_error                    -> vizzes[], formulas[], error   (liveboard/answer viz fails to load)
+      model_column_unresolved      -> column, model, error   (symptom of the table's own failure)
       other                        -> error
     """
     findings = []
@@ -183,6 +201,27 @@ def classify_import_errors(results):
                       if b.strip() and not b.strip().endswith(":")]
             findings.append({"kind": "invalid_formula_ids",
                              "object": r.get("name"), "formulas": fnames, "error": msg.strip()})
+        for _fml, _ref in _FORMULA_BAD_REF.findall(msg):
+            matched = True
+            _rp = [x.strip() for x in _ref.split("::")]
+            # Surfaced, NOT auto-dropped: the formula is real customer content, and the operator
+            # may prefer to restore the missing column over deleting their formula.
+            findings.append({"kind": "formula_broken_ref", "object": r.get("name"),
+                             "formula": _fml.strip(), "missing_ref": _ref.strip(),
+                             "ref_table": _rp[0] if len(_rp) > 1 else "",
+                             "ref_column": _rp[-1] if _rp else "", "error": msg.strip()})
+        _mc = _MODEL_COL_BAD.search(msg)
+        if _mc:
+            matched = True
+            # Name the table::column pairs the message lists. These are SYMPTOMS — the reviewer
+            # resolves the table-level failure (realign or drop the column) and this clears itself.
+            # Deliberately no drop action of its own: dropping here would strip the model column
+            # even when the operator chose to REALIGN the underlying type and keep it.
+            refs = [(t.strip(), c.strip()) for t, c in _SCOPED_REF.findall(_clean(_mc.group(1)))
+                    if t.strip() and c.strip()]
+            for _t, _c in (refs or [(r.get("name"), "")]):
+                findings.append({"kind": "model_column_unresolved", "object": _t,
+                                 "column": _c, "model": r.get("name"), "error": msg.strip()})
         if not matched and re.search(r"Error while translating .*? join|No matches found for table",
                                      msg, re.I):
             matched = True
@@ -211,6 +250,11 @@ def finding_key(f):
         return (k, obj, tuple(sorted(str(v) for v in f.get("vizzes", []))))
     if k == "invalid_formula_ids":
         return (k, obj, tuple(sorted((x or "").lower() for x in f.get("formulas", []))))
+    if k == "model_column_unresolved":
+        return (k, obj, (f.get("column") or "").strip().lower())
+    if k == "formula_broken_ref":
+        return (k, (f.get("formula") or "").strip().lower(),
+                (f.get("missing_ref") or "").strip().lower())
     if k == "dangling_ref":
         return (k, obj, (f.get("name") or "").strip().lower())
     if k == "drop_table":
