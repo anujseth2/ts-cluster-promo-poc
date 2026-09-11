@@ -803,10 +803,10 @@ _WH_TO_TS_TYPE = {
     "timestamp": "DATE_TIME", "timestamp_ntz": "DATE_TIME", "datetime": "DATE_TIME",
 }
 
-# Coarse type FAMILY. Type mismatches only BLOCK the import across families (string vs number vs
-# bool vs date — a 14536 hard-fail); within a family (INT32 vs INT64, FLOAT vs DOUBLE) the platform
-# only WARNS and imports fine. So flagging is family-level to avoid false positives like "INT vs
-# INT32". Covers both warehouse strings (bigint, string, …) and TS tokens (INT32, VARCHAR, …).
+# Coarse type FAMILY. Kept for VOID detection and for describing a mismatch ("string vs number");
+# it is NOT the flagging rule. Flagging compares TS TOKENS (see warehouse_type_findings): within
+# one family a mismatch can still hard-fail — DOUBLE vs bigint are both "num" and ThoughtSpot
+# rejects it. Covers both warehouse strings (bigint, string, …) and TS tokens (INT32, VARCHAR, …).
 _TYPE_FAMILY = {
     "tinyint": "num", "smallint": "num", "int": "num", "integer": "num", "bigint": "num",
     "long": "num", "float": "num", "double": "num", "real": "num", "decimal": "num", "numeric": "num",
@@ -851,11 +851,17 @@ def warehouse_type_findings(items, type_map, connection=""):
     (the type whack-a-mole). `type_map` = {table_lower: {col_lower: warehouse_type_string}} (e.g. from
     hive DESCRIBE). Returns type_mismatch findings in the same shape as classify_import_errors.
 
-    Flags a column ONLY on a CROSS-FAMILY difference (string vs number vs bool vs date) — the case
-    that actually hard-fails import (14536) — or when the warehouse type is VOID (unusable). A
-    within-family difference (INT vs INT32, FLOAT vs DOUBLE) is NOT flagged: the platform only warns
-    and imports fine, and treating it as a mismatch produced false positives like 'INT vs INT32'. An
-    unknown type on either side, or a column absent from the map, is skipped."""
+    Flags a column when the warehouse type and the TML token disagree once the warehouse type is
+    normalised to the TS TOKEN it maps to (bigint -> INT64, int -> INT32, string -> VARCHAR), or
+    when the warehouse type is VOID (unusable). An unknown/unmappable type on either side, or a
+    column absent from the map, is skipped.
+
+    Compare on the TOKEN, not the coarse FAMILY. Family compare was too loose: DOUBLE vs bigint
+    are both "num", so it stayed silent on a real hard failure — GSK 2026-09-11, PATIENT_AGE:
+    "DataType DOUBLE does not match CDW DataType ... fact_subnational_patient_bridge_respbio_br.
+    PATIENT_AGE", which killed the table and cascaded into the model that used it, while the drift
+    table rendered EMPTY. Token compare still absorbs the false positive family compare was added
+    for: Databricks `int` and TML `INT32` both normalise to INT32, so INT-vs-INT32 stays quiet."""
     out = []
     for item in items:
         try:
@@ -878,9 +884,11 @@ def warehouse_type_findings(items, type_map, connection=""):
             if cdw_t is None:
                 continue   # not in the warehouse -> MISSING, not a type mismatch
             tml_t = ((c.get("db_column_properties") or {}).get("data_type") or "").strip()
-            _cf, _tf = type_family(cdw_t), type_family(tml_t)
-            # cross-family (real 14536 blocker) or an unusable VOID warehouse type; NOT within-family
-            _flag = _cf == "void" or (_cf and _tf and _cf != _tf)
+            # The TS token the warehouse type maps to — "" when we can't name it confidently, and
+            # an unnamed type is never flagged (we only report drift we can explain).
+            _tok = warehouse_type_to_ts(cdw_t)
+            _flag = (type_family(cdw_t) == "void"
+                     or bool(_tok and tml_t and _tok.upper() != tml_t.upper()))
             if _flag:
                 out.append({
                     "kind": "type_mismatch",

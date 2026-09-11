@@ -370,6 +370,48 @@ def test_warehouse_type_findings_one_pass():
     assert all(f["kind"] == "type_mismatch" and f["source_type"] for f in found)
 
 
+def test_within_family_type_drift_is_flagged_not_swallowed():
+    # GSK 2026-09-11 regression. PATIENT_AGE was DOUBLE in the TML and an integer in Databricks.
+    # Both are the "num" family, so the old family-level rule stayed silent — the drift table
+    # rendered EMPTY while ThoughtSpot hard-failed ("DataType DOUBLE does not match CDW DataType"),
+    # taking the table down and cascading into the model that used the column.
+    from services.import_diagnostics import warehouse_type_findings
+    doc = {"table": {"name": "fact_subnational_patient_bridge_respbio_br",
+                     "db": "hive_metastore", "schema": "us_speciality_analytics",
+                     "db_table": "fact_subnational_patient_bridge_respbio_br", "columns": [
+        {"db_column_name": "PATIENT_AGE", "db_column_properties": {"data_type": "DOUBLE"}}]}}
+    for _cdw in ("int", "bigint", "smallint"):
+        found = warehouse_type_findings(
+            [{"edoc": json.dumps(doc)}],
+            {"fact_subnational_patient_bridge_respbio_br": {"patient_age": _cdw}})
+        assert [f["column"] for f in found] == ["PATIENT_AGE"], f"{_cdw} vs DOUBLE must flag"
+        assert found[0]["source_type"] == "DOUBLE"
+
+
+def test_int_vs_int32_stays_quiet():
+    # The false positive the family rule was introduced to kill must STAY dead: Databricks `int`
+    # and TML INT32 are the same type spelled two ways, so token-compare reports nothing.
+    from services.import_diagnostics import warehouse_type_findings
+    doc = {"table": {"name": "t", "columns": [
+        {"db_column_name": "a", "db_column_properties": {"data_type": "INT32"}},   # int   -> INT32
+        {"db_column_name": "b", "db_column_properties": {"data_type": "INT64"}},   # bigint-> INT64
+        {"db_column_name": "c", "db_column_properties": {"data_type": "VARCHAR"}}, # string-> VARCHAR
+        {"db_column_name": "d", "db_column_properties": {"data_type": "DOUBLE"}},  # decimal->DOUBLE
+    ]}}
+    type_map = {"t": {"a": "int", "b": "bigint", "c": "string", "d": "decimal(10,2)"}}
+    assert warehouse_type_findings([{"edoc": json.dumps(doc)}], type_map) == []
+
+
+def test_unmappable_warehouse_type_is_not_flagged():
+    # We only report drift we can name. A warehouse type with no TS token (struct/array/map) is
+    # skipped rather than guessed at — guessing here would drop a column on a bad reading.
+    from services.import_diagnostics import warehouse_type_findings
+    doc = {"table": {"name": "t", "columns": [
+        {"db_column_name": "payload", "db_column_properties": {"data_type": "VARCHAR"}}]}}
+    assert warehouse_type_findings([{"edoc": json.dumps(doc)}],
+                                   {"t": {"payload": "struct<a:int>"}}) == []
+
+
 def test_warehouse_type_findings_skips_unread_table():
     from services.import_diagnostics import warehouse_type_findings
     doc = {"table": {"name": "t", "columns": [

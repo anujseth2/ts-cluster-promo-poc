@@ -2963,13 +2963,16 @@ elif step == 3:
                 # Columns already dropped this run are NOT candidates — otherwise a column you resolved
                 # by dropping keeps reappearing one re-validate at a time.
                 _already_gone = st.session_state.get("dropped_col_names", set())
-                _rows, _void_rows = [], []
+                # Every reason a reported mismatch does NOT become a row, so the table can never
+                # sit there empty next to a red type error with nothing to click (the GSK demo).
+                _rows, _void_rows, _quiet_agree, _quiet_gone = [], [], [], []
                 for f in sorted(type_mismatch, key=lambda x: ((x.get("object") or "").lower(),
                                                               (x.get("column") or "").lower())):
                     obj = f.get("object") or "(table)"
                     col = f.get("column", "")
                     _scoped = f"{obj}::{col}" if f.get("object") else col
                     if _scoped in _already_gone or col in _already_gone:
+                        _quiet_gone.append(_scoped)
                         continue
                     tgt_t   = (_tfull.get((obj or "").strip().lower()) or {}).get(col.lower(), "")
                     src_cdw = (_sfull.get((obj or "").strip().lower()) or {}).get(col.lower(), "")
@@ -2988,12 +2991,15 @@ elif step == 3:
                             "_scoped":    _scoped,
                         })
                         continue
-                    # Only CROSS-FAMILY differences block the import (string vs number vs bool vs
-                    # date). Within a family (INT vs INT32, FLOAT vs DOUBLE) the platform just warns
-                    # and imports fine — skip it so e.g. INT/INT32/INT never shows as a mismatch.
-                    _whfam  = type_family(tgt_t) or type_family(src_cdw)
-                    _tmlfam = type_family(src_tml)
-                    if _whfam and _tmlfam and _whfam == _tmlfam:
+                    # Quiet ONLY when the warehouse and the TML agree once the warehouse type is
+                    # normalised to its TS token (Databricks `int` == TML INT32) — that is the
+                    # INT-vs-INT32 false positive. Do NOT quiet on family: DOUBLE vs bigint are
+                    # both "num" and ThoughtSpot hard-fails them, which is how PATIENT_AGE blew up
+                    # a live demo with this table showing "empty". Unread/unmappable => still shown.
+                    _cdw_cmp = tgt_t or src_cdw
+                    _cdw_tok = warehouse_type_to_ts(_cdw_cmp) if _cdw_cmp else ""
+                    if _cdw_tok and src_tml and _tnorm(_cdw_tok) == _tnorm(src_tml):
+                        _quiet_agree.append(_scoped)
                         continue
                     _agree = bool(src_cdw and tgt_t and _tnorm(src_cdw) == _tnorm(tgt_t))
                     # REALIGN only when both warehouses agree on a real type and the TML is the stale
@@ -3066,7 +3072,23 @@ elif step == 3:
                         "is stale; when they genuinely differ, fix the warehouse, or drop as a last "
                         "resort (scoped to that one table).")
                 elif not _void_rows:
-                    st.caption("No type mismatches to resolve here (any already dropped are excluded).")
+                    # ACCOUNT for the findings, never just render "empty". ThoughtSpot reported a
+                    # type problem; if this table has no row for it, say which column and why, or
+                    # the screen reads as "nothing to fix" beside a hard failure.
+                    if _quiet_gone:
+                        st.caption("No type mismatches left to resolve — already dropped this run: "
+                                   + ", ".join(f"`{s.replace('::', '.')}`" for s in sorted(_quiet_gone)))
+                    elif _quiet_agree:
+                        st.info("No action needed here: the warehouse and the TML agree on the type "
+                                "for " + ", ".join(f"`{s.replace('::', '.')}`" for s in
+                                                   sorted(_quiet_agree)[:8])
+                                + (" and others" if len(_quiet_agree) > 8 else "")
+                                + ". If ThoughtSpot still rejected a type, the column is listed under "
+                                  "**Other validation errors** below — that is a warehouse/TML "
+                                  "disagreement this read couldn't see.")
+                    else:
+                        st.caption("No type mismatches to resolve here "
+                                   "(any already dropped are excluded).")
                 # Explicit columns so an empty list renders a harmless 0-row table (no crash).
                 _df = pd.DataFrame(_rows, columns=["#", "Table", "Column", "Source CDW", "Source TML",
                                                    "Target CDW", "Issue", "Realign to", "Realign?",
