@@ -29,6 +29,7 @@ from services.import_diagnostics import (
     column_drop_cascade, finding_key, dangling_reference_findings, table_cleanup_findings,
     realign_column_types, warehouse_type_to_ts, warehouse_type_findings, type_family,
     recase_columns, model_tables_without_columns, prune_tables_whole,
+    blocking, warnings_only,
 )
 from services.table_matcher import column_signature
 from services.feedback_replace import feedback_preview, replace_prep, replace_finalize
@@ -2224,6 +2225,8 @@ elif step == 3:
             _tick = progress or (lambda *_a: None)
             work = [dict(it) for it in items]
             seen, passes, clean, reason = {}, 0, False, "no_progress"
+            # Warnings ThoughtSpot accepted, kept apart from the issues to resolve.
+            accepted_warnings = {}
             SAFETY = 40   # backstop only; real termination is clean / no-progress
             while passes < SAFETY:
                 passes += 1
@@ -2243,11 +2246,20 @@ elif step == 3:
                     reason = "request_failed"
                     break
                 _log_validate(files, results)
-                errs = [r for r in results if r["status"] != "OK"]
+                # WARNING is not a failure. ThoughtSpot returns it to acknowledge something it
+                # accepted — most often "DataType is being changed", which is a realign working as
+                # asked. Treating it as an error meant a clean promotion reported issues and never
+                # converged, so warnings are collected and surfaced but never gate the loop.
+                errs = [r for r in results
+                        if (r.get("status") or "").upper() not in ("OK", "WARNING")]
+                _warn_found = warnings_only(classify_import_errors(
+                    [r for r in results if (r.get("status") or "").upper() == "WARNING"]))
+                for _wf in _warn_found:
+                    accepted_warnings.setdefault(finding_key(_wf), _wf)
                 if not errs:
                     clean = True; reason = "clean"
                     break
-                found = classify_import_errors(errs)
+                found = blocking(classify_import_errors(errs))
                 opaque = bool(found) and all(f["kind"] == "other" for f in found)
                 # STATIC detectors first — no server calls. These explain most "opaque" failures:
                 # dangling [formula_<name>] refs, and tables emptied/disconnected by earlier drops.
@@ -2271,7 +2283,14 @@ elif step == 3:
                             _f["object"] = _r["name"]
                             _itemized.append(_f)
                     if _itemized:
-                        found = _itemized
+                        # ADD the per-file attributions; do not replace. An error that does not
+                        # reproduce when files are validated one at a time — a cross-object
+                        # permission failure, say — has no per-file counterpart, and replacing the
+                        # list dropped it off the screen entirely. GSK 2026-09-15: the real blocker
+                        # (AUTHORIZATION_FAILURE on a target logical table) vanished this way,
+                        # leaving only two harmless warnings and a count of "2 issues".
+                        _ik = {finding_key(x) for x in _itemized}
+                        found = _itemized + [f for f in found if finding_key(f) not in _ik]
                 else:
                     # Named errors present — merge static findings alongside them (additively).
                     _fk = {finding_key(x) for x in found}
@@ -2341,7 +2360,8 @@ elif step == 3:
                 if removed == 0:
                     reason = "no_progress"
                     break   # nothing could be neutralized -> no progress, stop
-            return list(seen.values()), clean, passes, reason
+            return (list(seen.values()), clean, passes, reason,
+                    list(accepted_warnings.values()))
 
         def _isolate_failures(items, progress=None):
             """Attribute an opaque/unnamed validation error (e.g. bare 'Schema validation failed')
@@ -2407,7 +2427,8 @@ elif step == 3:
                         _bar.progress(min(max(float(frac), 0.0), 1.0), text=msg)
                     except Exception:
                         pass
-            _found, _clean, _passes, _reason = _discover_all_issues(items, progress=_prog)
+            (_found, _clean, _passes, _reason,
+             _accepted) = _discover_all_issues(items, progress=_prog)
             try:
                 _bar.empty()
             except Exception:
@@ -2417,7 +2438,9 @@ elif step == 3:
                                   state="error", expanded=False)
                 return
             st.session_state.discovered_findings = _found
-            st.session_state.discovered_meta = {"clean": _clean, "passes": _passes, "reason": _reason}
+            st.session_state.discovered_meta = {"clean": _clean, "passes": _passes,
+                                                "reason": _reason}
+            st.session_state.accepted_warnings = _accepted
             if _found:
                 if not st.session_state.get("validation_errors"):
                     st.session_state.validation_errors = [{"name": "(probe)", "status": "ERROR", "error": ""}]
@@ -2645,14 +2668,19 @@ elif step == 3:
             _rtail = {"clean": " · validated clean",
                       "no_progress": " · stopped before clean (remaining errors can't be auto-resolved)",
                       "request_failed": " · stopped: connection to the target failed — warm the warehouse and retry"}
-            st.caption(f"Validation: {len(st.session_state.get('discovered_findings', []))} issue(s) "
-                       f"over {_dm['passes']} pass(es)" + _rtail.get(_dm.get("reason", ""), ""))
+            _n_block = len(blocking(st.session_state.get("discovered_findings", [])))
+            _n_warn  = len(st.session_state.get("accepted_warnings") or [])
+            st.caption(f"Validation: {_n_block} issue(s)"
+                       + (f" · {_n_warn} accepted with a warning" if _n_warn else "")
+                       + f" over {_dm['passes']} pass(es)"
+                       + _rtail.get(_dm.get("reason", ""), ""))
 
         # Raw validation run log — so consecutive runs are diffable (which files were validated,
         # each file's status/error). Full history appended to logs/validate_runs.jsonl.
         _lv = st.session_state.get("_last_validate")
         if _lv:
-            _n_err = sum(1 for r in _lv["results"] if r["status"] != "OK")
+            _n_err = sum(1 for r in _lv["results"]
+                         if (r.get("status") or "").upper() not in ("OK", "WARNING"))
             with st.expander(f"Validation run log — {len(_lv['results'])} file(s), {_n_err} error(s) "
                              f"· {_lv['ts']}  (full history in logs/validate_runs.jsonl)"):
                 import pandas as pd
@@ -2668,7 +2696,18 @@ elif step == 3:
         # single "Apply all" (no per-section re-validate round-trips).
         _discovered = bool(st.session_state.get("discovered_findings"))
         if val_errors or _discovered:
-            findings     = st.session_state.get("discovered_findings") or classify_import_errors(val_errors)
+            _all_found   = (st.session_state.get("discovered_findings")
+                            or classify_import_errors(val_errors))
+            # Split severities BEFORE anything counts, drops or gates on them. A WARNING from
+            # ThoughtSpot is an acknowledgement (a realign it applied), not work to do.
+            findings     = blocking(_all_found)
+            accepted     = (warnings_only(_all_found)
+                            + list(st.session_state.get("accepted_warnings") or []))
+            _acc_seen, _acc = set(), []
+            for _f in accepted:
+                if finding_key(_f) not in _acc_seen:
+                    _acc_seen.add(finding_key(_f)); _acc.append(_f)
+            accepted = _acc
             wh_missing   = [f for f in findings if f["kind"] == "missing_in_target_warehouse"]
             dep_blocked  = [f for f in findings if f["kind"] == "drop_blocked_by_dependents"]
             type_mismatch = [f for f in findings if f["kind"] == "type_mismatch"]
@@ -2686,7 +2725,16 @@ elif step == 3:
                 if finding_key(_f) not in _nc_seen:
                     findings.append(_f); _nc_seen.add(finding_key(_f))
             bare_tables  = [f for f in findings if f["kind"] == "model_table_no_columns"]
-            other        = [f for f in findings if f["kind"] == "other"]
+            # Catch-all by CONSTRUCTION, not by enumeration: anything this page does not render in
+            # its own section above falls through to "Other validation errors" below. A new finding
+            # kind can then never silently vanish from the screen just because nobody added a
+            # section for it — which is a worse failure than showing it raw.
+            _handled_kinds = {
+                "missing_in_target_warehouse", "drop_blocked_by_dependents", "type_mismatch",
+                "invalid_formula_ids", "dangling_ref", "drop_table", "join_unresolved",
+                "model_column_unresolved", "formula_broken_ref", "model_table_no_columns",
+            }
+            other        = [f for f in findings if f["kind"] not in _handled_kinds]
 
             # VALIDATE_ONLY reports only the FIRST missing column per table, so the reviewer
             # otherwise fixes them one-per-round. Diff every promoted table against the TARGET
@@ -2725,11 +2773,37 @@ elif step == 3:
                 f["object"] = _resolve_finding_table(f)
 
             _unverified = sum(1 for f in wh_missing if not f.get("verified"))
-            _issue_msg = f"Validation found {len(findings)} issue(s) to resolve before import."
-            if _unverified:
-                _issue_msg += (f"  {_unverified} column(s) below could not be checked against the "
-                               "warehouse (marked ⚠︎ unverified).")
-            st.error(_issue_msg)
+            if findings:
+                _issue_msg = f"Validation found {len(findings)} issue(s) to resolve before import."
+                if _unverified:
+                    _issue_msg += (f"  {_unverified} column(s) below could not be checked against the "
+                                   "warehouse (marked ⚠︎ unverified).")
+                st.error(_issue_msg)
+            elif accepted:
+                st.success(f"Nothing to resolve. ThoughtSpot accepted the promotion with "
+                           f"{len(accepted)} warning(s), listed below.")
+
+            # ── accepted with a warning: applied by the platform, no action required ──
+            if accepted:
+                _tc = [f for f in accepted if f["kind"] == "type_changed_notice"]
+                with st.expander(f"Accepted with a warning — {len(accepted)} item(s), no action "
+                                 f"needed", expanded=not findings):
+                    if _tc:
+                        st.caption("ThoughtSpot is confirming a data type change it applied — this "
+                                   "is a realignment doing its job. Worth a look only because "
+                                   "existing answers or liveboards built on the column may be "
+                                   "affected on the target.")
+                        import pandas as pd
+                        st.dataframe(_sno(pd.DataFrame(
+                            [{"Table": f.get("object") or "(not named)",
+                              "Column": f.get("column", ""),
+                              "Note": "data type changed"} for f in _tc])),
+                            use_container_width=True, hide_index=True)
+                    for f in accepted:
+                        if f["kind"] == "type_changed_notice":
+                            continue
+                        st.markdown(f"**{f.get('object') or '(not named)'}** — "
+                                    f"{friendly_error(f.get('error', ''))[0] or f.get('error', '')}")
 
             # Casing diagnostic: if a column is flagged as "missing from warehouse", it usually
             # means the connection-based recasing did not resolve that table. Show what happened.

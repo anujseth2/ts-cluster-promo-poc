@@ -370,6 +370,43 @@ def test_warehouse_type_findings_one_pass():
     assert all(f["kind"] == "type_mismatch" and f["source_type"] for f in found)
 
 
+def test_warning_status_is_not_an_issue_to_resolve():
+    # GSK 2026-09-15. Realigning CALLS and primary_target made ThoughtSpot return status WARNING
+    # with "DataType is being changed ..." — the platform CONFIRMING the realign it applied. Every
+    # non-OK status counted as an error, so a promotion with nothing wrong reported "2 issue(s) to
+    # resolve before import" and the probe never converged.
+    from services.import_diagnostics import classify_import_errors, blocking, warnings_only
+    res = [{"name": "fact_subnational_respbio_br", "type": "LOGICAL_TABLE", "status": "WARNING",
+            "error": "DataType is being changed for column having name CALLS and "
+                     "db_column_name CALLS."},
+           {"name": "copd_targets_to_trelegy", "type": "LOGICAL_TABLE", "status": "WARNING",
+            "error": "DataType is being changed for column having name primary_target and "
+                     "db_column_name primary_target. This change may break the dependents "
+                     "models/worksheets, answers, etc of this column."},
+           {"name": "ok_table", "status": "OK", "error": ""}]
+    found = classify_import_errors(res)
+    assert blocking(found) == [], "a WARNING must never be an issue to resolve"
+    warns = warnings_only(found)
+    assert [f["kind"] for f in warns] == ["type_changed_notice"] * 2
+    assert sorted(f["column"] for f in warns) == ["CALLS", "primary_target"]
+    # and the table is named, so it is never an "unknown"
+    assert all(f["object"] and f["object"] != "unknown" for f in warns)
+
+
+def test_authorization_failure_names_the_object_not_the_connection():
+    # The hint used to send the operator to check the CONNECTION, which is not what the payload
+    # says. It names a pre-existing target LOGICAL_TABLE, and checking connection sharing finds
+    # nothing wrong — which is how this error survived two GSK sessions.
+    from services.import_diagnostics import friendly_error
+    msg = ('Unable to save worksheet. Error Code: AUTHORIZATION_FAILURE Incident Id: 8f74b135 '
+           'Error Message: No permission to update objects: {   "LOGICAL_TABLE": [     '
+           '"7c4f181a-1b69-4de2-a73b-766aa0ff9a11"   ] } or to read child securable objects')
+    headline, action, _raw = friendly_error(msg)
+    assert "7c4f181a-1b69-4de2-a73b-766aa0ff9a11" in headline
+    assert "LOGICAL_TABLE" in headline
+    assert "not the connection" in action.lower()
+
+
 def test_pruning_a_table_takes_its_formula_column_with_it():
     # Found by the property suite (test_tml_properties.py), not in the field. drop_tables removed a
     # formula that referenced a pruned table, but left the model column that surfaced it, because it

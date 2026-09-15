@@ -73,6 +73,28 @@ _SCOPED_REF = re.compile(r"([A-Za-z0-9_\-. ]+?)\s*::\s*([A-Za-z0-9_\-. ]+)")
 # joins between facts.
 _NO_COLS_SELECTED = re.compile(
     r"tables have been added to the model without selecting any of their columns(.*)$", re.I | re.S)
+# "DataType is being changed for column having name CALLS and db_column_name CALLS. This change may
+#  break the dependents models/worksheets, answers, etc of this column."
+# ThoughtSpot returns this with status WARNING, not ERROR. It is the platform CONFIRMING a type
+# realignment and noting that dependents may be affected — i.e. the realign worked. It is not a
+# problem to resolve, and counting it as one reported a successful promotion as "2 issues".
+_TYPE_CHANGING = re.compile(
+    r"DataType is being changed for column having name\s+(.+?)\s+and db_column_name\s+([^.]+?)\s*\.",
+    re.I)
+# "Error: Tables do not exist. <br/>- <b>fact_x</b><br/><br/>- <b>dim_y</b>"
+_TABLES_MISSING = re.compile(r"Tables do not exist\.?(.*)$", re.I | re.S)
+# "Attempting to create a table with 0 columns. Not allowed."
+_ZERO_COLUMNS = re.compile(r"Attempting to create a table with 0 columns", re.I)
+# "Data type bigint is not valid for column having name HCP_ID and db_column_name HCP_ID."
+# The TML carries a RAW WAREHOUSE type where a TS token belongs. This is the failure mode a realign
+# causes if it ever writes 'bigint' instead of 'INT64', so it is worth naming loudly rather than
+# leaving as an opaque "other" — it points at our own output, not the customer's warehouse.
+_BAD_TYPE_TOKEN = re.compile(
+    r"Data type\s+(\S+?)\s+is not valid for column having name\s+(.+?)\s+and db_column_name"
+    r"\s+([^.]+?)\s*\.", re.I)
+# AUTHORIZATION_FAILURE payload: names the pre-existing target objects the account may not update.
+_AUTHZ_OBJECTS = re.compile(
+    r"AUTHORIZATION_FAILURE.*?No permission to update objects\s*:\s*(\{.*?\})", re.I | re.S)
 
 
 def _clean(msg: str) -> str:
@@ -93,6 +115,24 @@ def _clean(msg: str) -> str:
 
 # Plain-language translations for the error shapes ThoughtSpot returns verbatim. Each entry:
 # (compiled pattern, lambda match -> (headline, what_to_do)). First match wins.
+def _guids_by_type(blob):
+    """{"LOGICAL_TABLE": "<guid>, <guid>"} from the JSON-ish object ThoughtSpot embeds in an
+    AUTHORIZATION_FAILURE payload. Falls back to a regex scrape when it isn't valid JSON."""
+    try:
+        d = json.loads(blob)
+        if isinstance(d, dict):
+            return {str(k): ", ".join(str(x) for x in (v if isinstance(v, list) else [v]))
+                    for k, v in d.items() if v}
+    except Exception:
+        pass
+    out = {}
+    for typ, ids in re.findall(r'"([A-Z_]+)"\s*:\s*\[([^\]]*)\]', blob or ""):
+        g = re.findall(r'"([^"]+)"', ids)
+        if g:
+            out[typ] = ", ".join(g)
+    return out
+
+
 _ERROR_RULES = [
     (re.compile(r"free trial has ended|warehouses? (?:have|has) been suspended|CONNECTION_CREATION_ERROR", re.I),
      lambda m: ("The target warehouse can't be reached — it looks paused or suspended "
@@ -103,6 +143,19 @@ _ERROR_RULES = [
      lambda m: ("ThoughtSpot couldn't read the connection's metadata.",
                 "Usually the warehouse is asleep/suspended or the connection lost its credential — "
                 "wake the warehouse or re-test the connection, then re-run.")),
+    # Object-level denial: the payload NAMES the objects, so say which ones. This must sit ahead of
+    # the generic permission rule below, which used to answer it by pointing at the CONNECTION — the
+    # wrong object, so the operator checks the wrong permission and finds nothing wrong (GSK, twice).
+    (re.compile(r"AUTHORIZATION_FAILURE.*?No permission to update objects\s*:\s*(\{.*?\})",
+                re.I | re.S),
+     lambda m: ("No permission to UPDATE an object that already exists on the target: "
+                + ", ".join(f"{k} {v}" for k, v in sorted(_guids_by_type(m.group(1)).items()))
+                + ".",
+                "This is not the connection and not the warehouse — it is object-level sharing on "
+                "the target. The promoting account needs edit/MODIFY on the object(s) above (and "
+                "read on their columns), or DATAMANAGEMENT to update objects it does not own. The "
+                "guid is a PRE-EXISTING target object your model depends on, not one being "
+                "promoted — look it up on the target and share it, then re-run.")),
     (re.compile(r"10086|not authorized|permission|privilege|access denied", re.I),
      lambda m: ("Permission problem talking to the connection.",
                 "The account running the promotion needs access to the connection "
@@ -150,8 +203,15 @@ def classify_import_errors(results):
     """
     findings = []
     for r in results:
-        if (r.get("status") or "").upper() == "OK":
+        _status = (r.get("status") or "").upper()
+        if _status == "OK":
             continue
+        # WARNING is not a blocker. ThoughtSpot uses it to acknowledge something it accepted (a type
+        # realignment, say) while flagging a consequence. Every finding from this result carries the
+        # severity, so callers can report warnings without counting them as issues or feeding them
+        # into the auto-resolve loop.
+        _sev = "warning" if _status == "WARNING" else "error"
+        _start = len(findings)
         msg = r.get("error") or ""
         matched = False
         for col_fqn, conn in _MISSING_WH.findall(msg):
@@ -260,9 +320,54 @@ def classify_import_errors(results):
                                       msg, re.I) if t.strip()})
             findings.append({"kind": "join_unresolved", "object": r.get("name"),
                              "tables": tbls, "error": msg.strip()})
+        for _nm, _dbn in _TYPE_CHANGING.findall(msg):
+            matched = True
+            findings.append({"kind": "type_changed_notice", "object": r.get("name"),
+                             "column": _dbn.strip() or _nm.strip(),
+                             "logical_name": _nm.strip(), "error": msg.strip()})
+        for _bad, _nm, _dbn in _BAD_TYPE_TOKEN.findall(msg):
+            matched = True
+            # OUR bug shape, not the customer's: a raw warehouse type reached the TML where a TS
+            # token belongs. warehouse_type_to_ts exists to prevent exactly this.
+            findings.append({"kind": "invalid_type_token", "object": r.get("name"),
+                             "column": _dbn.strip() or _nm.strip(), "bad_type": _bad.strip(),
+                             "suggested": warehouse_type_to_ts(_bad.strip()),
+                             "error": msg.strip()})
+        _tm = _TABLES_MISSING.search(msg)
+        if _tm:
+            matched = True
+            _tbls = [b.strip() for b in _BOLD.findall(_tm.group(1)) if b.strip()]
+            findings.append({"kind": "table_missing_on_target", "object": r.get("name"),
+                             "tables": _tbls, "error": msg.strip()})
+        if _ZERO_COLUMNS.search(msg):
+            matched = True
+            # ThoughtSpot does not name the table; table_cleanup_findings() does, from the TML.
+            findings.append({"kind": "table_zero_columns", "object": r.get("name"),
+                             "error": msg.strip()})
+        _az = _AUTHZ_OBJECTS.search(msg)
+        if _az:
+            matched = True
+            _by_type = _guids_by_type(_az.group(1))
+            findings.append({"kind": "target_permission_denied", "object": r.get("name"),
+                             "objects": _by_type,
+                             "guids": [g.strip() for v in _by_type.values()
+                                       for g in v.split(",") if g.strip()],
+                             "error": msg.strip()})
         if not matched:
             findings.append({"kind": "other", "object": r.get("name"), "error": msg.strip()})
+        for _f in findings[_start:]:
+            _f.setdefault("severity", _sev)
     return findings
+
+
+def blocking(findings):
+    """Only the findings that must be resolved before import. A warning is information, not work."""
+    return [f for f in (findings or []) if f.get("severity", "error") != "warning"]
+
+
+def warnings_only(findings):
+    """The findings ThoughtSpot accepted but wants the operator to know about."""
+    return [f for f in (findings or []) if f.get("severity") == "warning"]
 
 
 def finding_key(f):
@@ -284,6 +389,12 @@ def finding_key(f):
                 (f.get("missing_ref") or "").strip().lower())
     if k == "model_table_no_columns":
         return (k, obj, tuple(sorted((t or "").lower() for t in f.get("tables", []))))
+    if k in ("type_changed_notice", "invalid_type_token"):
+        return (k, obj, (f.get("column") or "").strip().lower())
+    if k == "table_missing_on_target":
+        return (k, obj, tuple(sorted((t or "").lower() for t in f.get("tables", []))))
+    if k == "target_permission_denied":
+        return (k, obj, tuple(sorted((g or "").lower() for g in f.get("guids", []))))
     if k == "dangling_ref":
         return (k, obj, (f.get("name") or "").strip().lower())
     if k == "drop_table":
