@@ -2103,15 +2103,25 @@ elif step == 3:
             if t and t.get("name"):
                 _tbl_cols[t["name"]] = _display_cols(t)
         if _tbl_cols:
-            st.markdown("**Skip specific columns** — leave a column out, keep the rest (optional). "
-                        "Tables start collapsed; expand one to tick its columns.")
             _skip_sel = st.session_state.setdefault("skip_selected", set())
             _skgen = st.session_state.get("_skip_gen", 0)                  # bump = reset all editors
-            _skq = st.text_input("Filter columns to skip", key="skip_search",
-                                 label_visibility="collapsed",
-                                 placeholder="🔎 Filter by table or column name").strip().lower()
-            _any_shown = False
-            for _tn in sorted(_tbl_cols, key=lambda n: _tbl_serial.get(n.strip().lower(), 1e9)):
+            # The WHOLE section collapses, not just each table — 25+ tables otherwise push the
+            # buttons below it off the page. Same checkbox-as-disclosure device as the per-table
+            # headers: left-aligned natively (a button label is centred and resists restyling) and
+            # its own key holds the open/closed state across the reruns that ticking causes, so it
+            # never snaps shut mid-selection the way an expander's `expanded` argument does.
+            _sec_hdr = (f"**Skip specific columns**  ·  {len(_tbl_cols)} table(s)"
+                        + (f"  ·  {len(_skip_sel)} ticked" if _skip_sel else ""))
+            _sec_open = st.checkbox(_sec_hdr, key="skipsec_open")
+            st.caption("Leave a column out and keep the rest (optional). Expand a table to tick "
+                       "its columns.")
+            _skq, _any_shown = "", False
+            if _sec_open:
+                _skq = st.text_input("Filter columns to skip", key="skip_search",
+                                     label_visibility="collapsed",
+                                     placeholder="🔎 Filter by table or column name").strip().lower()
+            for _tn in (sorted(_tbl_cols, key=lambda n: _tbl_serial.get(n.strip().lower(), 1e9))
+                        if _sec_open else []):
                 _tn_l = _tn.strip().lower()
                 _cols = [c for c in sorted(_tbl_cols[_tn])
                          if (not _skq) or (_skq in _tn_l) or (_skq in c.lower())]
@@ -2144,16 +2154,21 @@ elif step == 3:
                                         help="Leave this column out of the promotion (and any viz using it)."),
                         },
                         disabled=["Column"])
-            if not _any_shown:
+            if _sec_open and not _any_shown:
                 st.caption("No columns match the filter.")
-            _skf1, _skf2, _ = st.columns([1.4, 1, 3])
-            with _skf1:
-                _apply_skip = st.button(f"Apply column skips ({len(_skip_sel)})", key="skip_apply_cols",
-                                        disabled=not _skip_sel, use_container_width=True)
-            with _skf2:
-                if st.button("Clear all", key="skip_clear", disabled=not _skip_sel,
-                             use_container_width=True):
-                    _skip_sel.clear(); st.session_state._skip_gen = _skgen + 1; st.rerun()
+            # Apply/Clear stay reachable whenever something is ticked, even with the section shut —
+            # collapsing must never strand a selection the operator has already made.
+            _apply_skip = False
+            if _sec_open or _skip_sel:
+                _skf1, _skf2, _ = st.columns([1.4, 1, 3])
+                with _skf1:
+                    _apply_skip = st.button(f"Apply column skips ({len(_skip_sel)})",
+                                            key="skip_apply_cols",
+                                            disabled=not _skip_sel, use_container_width=True)
+                with _skf2:
+                    if st.button("Clear all", key="skip_clear", disabled=not _skip_sel,
+                                 use_container_width=True):
+                        _skip_sel.clear(); st.session_state._skip_gen = _skgen + 1; st.rerun()
             if _apply_skip and _skip_sel:
                 _sdrop = set(_skip_sel)
                 _fixed, _sman = drop_columns(st.session_state.transformed_items, _sdrop)
