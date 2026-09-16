@@ -95,6 +95,14 @@ _BAD_TYPE_TOKEN = re.compile(
 # AUTHORIZATION_FAILURE payload: names the pre-existing target objects the account may not update.
 _AUTHZ_OBJECTS = re.compile(
     r"AUTHORIZATION_FAILURE.*?No permission to update objects\s*:\s*(\{.*?\})", re.I | re.S)
+# "Model/Worksheet columns have invalid properties.<br/><ul><li><b>tbl::DAY_DATE_FIELD</b>
+#  <ul><li>calendar</li></ul></li></ul>SOLUTION: ..."
+# A model column carries a property the target can't honour — a named CALENDAR being the case seen
+# at GSK, where the custom calendar exists on the source cluster but not on the target. The body
+# names the column AND the offending property; matching only the stable leading sentence keeps this
+# working regardless of how the trailing SOLUTION text is worded.
+_INVALID_COL_PROPS = re.compile(
+    r"Model/Worksheet columns have invalid properties\.?(.*)$", re.I | re.S)
 
 
 def _clean(msg: str) -> str:
@@ -108,7 +116,9 @@ def _clean(msg: str) -> str:
         s = s.replace(br, "\n")
     for drop in ("<ul>", "<ol>"):
         s = s.replace(drop, "")
-    s = s.replace("<li>", "- ")
+    # A list item always STARTS a line. Without the newline a nested <ul><li> ran onto the end of
+    # its parent item ("tbl::DAY_DATE_FIELD**- calendar"), which both parsed wrong and read wrong.
+    s = s.replace("<li>", "\n- ")
     s = s.replace("<b>", "**").replace("</b>", "**")
     return "\n".join(ln.rstrip() for ln in s.split("\n")).strip()
 
@@ -156,6 +166,12 @@ _ERROR_RULES = [
                 "read on their columns), or DATAMANAGEMENT to update objects it does not own. The "
                 "guid is a PRE-EXISTING target object your model depends on, not one being "
                 "promoted — look it up on the target and share it, then re-run.")),
+    (re.compile(r"Model/Worksheet columns have invalid properties", re.I),
+     lambda m: ("A model column carries a property the target cluster doesn't have.",
+                "Most often a named CALENDAR that exists on the source but was never created on "
+                "the target. Create the calendar on the target (Data > Calendars) to keep the "
+                "column's behaviour, or remove the property from the column and re-run. The "
+                "column and the property are named above.")),
     (re.compile(r"10086|not authorized|permission|privilege|access denied", re.I),
      lambda m: ("Permission problem talking to the connection.",
                 "The account running the promotion needs access to the connection "
@@ -344,6 +360,22 @@ def classify_import_errors(results):
             # ThoughtSpot does not name the table; table_cleanup_findings() does, from the TML.
             findings.append({"kind": "table_zero_columns", "object": r.get("name"),
                              "error": msg.strip()})
+        _ip = _INVALID_COL_PROPS.search(msg)
+        if _ip:
+            matched = True
+            _body = _clean(_ip.group(1)).split("SOLUTION")[0]
+            _cols, _props = [], []
+            for _ln in (l.strip().lstrip("- ").strip() for l in _body.split("\n")):
+                _ln = _ln.strip("*").strip()
+                if not _ln:
+                    continue
+                if "::" in _ln:
+                    _cols.append(_ln)
+                else:
+                    _props.append(_ln)
+            findings.append({"kind": "invalid_column_property", "object": r.get("name"),
+                             "columns": _cols, "properties": sorted(set(_props)),
+                             "error": msg.strip()})
         _az = _AUTHZ_OBJECTS.search(msg)
         if _az:
             matched = True
@@ -358,6 +390,17 @@ def classify_import_errors(results):
         for _f in findings[_start:]:
             _f.setdefault("severity", _sev)
     return findings
+
+
+def is_blocking_result(r):
+    """True when a VALIDATE_ONLY result must be resolved before import.
+
+    OK passes. WARNING is ThoughtSpot ACKNOWLEDGING something it accepted (a data type it changed,
+    say) — not work to do. Every place that splits results has to agree on this, or warnings leak
+    back in as errors through whichever path forgot: the per-file isolation pass did exactly that
+    and re-labelled them "ERROR", so two accepted realignments were counted as issues AND kept the
+    model isolation from ever running on the real failure."""
+    return (r.get("status") or "").upper() not in ("OK", "WARNING")
 
 
 def blocking(findings):
@@ -393,6 +436,8 @@ def finding_key(f):
         return (k, obj, (f.get("column") or "").strip().lower())
     if k == "table_missing_on_target":
         return (k, obj, tuple(sorted((t or "").lower() for t in f.get("tables", []))))
+    if k == "invalid_column_property":
+        return (k, obj, tuple(sorted((c or "").lower() for c in f.get("columns", []))))
     if k == "target_permission_denied":
         return (k, obj, tuple(sorted((g or "").lower() for g in f.get("guids", []))))
     if k == "dangling_ref":

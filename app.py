@@ -29,7 +29,7 @@ from services.import_diagnostics import (
     column_drop_cascade, finding_key, dangling_reference_findings, table_cleanup_findings,
     realign_column_types, warehouse_type_to_ts, warehouse_type_findings, type_family,
     recase_columns, model_tables_without_columns, prune_tables_whole,
-    blocking, warnings_only,
+    blocking, warnings_only, is_blocking_result,
 )
 from services.table_matcher import column_signature
 from services.feedback_replace import feedback_preview, replace_prep, replace_finalize
@@ -148,7 +148,7 @@ def _run_validation(items, step=None):
     results = target_client().import_tml(val_strings, policy="VALIDATE_ONLY")
     st.session_state._last_validate = _log_validate(files, results)
     ok  = [r for r in results if r["status"] == "OK"]
-    err = [r for r in results if r["status"] != "OK"]
+    err = [r for r in results if is_blocking_result(r)]
     return pr_url, err, ok
 
 
@@ -2212,7 +2212,7 @@ elif step == 3:
             # change?) — persisted to logs/validate_runs.jsonl and kept for the inline expander.
             st.session_state._last_validate = _log_validate(files, results)
             ok  = [r for r in results if r["status"] == "OK"]
-            err = [r for r in results if r["status"] != "OK"]
+            err = [r for r in results if is_blocking_result(r)]
             return None, err, ok
 
         def _discover_all_issues(items, progress=None):
@@ -2278,8 +2278,12 @@ elif step == 3:
                           f"{len(work)} file(s), one at a time…", 0.60)
                     _itemized = []
                     for _r in _isolate_failures(work, progress=lambda _m: _tick(f"Pass {passes} · {_m}", 0.65)):
+                        # Carry the REAL status. Hardcoding "ERROR" here turned every accepted
+                        # warning the per-file pass saw back into a blocking issue.
                         for _f in classify_import_errors(
-                                [{"name": _r["name"], "status": "ERROR", "error": _r["error"]}]):
+                                [{"name": _r["name"],
+                                  "status": _r.get("status") or "ERROR",
+                                  "error": _r["error"]}]):
                             _f["object"] = _r["name"]
                             _itemized.append(_f)
                     if _itemized:
@@ -2390,9 +2394,10 @@ elif step == 3:
                 _tick(f"{i}/{total}: table `{nm}`…")
                 try:
                     res = target_client().import_tml(_strings([it]), policy="VALIDATE_ONLY")
-                    bad = [r for r in res if r["status"] != "OK"]
+                    bad = [r for r in res if is_blocking_result(r)]
                     if bad:
                         failures.append({"name": nm, "type": "table",
+                                         "status": bad[0].get("status") or "ERROR",
                                          "error": (bad[0].get("error") or "")[:800]})
                 except Exception as e:
                     failures.append({"name": nm, "type": "table", "error": f"request failed: {str(e)[:200]}"})
@@ -2405,9 +2410,10 @@ elif step == 3:
                     try:
                         res = target_client().import_tml(all_table_strings + _strings([it]),
                                                          policy="VALIDATE_ONLY")
-                        bad = [r for r in res if r["status"] != "OK"]
+                        bad = [r for r in res if is_blocking_result(r)]
                         if bad:
                             failures.append({"name": nm, "type": "model",
+                                             "status": bad[0].get("status") or "ERROR",
                                              "error": (bad[0].get("error") or "")[:800]})
                     except Exception as e:
                         failures.append({"name": nm, "type": "model", "error": f"request failed: {str(e)[:200]}"})
@@ -2733,6 +2739,7 @@ elif step == 3:
                 "missing_in_target_warehouse", "drop_blocked_by_dependents", "type_mismatch",
                 "invalid_formula_ids", "dangling_ref", "drop_table", "join_unresolved",
                 "model_column_unresolved", "formula_broken_ref", "model_table_no_columns",
+                "invalid_column_property",
             }
             other        = [f for f in findings if f["kind"] not in _handled_kinds]
 
@@ -3403,6 +3410,19 @@ elif step == 3:
                 for _f in sorted(bare_tables, key=lambda x: (x.get("model") or "").lower()):
                     _tl = ", ".join(f"`{t}`" for t in (_f.get("tables") or [])) or "(not named)"
                     st.warning(f"**{_f.get('model') or _f.get('object')}** — {_tl}")
+
+            # ── model columns carrying a property the target doesn't have (e.g. a calendar) ──
+            _bad_props = [f for f in findings if f["kind"] == "invalid_column_property"]
+            if _bad_props:
+                st.markdown("#### Model columns with a property the target doesn't have")
+                st.caption("The property exists on the source cluster but not on the target — a "
+                           "named calendar is the usual case. Create it on the target to keep the "
+                           "column behaving the same way, or remove the property from the column. "
+                           "Nothing here is dropped for you: the column itself is fine.")
+                for _f in _bad_props:
+                    _pl = ", ".join(f"`{p}`" for p in (_f.get("properties") or [])) or "(not named)"
+                    for _c in (_f.get("columns") or ["(column not named)"]):
+                        st.warning(f"**{_c}** — missing on target: {_pl}")
 
             # ── anything unrecognised ──
             if other:

@@ -370,6 +370,48 @@ def test_warehouse_type_findings_one_pass():
     assert all(f["kind"] == "type_mismatch" and f["source_type"] for f in found)
 
 
+def test_isolation_pass_does_not_relabel_warnings_as_errors():
+    # GSK 2026-09-16. Validating each file alone surfaces that file's WARNING too. The isolation
+    # pass collected any non-OK result as a "failure" and then classified it with a hardcoded
+    # status of ERROR, so two accepted realignments came back as blocking issues — counted twice,
+    # once under "Accepted with a warning" and again under "Other validation errors".
+    from services.import_diagnostics import is_blocking_result, classify_import_errors, blocking
+    per_file = [{"name": "fact_subnational_respbio_br", "status": "WARNING",
+                 "error": "DataType is being changed for column having name CALLS and "
+                          "db_column_name CALLS."},
+                {"name": "some_model", "status": "ERROR", "error": "Schema validation failed."}]
+    # only the real error counts as a file failure ...
+    assert [r["name"] for r in per_file if is_blocking_result(r)] == ["some_model"]
+    # ... and carrying the real status through keeps the warning non-blocking
+    assert blocking(classify_import_errors(
+        [{"name": r["name"], "status": r.get("status") or "ERROR",
+          "error": r["error"]} for r in per_file if is_blocking_result(r)])) != []
+    assert blocking(classify_import_errors(per_file[:1])) == []
+
+
+def test_invalid_column_property_names_the_column_and_the_property():
+    # GSK 2026-09-16: "Model/Worksheet columns have invalid properties" rendered as "unknown" with
+    # the column buried in list markup. The body names both halves, so both must come out.
+    from services.import_diagnostics import classify_import_errors, friendly_error
+    msg = ("Model/Worksheet columns have invalid properties.<br/><ul><li><b>"
+           "fact_subnational_day_bridge_respbio_br::DAY_DATE_FIELD</b>"
+           "<ul><li>calendar</li></ul></li></ul>SOLUTION: create it or remove the property.")
+    found = classify_import_errors([{"name": "unknown", "status": "ERROR", "error": msg}])
+    assert [f["kind"] for f in found] == ["invalid_column_property"]
+    assert found[0]["columns"] == ["fact_subnational_day_bridge_respbio_br::DAY_DATE_FIELD"]
+    assert found[0]["properties"] == ["calendar"]
+    assert "calendar" in friendly_error(msg)[1].lower()
+
+
+def test_nested_list_markup_does_not_run_onto_one_line():
+    # <li> always starts a line. Otherwise a nested item joins its parent
+    # ("...DAY_DATE_FIELD**- calendar"), which parses wrong and reads wrong on screen.
+    from services.import_diagnostics import _clean
+    out = _clean("<ul><li><b>parent</b><ul><li>child</li></ul></li></ul>")
+    lines = [l.strip() for l in out.split("\n") if l.strip()]
+    assert lines == ["- **parent**", "- child"]
+
+
 def test_warning_status_is_not_an_issue_to_resolve():
     # GSK 2026-09-15. Realigning CALLS and primary_target made ThoughtSpot return status WARNING
     # with "DataType is being changed ..." — the platform CONFIRMING the realign it applied. Every
