@@ -1341,6 +1341,62 @@ def drop_column_properties(items, targets):
     return out, removed
 
 
+def restore_unneeded_type_changes(items, source_items):
+    """Put back any declared type this tool changed that did not need changing.
+
+    Compares the bundle against the RAW SOURCE TML. A column whose type differs from the source
+    but stays in the same storage CLASS (int / float / str / bool / date) was rewritten for no
+    reason the platform cares about — INT64 to INT32 being the case that reached GSK — so the
+    source's own type is restored. A difference that crosses a class (VARCHAR to INT64) is a
+    deliberate realignment and is left alone.
+
+    This repairs the bundle IN PLACE. Pruning the approval map only stops future exports; the type
+    is already written into the items, and on the validation page there is no re-export to catch
+    it. Returns (new_items, [(table, column, from, to), …])."""
+    src = {}
+    for item in source_items or []:
+        try:
+            doc = _parse_edoc(item)
+        except Exception:
+            continue
+        t = doc.get("table")
+        if not (t and t.get("name")):
+            continue
+        tl = t["name"].strip().lower()
+        for c in t.get("columns") or []:
+            dt = (c.get("db_column_properties") or {}).get("data_type") or ""
+            for key in ((c.get("name") or "").strip().lower(),
+                        (c.get("db_column_name") or "").strip().lower()):
+                if key and dt:
+                    src[(tl, key)] = dt
+    if not src:
+        return items, []
+    restored, out = [], []
+    for item in items:
+        try:
+            doc = _parse_edoc(item)
+        except Exception:
+            out.append(item)
+            continue
+        t = doc.get("table")
+        touched = False
+        if t and t.get("name"):
+            tl = t["name"].strip().lower()
+            for c in t.get("columns") or []:
+                cur = (c.get("db_column_properties") or {}).get("data_type") or ""
+                want = (src.get((tl, (c.get("name") or "").strip().lower()))
+                        or src.get((tl, (c.get("db_column_name") or "").strip().lower())))
+                if not (cur and want) or cur.strip().upper() == want.strip().upper():
+                    continue
+                if type_class(cur) and type_class(cur) == type_class(want):
+                    c["db_column_properties"]["data_type"] = want
+                    restored.append((t["name"], c.get("db_column_name") or c.get("name"),
+                                     cur, want))
+                    touched = True
+        out.append({**item, "edoc": json.dumps(doc)} if touched else item)
+    return out, restored
+
+
 def prune_stale_realignments(items, realign):
     """Split a durable realign map into the entries that still change something and the ones that
     no longer do. Returns (kept, dropped) as {"table::col": type} dicts.

@@ -29,6 +29,7 @@ from services.import_diagnostics import (
     column_drop_cascade, finding_key, dangling_reference_findings, table_cleanup_findings,
     realign_column_types, warehouse_type_to_ts, warehouse_type_findings, type_family, type_class,
     recase_columns, model_tables_without_columns, prune_tables_whole, prune_stale_realignments,
+    restore_unneeded_type_changes,
     blocking, warnings_only, is_blocking_result, drop_column_properties,
 )
 from services.table_matcher import column_signature
@@ -2015,6 +2016,24 @@ elif step == 3:
 
     _prepare_bundle()
     selected_ids = st.session_state.get("selected_ids", [])
+
+    # SELF-HEAL the bundle in place, every time this page loads. _prepare_bundle only runs on a
+    # fresh export, so a type this tool rewrote under an older rule survives in the items and keeps
+    # producing "DataType is being changed" with no export to correct it. Comparing against the raw
+    # source TML restores anything changed without crossing a storage class; a genuine realignment
+    # (VARCHAR -> INT64) crosses one and is left alone.
+    _bundle = st.session_state.get("transformed_items")
+    if _bundle and st.session_state.get("_source_raw_items"):
+        _bundle, _restored = restore_unneeded_type_changes(
+            _bundle, st.session_state["_source_raw_items"])
+        if _restored:
+            st.session_state.transformed_items = _bundle
+            st.session_state.realign_types = prune_stale_realignments(
+                _bundle, st.session_state.get("realign_types") or {})[0]
+            st.info("Restored the source's own data type on **" + str(len(_restored)) +
+                    "** column(s) that had been retyped without needing it (integer width only): "
+                    + ", ".join(f"`{t}.{c}` {a}→{b}" for t, c, a, b in _restored[:6])
+                    + (", …" if len(_restored) > 6 else "") + ".")
 
     transformed_items = st.session_state.get("transformed_items")
     cm = st.session_state.get("conn_mismatch")

@@ -536,6 +536,31 @@ def test_within_family_type_drift_is_flagged_not_swallowed():
         assert found[0]["source_type"] == "DOUBLE"
 
 
+def test_bundle_self_heals_a_type_it_should_not_have_changed():
+    # 2026-09-17: CALLS was STILL being changed on 2c after the apply-step fix, because that fix
+    # only runs during a fresh export. The bundle in memory already carried the rewritten type and
+    # the validation page never re-exports, so nothing undid it. Repairing against the raw source
+    # TML fixes the items in place, which is the only thing that helps mid-session.
+    from services.import_diagnostics import restore_unneeded_type_changes
+    def _tbl(calls, hcp):
+        return {"edoc": json.dumps({"table": {"name": "fact_x", "columns": [
+            {"name": "Calls", "db_column_name": "CALLS",
+             "db_column_properties": {"data_type": calls}},
+            {"name": "Hcp Id", "db_column_name": "HCP_ID",
+             "db_column_properties": {"data_type": hcp}}]}})}
+    source = [_tbl("INT64", "VARCHAR")]
+    bundle = [_tbl("INT32", "INT64")]        # both were realigned under the old rule
+    out, restored = restore_unneeded_type_changes(bundle, source)
+    cols = {c["db_column_name"]: c["db_column_properties"]["data_type"]
+            for c in json.loads(out[0]["edoc"])["table"]["columns"]}
+    assert cols["CALLS"] == "INT64", "width-only rewrite must be reverted to the source type"
+    assert cols["HCP_ID"] == "INT64", "a cross-class realignment must survive"
+    assert restored == [("fact_x", "CALLS", "INT32", "INT64")]
+    # idempotent, and a clean bundle is left completely alone
+    assert restore_unneeded_type_changes(out, source)[1] == []
+    assert restore_unneeded_type_changes(source, source)[1] == []
+
+
 def test_a_realignment_that_changes_no_class_is_never_applied():
     # Anuj, 2026-09-17: "CALLS should not even appear in the list, this is a clear regression."
     # Not flagging it any more is not enough: an approval is DURABLE and is re-applied to every
