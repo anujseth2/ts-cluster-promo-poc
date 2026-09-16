@@ -2681,6 +2681,34 @@ elif step == 3:
                        + f" over {_dm['passes']} pass(es)"
                        + _rtail.get(_dm.get("reason", ""), ""))
 
+        # Type realignments are DURABLE: once approved they are re-applied to every export from
+        # then on. So a realignment approved under an older, stricter rule keeps rewriting the TML
+        # long after the tool stopped asking for it — which is why an integer-width change can
+        # still be in the bundle even though nothing flags it any more. Show what is active and
+        # give it an undo; a full Reset was previously the only way out.
+        _active_re = st.session_state.get("realign_types") or {}
+        if _active_re:
+            with st.expander(f"{len(_active_re)} type realignment(s) are applied to every export",
+                             expanded=False):
+                import pandas as pd
+                st.dataframe(_sno(pd.DataFrame(
+                    [{"Table": k.split("::")[0], "Column": k.split("::")[-1], "Realigned to": v}
+                     for k, v in sorted(_active_re.items())])),
+                    use_container_width=True, hide_index=True)
+                st.caption("These rewrite the column's declared type on every re-export. Clearing "
+                           "them restores the source TML's own types; you will be re-prompted for "
+                           "anything that genuinely still conflicts with the warehouse.")
+                if st.button("Clear all realignments and re-export", key="clear_realigns"):
+                    st.session_state.pop("realign_types", None)
+                    # Dropping the bundle is what forces a fresh export (_need_export is derived
+                    # from "transformed_items" not being present). The re-export re-applies the
+                    # skips and prunes, just without the realignments.
+                    st.session_state.pop("transformed_items", None)
+                    for _k in ("pr_url", "validation_errors", "validation_ok",
+                               "discovered_findings", "discovered_meta", "accepted_warnings"):
+                        st.session_state.pop(_k, None)
+                    st.rerun()
+
         # Raw validation run log — so consecutive runs are diffable (which files were validated,
         # each file's status/error). Full history appended to logs/validate_runs.jsonl.
         _lv = st.session_state.get("_last_validate")
@@ -3715,11 +3743,21 @@ elif step == 4:
         st.session_state._git_nochange = _nochange
 
         if _nochange:
-            st.info(f"**Nothing to commit.** All {len(_new_files)} promoted file(s) are already "
-                    "byte-identical on `main`, so no commit and no PR are needed. (An unchanged "
-                    "re-promotion is why earlier runs produced empty PRs.) If you *did* change "
-                    "something, it never reached the bundle — go back and check. You can still "
-                    "re-import to the target below.")
+            # Say WHEN they landed. "Nothing to commit" on its own reads like a failure, when the
+            # usual cause is simply that this same content was committed by an earlier run.
+            _when = ""
+            try:
+                _last = git_client()._repo.get_commits(sha="main")[0].commit.author.date
+                _when = f" `main` was last updated {_last:%Y-%m-%d %H:%M} UTC."
+            except Exception:
+                pass
+            st.success(f"**Already on `main` — nothing left to commit.** All {len(_new_files)} "
+                       f"promoted file(s) match `main` byte for byte, so a commit and PR would be "
+                       f"empty.{_when} Normally this means an earlier run today already committed "
+                       "this exact content. You can still re-import to the target below.")
+            st.caption("If you changed something and expected it here, the change never reached "
+                       "the bundle — go back a step and confirm it was applied and re-exported. "
+                       "(An unchanged re-promotion is also why earlier runs produced empty PRs.)")
         else:
             st.markdown(f"**{len(_added)} new · {len(_changed)} changed · {_unchanged} unchanged**")
             for _p in _added:
