@@ -2858,16 +2858,61 @@ elif step == 3:
                 with st.expander(f"Accepted with a warning — {len(accepted)} item(s), no action "
                                  f"needed", expanded=not findings):
                     if _tc:
-                        st.caption("ThoughtSpot is confirming a data type change it applied — this "
-                                   "is a realignment doing its job. Worth a look only because "
-                                   "existing answers or liveboards built on the column may be "
-                                   "affected on the target.")
+                        # Show the THREE types. "Why is the tool still changing this?" cannot be
+                        # answered by a note saying a change happened — it needs source vs what we
+                        # are shipping vs what the target holds today. Promoted == Source means the
+                        # tool changed nothing and the target is simply older (often because an
+                        # EARLIER run imported a realignment that is now being corrected back).
                         import pandas as pd
-                        st.dataframe(_sno(pd.DataFrame(
-                            [{"Table": f.get("object") or "(not named)",
-                              "Column": f.get("column", ""),
-                              "Note": "data type changed"} for f in _tc])),
-                            use_container_width=True, hide_index=True)
+                        _src_t = {}
+                        for _it in st.session_state.get("_source_raw_items", []):
+                            _d = _parse_edoc(_it.get("edoc", "{}")).get("table") or {}
+                            if _d.get("name"):
+                                for _c in _d.get("columns") or []:
+                                    _dt = (_c.get("db_column_properties") or {}).get("data_type", "")
+                                    for _k in ((_c.get("name") or "").lower(),
+                                               (_c.get("db_column_name") or "").lower()):
+                                        if _k:
+                                            _src_t[(_d["name"].lower(), _k)] = _dt
+                        _bun_t = {}
+                        for _it in st.session_state.get("transformed_items", []):
+                            _d = _parse_edoc(_it.get("edoc", "{}")).get("table") or {}
+                            if _d.get("name"):
+                                for _c in _d.get("columns") or []:
+                                    _dt = (_c.get("db_column_properties") or {}).get("data_type", "")
+                                    for _k in ((_c.get("name") or "").lower(),
+                                               (_c.get("db_column_name") or "").lower()):
+                                        if _k:
+                                            _bun_t[(_d["name"].lower(), _k)] = _dt
+                        _tgt_t = {}
+                        try:
+                            for _tn, _cm2 in _modeled_col_types(
+                                    sorted({f.get("object") for f in _tc if f.get("object")})).items():
+                                for _cl, _ty in (_cm2 or {}).items():
+                                    _tgt_t[(_tn.lower(), _cl.lower())] = _ty
+                        except Exception:
+                            pass
+                        _rows_tc = []
+                        for f in _tc:
+                            _k = ((f.get("object") or "").lower(), (f.get("column") or "").lower())
+                            _s, _b = _src_t.get(_k, ""), _bun_t.get(_k, "")
+                            _g = _tgt_t.get(_k, "")
+                            _who = ("this tool changed it" if _s and _b and _s != _b
+                                    else "not us — source and target differ" if _s and _b
+                                    else "couldn't read all three")
+                            _rows_tc.append({"Table": f.get("object") or "(not named)",
+                                             "Column": f.get("column", ""),
+                                             "Source TML": _s or "(?)",
+                                             "Promoted": _b or "(?)",
+                                             "Target today": _g or "(unread)",
+                                             "Who changed it": _who})
+                        st.caption("ThoughtSpot is confirming a data type change. **Promoted** is "
+                                   "what this run ships; if it equals **Source TML** the tool "
+                                   "changed nothing and the target is just older — commonly "
+                                   "because an earlier run imported a realignment that this run is "
+                                   "now correcting back. Landing it once clears the warning.")
+                        st.dataframe(_sno(pd.DataFrame(_rows_tc)),
+                                     use_container_width=True, hide_index=True)
                     for f in accepted:
                         if f["kind"] == "type_changed_notice":
                             continue
