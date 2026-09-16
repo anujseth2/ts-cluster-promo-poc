@@ -27,7 +27,7 @@ from services.import_diagnostics import (
     classify_import_errors, drop_columns, silent_drop_findings, column_dependents, column_usage,
     drop_vizzes, table_drop_preview, drop_tables, warehouse_missing_findings, friendly_error,
     column_drop_cascade, finding_key, dangling_reference_findings, table_cleanup_findings,
-    realign_column_types, warehouse_type_to_ts, warehouse_type_findings, type_family,
+    realign_column_types, warehouse_type_to_ts, warehouse_type_findings, type_family, type_class,
     recase_columns, model_tables_without_columns, prune_tables_whole,
     blocking, warnings_only, is_blocking_result, drop_column_properties,
 )
@@ -3100,14 +3100,16 @@ elif step == 3:
                             "_scoped":    _scoped,
                         })
                         continue
-                    # Quiet ONLY when the warehouse and the TML agree once the warehouse type is
-                    # normalised to its TS token (Databricks `int` == TML INT32) — that is the
-                    # INT-vs-INT32 false positive. Do NOT quiet on family: DOUBLE vs bigint are
-                    # both "num" and ThoughtSpot hard-fails them, which is how PATIENT_AGE blew up
-                    # a live demo with this table showing "empty". Unread/unmappable => still shown.
+                    # Quiet when the warehouse and the TML agree on storage CLASS. Integer width
+                    # (int vs bigint, INT32 vs INT64) is NOT drift: no run in the corpus has ever
+                    # hard-failed on it, and realigning it rewrites the customer's TML for nothing
+                    # while earning a "may break the dependents" warning. DOUBLE vs INT64 IS drift
+                    # (float vs int) — that is PATIENT_AGE, and it hard-fails.
+                    # Unread or unmappable on either side => still shown.
                     _cdw_cmp = tgt_t or src_cdw
-                    _cdw_tok = warehouse_type_to_ts(_cdw_cmp) if _cdw_cmp else ""
-                    if _cdw_tok and src_tml and _tnorm(_cdw_tok) == _tnorm(src_tml):
+                    _cc = type_class(_cdw_cmp) if _cdw_cmp else ""
+                    _tc = type_class(src_tml)
+                    if _cc and _tc and _cc == _tc:
                         _quiet_agree.append(_scoped)
                         continue
                     _agree = bool(src_cdw and tgt_t and _tnorm(src_cdw) == _tnorm(tgt_t))
@@ -4063,7 +4065,9 @@ elif step == 5:
             # inferred from the snapshot — so a rebuilt/relabeled object that is actually a single
             # object on the target is no longer false-flagged. Created vs updated still uses the
             # pre-import snapshot (reconcile can't distinguish those two on its own).
-            if row["status"] != "OK":
+            # A WARNING object DID land, so it still earns a change label (created / updated /
+            # present). Only a real failure has no landing to describe.
+            if is_blocking_result(row):
                 return ""
             if row["type"] == "Feedback":
                 return "synced"
@@ -4094,18 +4098,24 @@ elif step == 5:
         df["change"] = df.apply(_change, axis=1)
         df["detail"] = df.apply(_detail, axis=1)
         df["obj_id"] = df["name"].map(lambda n: detail_by_name.get(n, {}).get("obj_id", ""))
-        success    = df[df["status"] == "OK"]
-        failed     = df[df["status"] != "OK"]
+        # An import that landed with a WARNING LANDED. ThoughtSpot uses WARNING to acknowledge
+        # something it accepted, so counting it under "Failed" told the operator a successful
+        # promotion had failed objects in it.
+        _sev = df["status"].fillna("").str.upper()
+        success    = df[_sev.isin(["OK", "WARNING"])]
+        failed     = df[~_sev.isin(["OK", "WARNING"])]
+        warned     = df[_sev == "WARNING"]
 
         dup_ct = int((success["change"] == "⚠ DUPLICATE").sum()) if not success.empty else 0
         # From → To header: which cluster/team this promotion moved between.
         _src_h = opt_env("TS_SOURCE_HOST").replace("https://", "").rstrip("/") or "source"
         _tgt_h = opt_env("TS_TARGET_HOST").replace("https://", "").rstrip("/") or "target"
         st.markdown(f"Promoted **{len(df)}** object(s):  `{_src_h}`  →  `{_tgt_h}`  ·  team **{team_name}**")
-        col1, col2, col3 = st.columns(3)
+        col1, col2, col3, col4 = st.columns(4)
         col1.metric("Succeeded",  len(success))
         col2.metric("Failed",     len(failed))
-        col3.metric("Duplicates", dup_ct)
+        col3.metric("With a warning", len(warned))
+        col4.metric("Duplicates", dup_ct)
         # One roll-up line: how each succeeded object landed on the target + what kinds shifted.
         if not success.empty:
             _created = int((success["change"] == "created").sum())

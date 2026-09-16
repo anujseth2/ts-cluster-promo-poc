@@ -536,6 +536,40 @@ def test_within_family_type_drift_is_flagged_not_swallowed():
         assert found[0]["source_type"] == "DOUBLE"
 
 
+def test_integer_width_is_never_drift():
+    # Anuj, 2026-09-16: "why are CALLS and all other columns with INT to INT32 and INT64 being
+    # changed? I don't think that this change is required." He is right, and the corpus proves it:
+    # across ~2 months of real runs every hard 14536 was BOOL vs non-bool, VARCHAR vs number, or
+    # DOUBLE vs INT64. Not one was an integer WIDTH difference. Flagging those forced a realign the
+    # platform never asked for, rewrote the customer's TML, and earned a "may break the dependents"
+    # warning for nothing.
+    from services.import_diagnostics import warehouse_type_findings, type_class
+
+    def _doc(col, tml):
+        return {"table": {"name": "t", "columns": [
+            {"db_column_name": col, "db_column_properties": {"data_type": tml}}]}}
+
+    def _flags(col, tml, cdw):
+        return bool(warehouse_type_findings([{"edoc": json.dumps(_doc(col, tml))}],
+                                            {"t": {col.lower(): cdw}}))
+
+    # integer width, in every spelling: never drift
+    for tml, cdw in (("INT64", "int"), ("INT32", "bigint"), ("INT64", "INT32"),
+                     ("INT32", "smallint"), ("INT64", "bigint")):
+        assert not _flags("CALLS", tml, cdw), f"{tml} vs {cdw} must not be reported as drift"
+    # floating point width is likewise not drift
+    assert not _flags("amt", "DOUBLE", "decimal(10,2)")
+    assert not _flags("amt", "DOUBLE", "float")
+    # but every pair that ACTUALLY hard-failed at GSK still flags
+    assert _flags("PATIENT_AGE", "DOUBLE", "bigint"), "float vs int hard-fails (PATIENT_AGE)"
+    assert _flags("PATIENT_AGE", "DOUBLE", "INT64")
+    assert _flags("HCP_ID", "VARCHAR", "bigint"), "str vs int hard-fails (HCP_ID)"
+    assert _flags("flag_x", "BOOL", "string"), "bool vs str hard-fails"
+    assert _flags("d", "DATE_TIME", "bigint")
+    assert type_class("bigint") == type_class("INT32") == "int"
+    assert type_class("DOUBLE") == type_class("decimal(18,4)") == "float"
+
+
 def test_int_vs_int32_stays_quiet():
     # The false positive the family rule was introduced to kill must STAY dead: Databricks `int`
     # and TML INT32 are the same type spelled two ways, so token-compare reports nothing.

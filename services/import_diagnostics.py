@@ -1132,6 +1132,39 @@ _TYPE_FAMILY = {
 }
 
 
+# Storage CLASS — the granularity at which ThoughtSpot actually rejects a type.
+#
+# Evidence, from every hard 14536 in ~2 months of real GSK runs (tests/corpus): BOOL vs non-bool,
+# VARCHAR vs number (x5), and DOUBLE vs INT64 (PATIENT_AGE). Not one failure was an INTEGER WIDTH
+# difference — int vs bigint, INT32 vs INT64 — in any run.
+#
+# So family (num/str/bool/date) is too coarse: it lumps DOUBLE in with INT64 and stayed silent on a
+# real hard failure. And the exact TS token is too fine: it splits INT32 from INT64 and demands a
+# realignment the platform never asked for, which rewrites the customer's TML for no benefit and
+# earns a "DataType is being changed ... may break the dependents" warning for the trouble.
+# Integer-vs-floating-point is the line that matters; integer width is not.
+_TYPE_CLASS = {
+    "tinyint": "int", "smallint": "int", "int": "int", "integer": "int", "bigint": "int",
+    "long": "int", "int16": "int", "int32": "int", "int64": "int",
+    "float": "float", "double": "float", "real": "float", "decimal": "float", "numeric": "float",
+    "string": "str", "varchar": "str", "char": "str", "text": "str",
+    "boolean": "bool", "bool": "bool",
+    "date": "date", "timestamp": "date", "timestamp_ntz": "date", "datetime": "date",
+    "date_time": "date", "time": "date",
+}
+
+
+def type_class(t):
+    """Storage class of a warehouse type OR a TS token: int / float / str / bool / date / void.
+    "" when unknown. Precision is stripped, so decimal(10,2) -> decimal -> float."""
+    t = (t or "").strip().lower()
+    if not t:
+        return ""
+    if t == "void":
+        return "void"
+    return _TYPE_CLASS.get(t.split("(")[0].strip(), "")
+
+
 def type_family(t):
     """Coarse family (num/str/bool/date/void) for a warehouse type OR a TS token; "" if unknown.
     Precision is stripped, so decimal(10,2) -> decimal -> num and varchar(255) -> varchar -> str."""
@@ -1198,11 +1231,11 @@ def warehouse_type_findings(items, type_map, connection=""):
             if cdw_t is None:
                 continue   # not in the warehouse -> MISSING, not a type mismatch
             tml_t = ((c.get("db_column_properties") or {}).get("data_type") or "").strip()
-            # The TS token the warehouse type maps to — "" when we can't name it confidently, and
-            # an unnamed type is never flagged (we only report drift we can explain).
-            _tok = warehouse_type_to_ts(cdw_t)
-            _flag = (type_family(cdw_t) == "void"
-                     or bool(_tok and tml_t and _tok.upper() != tml_t.upper()))
+            # Compare storage CLASS: int vs float vs str vs bool vs date. An unknown type on
+            # either side is never flagged (we only report drift we can explain), and an integer
+            # width difference is NOT drift — the platform accepts it.
+            _cc, _tc = type_class(cdw_t), type_class(tml_t)
+            _flag = _cc == "void" or bool(_cc and _tc and _cc != _tc)
             if _flag:
                 out.append({
                     "kind": "type_mismatch",
