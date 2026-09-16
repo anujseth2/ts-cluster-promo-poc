@@ -1341,6 +1341,42 @@ def drop_column_properties(items, targets):
     return out, removed
 
 
+def promotion_plan(model_ids, table_ids, id2name, present, selected):
+    """What leaving an object out of the promotion set actually means.
+
+    `selected` = ids ticked to promote. `present` = names that already exist on the TARGET (names
+    are preserved across clusters, so presence is by name). Returns a dict:
+
+      excluded       ids not being promoted
+      unsafe         MODEL names left out that are NOT on the target — there is nothing to bind to
+                     and nothing sensible to prune, so the page must block on these
+      safe_skips     table names left out that ARE on the target — the model binds to that copy and
+                     nothing is dropped
+      prune          table names left out that are NOT on the target — they must be pruned out of
+                     the model, which drops whatever referenced them (gated by an acknowledgement)
+
+    Pulled out of the Select page so the consequence of a tick is unit-testable rather than
+    entangled with widget state: the four cases differ in what they destroy, and getting one wrong
+    silently changes what lands on the target."""
+    sel = set(selected or ())
+    excluded, unsafe, safe_skips, prune = set(), [], [], []
+    for i in model_ids or ():
+        if i in sel:
+            continue
+        excluded.add(i)
+        nm = id2name.get(i, i)
+        if nm not in present:
+            unsafe.append(nm)
+    for i in table_ids or ():
+        nm = id2name.get(i, i)
+        if i in sel:
+            continue
+        excluded.add(i)
+        (safe_skips if nm in present else prune).append(nm)
+    return {"excluded": excluded, "unsafe": unsafe,
+            "safe_skips": safe_skips, "prune": prune}
+
+
 def restore_unneeded_type_changes(items, source_items):
     """Put back any declared type this tool changed that did not need changing.
 

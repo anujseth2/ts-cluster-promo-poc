@@ -29,7 +29,7 @@ from services.import_diagnostics import (
     column_drop_cascade, finding_key, dangling_reference_findings, table_cleanup_findings,
     realign_column_types, warehouse_type_to_ts, warehouse_type_findings, type_family, type_class,
     recase_columns, model_tables_without_columns, prune_tables_whole, prune_stale_realignments,
-    restore_unneeded_type_changes,
+    restore_unneeded_type_changes, promotion_plan,
     blocking, warnings_only, is_blocking_result, drop_column_properties,
 )
 from services.table_matcher import column_signature
@@ -1088,6 +1088,8 @@ if step == 0:
             st.session_state._promo_items    = (dep.get("model_items") or []) + (dep.get("leaf_items") or [])
             st.session_state._resolved_key   = sel_key
             st.session_state.pop("excluded", None)
+            st.session_state.pop("promo_selected", None)
+            st.session_state.pop("_promo_seed_sig", None)
             st.session_state.pop("prune_tables", None)
             st.session_state.pop("prune_ack_sig", None)
             for _k in ("obj_id_status", "_raw_items", "table_alignment", "prod_by_name",
@@ -1283,51 +1285,114 @@ if step == 0:
                      "of the model (you'll be shown what that drops).")
             # Mode change flips the default include state of every table, so reset their widgets.
             if st.session_state.get("_tables_mode_prev") != tmode:
+                # Re-seed the promotion table (its defaults depend on the mode) and clear the
+                # per-table prune acknowledgements.
+                st.session_state.pop("_promo_seed_sig", None)
                 for _i in dep["table_ids"]:
-                    st.session_state.pop(f"inc_{_i}", None)
                     st.session_state.pop(f"ackprune_{_i}", None)
                 st.session_state._tables_mode_prev = tmode
             tables_default_include = (tmode == OPT_CREATE)
 
-            for i in dep["leaf_ids"]:
-                st.markdown(f"-  `{id2name.get(i, i)}`  ·  leaf  ·  _always promoted_")
+            import pandas as pd
+            if dep["leaf_ids"]:
+                st.caption("Always promoted: "
+                           + ", ".join(f"`{id2name.get(i, i)}`" for i in dep["leaf_ids"]))
 
-            # Models: you can only leave one out if it already exists on the target (there is
-            # nothing sensible to prune when you are promoting the model itself).
-            for i in dep["model_ids"]:
-                nm     = id2name.get(i, i)
-                on_tgt = nm in present
-                mark   = "on target ✓" if on_tgt else "not on target ✗"
-                inc = st.checkbox(f"`{nm}`  ·  model  ·  {mark}",
-                                  value=(i not in excluded), key=f"inc_{i}")
-                if inc:
-                    excluded.discard(i)
-                else:
-                    excluded.add(i)
-                    if not on_tgt:
-                        unsafe.append(nm)
+            # ONE table for models + tables instead of 30-odd stacked checkboxes. Streamlit's
+            # data_editor cannot style cells, so "colour" is a coloured marker in the text — which
+            # also survives copy/paste and screen readers. Semantics are unchanged from the
+            # checkbox list: ticked = promote; the meaning of LEAVING one out is spelled out per
+            # row rather than left to be remembered.
+            _promo_ids = list(dep["model_ids"]) + list(dep["table_ids"])
+            _seed_sig = (tuple(_promo_ids), tables_default_include)
+            if st.session_state.get("_promo_seed_sig") != _seed_sig:
+                # Default: models in, tables per the handling mode. Matches the old widget defaults.
+                st.session_state.promo_selected = (
+                    set(dep["model_ids"])
+                    | (set(dep["table_ids"]) if tables_default_include else set()))
+                st.session_state._promo_seed_sig = _seed_sig
+                _bump_editor("promoset")
+            _psel = st.session_state.setdefault("promo_selected", set(_promo_ids))
 
-            # Tables: untick = skip (bind to the target copy) when on target; when NOT on target
-            # it must be pruned out of the model — show the blast radius and require an ack.
-            pending_prune = []   # not-on-target tables unticked -> pruned via ONE gate below
-            safe_skips    = []   # on-target tables unticked -> bind to target's copy (nothing dropped)
-            for i in dep["table_ids"]:
-                nm     = id2name.get(i, i)
-                on_tgt = nm in present
-                mark   = "on target ✓" if on_tgt else "not on target ✗"
-                inc = st.checkbox(f"`{nm}`  ·  table  ·  {mark}",
-                                  value=tables_default_include, key=f"inc_{i}")
-                if inc:
-                    excluded.discard(i)
-                    prune.discard(nm)
-                elif on_tgt:
-                    excluded.add(i)
-                    prune.discard(nm)   # safe skip: the model binds to the target's copy
-                    safe_skips.append(nm)
-                else:
-                    excluded.add(i)
-                    prune.discard(nm)
-                    pending_prune.append((nm, table_drop_preview(promo_items, nm)))
+            _rows_ps = []
+            for _kind, _ids in (("model", dep["model_ids"]), ("table", dep["table_ids"])):
+                for i in _ids:
+                    nm = id2name.get(i, i)
+                    on_tgt = nm in present
+                    if _kind == "model":
+                        _out = ("binds to the target's copy" if on_tgt
+                                else "⚠ can't be left out — not on target")
+                    else:
+                        _out = ("binds to the target's copy, nothing dropped" if on_tgt
+                                else "pruned out of the model (you'll see what drops)")
+                    _rows_ps.append({
+                        "#": len(_rows_ps) + 1,
+                        "Object": nm,
+                        "Kind": _kind,
+                        "On target": "🟢 yes" if on_tgt else "🔴 no",
+                        "Promote?": i in _psel,
+                        "If left out": _out,
+                        "_scoped": i})
+            _psdf = pd.DataFrame(_rows_ps, columns=["#", "Object", "Kind", "On target",
+                                                    "Promote?", "If left out", "_scoped"])
+            _n_on  = sum(1 for r in _rows_ps if r["On target"].endswith("yes"))
+            st.markdown(f"**{len(_rows_ps)} object(s)** · 🟢 **{_n_on}** already on target · "
+                        f"🔴 **{len(_rows_ps) - _n_on}** not on target")
+            _pq = st.text_input("Filter promotion set", key="promoset_search",
+                                label_visibility="collapsed",
+                                placeholder="🔎 Filter by name").strip().lower()
+            _pv = _psdf
+            if _pq and not _psdf.empty:
+                _pv = _psdf[_psdf["Object"].str.lower().str.contains(_pq, regex=False)]
+            _pb1, _pb2, _pb3, _ = st.columns([1.1, 1.1, 1.3, 2])
+            _eb_ps = f"promoset::{_pq}"
+            with _pb1:
+                if st.button(f"Tick shown ({len(_pv)})", key="ps_all", use_container_width=True,
+                             disabled=_pv.empty):
+                    _psel.update(_pv["_scoped"].tolist()); _bump_editor(_eb_ps); st.rerun()
+            with _pb2:
+                if st.button("Untick shown", key="ps_none", use_container_width=True,
+                             disabled=_pv.empty):
+                    for _s in _pv["_scoped"].tolist():
+                        _psel.discard(_s)
+                    _bump_editor(_eb_ps); st.rerun()
+            with _pb3:
+                if st.button("Only what's missing", key="ps_missing", use_container_width=True,
+                             help="Promote just the objects that are NOT on the target yet."):
+                    _psel.clear()
+                    _psel.update(r["_scoped"] for r in _rows_ps if r["On target"].endswith("no"))
+                    _bump_editor(_eb_ps); st.rerun()
+            _select_editor(
+                _pv, ["Promote?"], ["promo_selected"], _eb_ps,
+                column_config={
+                    "#":          st.column_config.TextColumn("#", width="small"),
+                    "Object":     st.column_config.TextColumn("Object", width="large"),
+                    "Kind":       st.column_config.TextColumn("Kind", width="small"),
+                    "On target":  st.column_config.TextColumn(
+                                    "On target", width="small",
+                                    help="🟢 already exists on the target (names are preserved "
+                                         "across clusters) · 🔴 not there yet"),
+                    "Promote?":   st.column_config.CheckboxColumn(
+                                    "Promote?", width="small",
+                                    help="Ticked = included in this promotion."),
+                    "If left out": st.column_config.TextColumn("If left out", width="large"),
+                },
+                disabled=["#", "Object", "Kind", "On target", "If left out"])
+            if _pq:
+                st.caption(f"{len(_pv)} of {len(_psdf)} shown. Filtering never changes rows you "
+                           "can't see.")
+
+            # Derive the same state the checkbox list produced. Unchanged rules: a model can only
+            # be left out when it is already on the target; an unticked table either binds to the
+            # target's copy (safe) or must be pruned from the model (gated below).
+            _plan = promotion_plan(dep["model_ids"], dep["table_ids"], id2name, present, _psel)
+            excluded.clear(); excluded.update(_plan["excluded"])
+            unsafe.extend(_plan["unsafe"])
+            safe_skips = _plan["safe_skips"]     # on target -> model binds to that copy, no drops
+            for _nm in _plan["safe_skips"] + [n for n in _plan["prune"]]:
+                prune.discard(_nm)               # the gate below re-adds only what gets acked
+            # not-on-target tables left out -> pruned via the ONE acknowledgement gate below
+            pending_prune = [(nm, table_drop_preview(promo_items, nm)) for nm in _plan["prune"]]
 
             # ONE gate for every not-on-target table being pruned: list all removals at once,
             # then a single explicit acknowledgement BUTTON (deliberately not a checkbox, so it

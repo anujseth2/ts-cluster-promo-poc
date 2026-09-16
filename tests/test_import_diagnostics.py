@@ -536,6 +536,35 @@ def test_within_family_type_drift_is_flagged_not_swallowed():
         assert found[0]["source_type"] == "DOUBLE"
 
 
+def test_promotion_plan_distinguishes_the_four_cases():
+    # The Select page's promotion set moved from a stack of checkboxes to one table. The four
+    # outcomes of leaving something out differ in what they DESTROY, so they are tested here
+    # rather than left tangled up with widget state.
+    from services.import_diagnostics import promotion_plan
+    id2name = {"m_on": "ModelOnTarget", "m_off": "ModelMissing",
+               "t_on": "TableOnTarget", "t_off": "TableMissing"}
+    present = {"ModelOnTarget", "TableOnTarget"}
+    models, tables = ["m_on", "m_off"], ["t_on", "t_off"]
+
+    # everything ticked: nothing excluded, nothing destroyed
+    p = promotion_plan(models, tables, id2name, present, set(id2name))
+    assert p == {"excluded": set(), "unsafe": [], "safe_skips": [], "prune": []}
+
+    # nothing ticked: each case lands in its own bucket
+    p = promotion_plan(models, tables, id2name, present, set())
+    assert p["excluded"] == {"m_on", "m_off", "t_on", "t_off"}
+    assert p["unsafe"] == ["ModelMissing"]        # a model not on target CANNOT be left out
+    assert p["safe_skips"] == ["TableOnTarget"]   # binds to the target's copy, nothing dropped
+    assert p["prune"] == ["TableMissing"]         # must be pruned from the model (destructive)
+
+    # a model that IS on the target may be left out safely — it is not "unsafe"
+    p = promotion_plan(models, tables, id2name, present, {"m_off", "t_on", "t_off"})
+    assert p["unsafe"] == [] and p["excluded"] == {"m_on"}
+    # and a ticked table is never queued for pruning even when missing from the target
+    p = promotion_plan(models, tables, id2name, present, {"m_on", "m_off", "t_off"})
+    assert p["prune"] == [] and p["safe_skips"] == ["TableOnTarget"]
+
+
 def test_bundle_self_heals_a_type_it_should_not_have_changed():
     # 2026-09-17: CALLS was STILL being changed on 2c after the apply-step fix, because that fix
     # only runs during a fresh export. The bundle in memory already carried the rewritten type and
