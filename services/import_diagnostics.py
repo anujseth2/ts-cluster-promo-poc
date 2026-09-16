@@ -97,9 +97,10 @@ _AUTHZ_OBJECTS = re.compile(
     r"AUTHORIZATION_FAILURE.*?No permission to update objects\s*:\s*(\{.*?\})", re.I | re.S)
 # "Model/Worksheet columns have invalid properties.<br/><ul><li><b>tbl::DAY_DATE_FIELD</b>
 #  <ul><li>calendar</li></ul></li></ul>SOLUTION: ..."
-# A model column carries a property the target can't honour — a named CALENDAR being the case seen
-# at GSK, where the custom calendar exists on the source cluster but not on the target. The body
-# names the column AND the offending property; matching only the stable leading sentence keeps this
+# The verbatim GSK message ends "SOLUTION: Use one of the valid properties", so the platform is
+# rejecting the property NAME on a model column, not reporting a missing object. Seen with
+# `calendar` on DAY_DATE_FIELD: the source emits it, the target's TML schema has no slot for it.
+# The body names the column AND the property; matching only the stable leading sentence keeps this
 # working regardless of how the trailing SOLUTION text is worded.
 _INVALID_COL_PROPS = re.compile(
     r"Model/Worksheet columns have invalid properties\.?(.*)$", re.I | re.S)
@@ -167,11 +168,13 @@ _ERROR_RULES = [
                 "guid is a PRE-EXISTING target object your model depends on, not one being "
                 "promoted — look it up on the target and share it, then re-run.")),
     (re.compile(r"Model/Worksheet columns have invalid properties", re.I),
-     lambda m: ("A model column carries a property the target cluster doesn't have.",
-                "Most often a named CALENDAR that exists on the source but was never created on "
-                "the target. Create the calendar on the target (Data > Calendars) to keep the "
-                "column's behaviour, or remove the property from the column and re-run. The "
-                "column and the property are named above.")),
+     lambda m: ("A model column carries a property the TARGET doesn't accept on a model column.",
+                "ThoughtSpot's answer is 'use one of the valid properties', so it is rejecting the "
+                "property NAME, not a missing object — usually the source cluster is on a newer "
+                "release that emits a property the target's TML schema has no slot for. Remove the "
+                "property from that column (the column itself is fine and keeps its data), or "
+                "align the target's version. Check the source and target release numbers if this "
+                "keeps appearing on a property you did not add.")),
     (re.compile(r"10086|not authorized|permission|privilege|access denied", re.I),
      lambda m: ("Permission problem talking to the connection.",
                 "The account running the promotion needs access to the connection "
@@ -1244,6 +1247,51 @@ def realign_column_types(items, realign):
                     n += 1
         out.append({**item, "edoc": json.dumps(doc)})
     return out, n
+
+
+def drop_column_properties(items, targets):
+    """Remove named PROPERTIES from model/worksheet columns, keeping the columns themselves.
+
+    `targets`: {"table::col": ["calendar", …]} — scoped, and the property names are matched
+    case-insensitively. This is the answer to "Model/Worksheet columns have invalid properties":
+    the target rejects the property name, so the property goes and the column stays with its data,
+    its name and its obj_id intact. Approve-first, like a realign — never applied automatically,
+    because the property means something on the source and dropping it is a real (if small)
+    semantic change to what lands.
+
+    Returns (new_items, [(column, property), …] actually removed)."""
+    want = {}
+    for k, props in (targets or {}).items():
+        if "::" in (k or "") and props:
+            want[k.strip().lower()] = {str(p).strip().lower() for p in props}
+    if not want:
+        return items, []
+    removed, out = [], []
+    for item in items:
+        doc = _parse_edoc(item)
+        touched = False
+        for key in ("model", "worksheet"):
+            node = doc.get(key)
+            if not node:
+                continue
+            for c in node.get("columns") or []:
+                cid = (c.get("column_id") or "").strip().lower()
+                props = want.get(cid)
+                if not props:
+                    continue
+                for pname in [p for p in list(c.keys()) if p.strip().lower() in props]:
+                    c.pop(pname, None)
+                    removed.append((c.get("column_id"), pname))
+                    touched = True
+                # some builds nest them under `properties`
+                nested = c.get("properties")
+                if isinstance(nested, dict):
+                    for pname in [p for p in list(nested.keys()) if p.strip().lower() in props]:
+                        nested.pop(pname, None)
+                        removed.append((c.get("column_id"), pname))
+                        touched = True
+        out.append({**item, "edoc": json.dumps(doc)} if touched else item)
+    return out, removed
 
 
 def recase_columns(items, case_map):

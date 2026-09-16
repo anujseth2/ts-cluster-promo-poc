@@ -390,17 +390,41 @@ def test_isolation_pass_does_not_relabel_warnings_as_errors():
 
 
 def test_invalid_column_property_names_the_column_and_the_property():
-    # GSK 2026-09-16: "Model/Worksheet columns have invalid properties" rendered as "unknown" with
-    # the column buried in list markup. The body names both halves, so both must come out.
-    from services.import_diagnostics import classify_import_errors, friendly_error
-    msg = ("Model/Worksheet columns have invalid properties.<br/><ul><li><b>"
-           "fact_subnational_day_bridge_respbio_br::DAY_DATE_FIELD</b>"
-           "<ul><li>calendar</li></ul></li></ul>SOLUTION: create it or remove the property.")
+    # VERBATIM bytes from the GSK run of 2026-09-16T22:52:08 (debug bundle), not a reconstruction.
+    # Note the shapes that broke an earlier parse: the column sits after a literal "- " rather than
+    # inside <li>, the property is "* calendar" inside <li>, and SOLUTION is bolded.
+    from services.import_diagnostics import classify_import_errors
+    msg = ("Model/Worksheet columns have invalid properties.<br/>- <b>"
+           "fact_subnational_day_bridge_respbio_br::DAY_DATE_FIELD</b><br/><ul><li>* calendar</li>"
+           "</ul><br/><b>SOLUTION:</b><br/>Use one of the valid properties.<br/>")
     found = classify_import_errors([{"name": "unknown", "status": "ERROR", "error": msg}])
     assert [f["kind"] for f in found] == ["invalid_column_property"]
     assert found[0]["columns"] == ["fact_subnational_day_bridge_respbio_br::DAY_DATE_FIELD"]
     assert found[0]["properties"] == ["calendar"]
-    assert "calendar" in friendly_error(msg)[1].lower()
+
+
+def test_dropping_a_column_property_keeps_the_column():
+    # The remedy for the above: the property goes, the column and its identity stay. Dropping the
+    # COLUMN here would lose data for what is only a schema-vocabulary difference between clusters.
+    from services.import_diagnostics import drop_column_properties
+    doc = {"model": {"name": "m", "columns": [
+        {"name": "Day Date", "column_id": "fact_day::DAY_DATE_FIELD", "calendar": "fiscal_2026"},
+        {"name": "Other", "column_id": "fact_day::OTHER", "calendar": "fiscal_2026"}]}}
+    items = [{"info": {"name": "m"}, "edoc": json.dumps(doc)}]
+    out, removed = drop_column_properties(items, {"fact_day::DAY_DATE_FIELD": ["calendar"]})
+    cols = json.loads(out[0]["edoc"])["model"]["columns"]
+    assert removed == [("fact_day::DAY_DATE_FIELD", "calendar")]
+    assert "calendar" not in cols[0] and cols[0]["column_id"] == "fact_day::DAY_DATE_FIELD"
+    assert cols[0]["name"] == "Day Date"                 # column intact
+    assert cols[1]["calendar"] == "fiscal_2026"          # scoped: the other column is untouched
+    # nested form, and idempotence
+    doc2 = {"model": {"name": "m", "columns": [
+        {"column_id": "t::C", "properties": {"calendar": "x", "keep": 1}}]}}
+    out2, rm2 = drop_column_properties([{"info": {"name": "m"}, "edoc": json.dumps(doc2)}],
+                                       {"t::C": ["calendar"]})
+    props = json.loads(out2[0]["edoc"])["model"]["columns"][0]["properties"]
+    assert props == {"keep": 1} and rm2 == [("t::C", "calendar")]
+    assert drop_column_properties(out2, {"t::C": ["calendar"]})[1] == []
 
 
 def test_nested_list_markup_does_not_run_onto_one_line():

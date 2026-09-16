@@ -29,7 +29,7 @@ from services.import_diagnostics import (
     column_drop_cascade, finding_key, dangling_reference_findings, table_cleanup_findings,
     realign_column_types, warehouse_type_to_ts, warehouse_type_findings, type_family,
     recase_columns, model_tables_without_columns, prune_tables_whole,
-    blocking, warnings_only, is_blocking_result,
+    blocking, warnings_only, is_blocking_result, drop_column_properties,
 )
 from services.table_matcher import column_signature
 from services.feedback_replace import feedback_preview, replace_prep, replace_finalize
@@ -3415,14 +3415,39 @@ elif step == 3:
             _bad_props = [f for f in findings if f["kind"] == "invalid_column_property"]
             if _bad_props:
                 st.markdown("#### Model columns with a property the target doesn't have")
-                st.caption("The property exists on the source cluster but not on the target — a "
-                           "named calendar is the usual case. Create it on the target to keep the "
-                           "column behaving the same way, or remove the property from the column. "
-                           "Nothing here is dropped for you: the column itself is fine.")
+                st.caption("ThoughtSpot is rejecting the property NAME, not reporting a missing "
+                           "object — its own answer is \"use one of the valid properties\". That "
+                           "usually means the source cluster emits a property the target's TML "
+                           "schema has no slot for, so it is worth comparing the two release "
+                           "numbers. The column itself is fine and keeps its data; only the "
+                           "property has to go.")
+                _prop_map = {}
                 for _f in _bad_props:
                     _pl = ", ".join(f"`{p}`" for p in (_f.get("properties") or [])) or "(not named)"
                     for _c in (_f.get("columns") or ["(column not named)"]):
-                        st.warning(f"**{_c}** — missing on target: {_pl}")
+                        st.warning(f"**{_c}** — target won't accept: {_pl}")
+                        if _f.get("properties") and "::" in str(_c):
+                            _prop_map[_c] = _f["properties"]
+                if _prop_map:
+                    _n = sum(len(v) for v in _prop_map.values())
+                    if st.button(f"Remove {_n} property/properties, keep the column(s)",
+                                 key="drop_col_props"):
+                        _fixed, _rm = drop_column_properties(
+                            st.session_state.transformed_items, _prop_map)
+                        st.session_state.transformed_items = _fixed
+                        st.session_state.setdefault("dropped_col_props", {}).update(_prop_map)
+                        if _rm:
+                            st.session_state._last_drop_report = (
+                                "Removed " + ", ".join(f"`{p}` from `{c}`" for c, p in _rm)
+                                + ". The column(s) and their data are unchanged.")
+                        else:
+                            st.session_state._last_drop_report = (
+                                "No property was found on those columns to remove — the TML may "
+                                "nest it differently. Send the debug bundle.")
+                        for _k in ("pr_url", "validation_errors", "validation_ok",
+                                   "discovered_findings", "discovered_meta"):
+                            st.session_state.pop(_k, None)
+                        st.rerun()
 
             # ── anything unrecognised ──
             if other:

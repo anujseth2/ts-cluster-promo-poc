@@ -56,7 +56,7 @@ def _classify(rec):
 
 def test_corpus_is_present_and_real():
     rows = _corpus()
-    assert len(rows) >= 93, "corpus shrank — messages should only ever be added"
+    assert len(rows) >= 95, "corpus shrank — messages should only ever be added"
     assert all(r.get("error") and r.get("first_seen") for r in rows)
 
 
