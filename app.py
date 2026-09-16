@@ -28,7 +28,7 @@ from services.import_diagnostics import (
     drop_vizzes, table_drop_preview, drop_tables, warehouse_missing_findings, friendly_error,
     column_drop_cascade, finding_key, dangling_reference_findings, table_cleanup_findings,
     realign_column_types, warehouse_type_to_ts, warehouse_type_findings, type_family, type_class,
-    recase_columns, model_tables_without_columns, prune_tables_whole,
+    recase_columns, model_tables_without_columns, prune_tables_whole, prune_stale_realignments,
     blocking, warnings_only, is_blocking_result, drop_column_properties,
 )
 from services.table_matcher import column_signature
@@ -898,7 +898,15 @@ def _prepare_bundle():
             # `table::col` -> TS token; already-dropped columns are gone, so this is a no-op for them.
             realign_map = st.session_state.get("realign_types", {})
             if realign_map:
-                transformed_items, _rn = realign_column_types(transformed_items, realign_map)
+                # Drop approvals that no longer change the storage class BEFORE applying, so a
+                # rule change can't leave the bundle carrying rewrites nobody asked for, and so
+                # the "realignments applied" list on the validation page tells the truth.
+                realign_map, _stale = prune_stale_realignments(transformed_items, realign_map)
+                if _stale:
+                    st.session_state.realign_types = realign_map
+                    st.session_state._realign_pruned = sorted(_stale)
+                if realign_map:
+                    transformed_items, _rn = realign_column_types(transformed_items, realign_map)
             st.session_state.transformed_items = transformed_items
             st.session_state.warnings          = warnings
             st.session_state._export_fb_state  = _fb_state   # what feedback choice this export reflects
@@ -2686,6 +2694,13 @@ elif step == 3:
         # long after the tool stopped asking for it — which is why an integer-width change can
         # still be in the bundle even though nothing flags it any more. Show what is active and
         # give it an undo; a full Reset was previously the only way out.
+        _pruned_re = st.session_state.pop("_realign_pruned", None)
+        if _pruned_re:
+            st.info("Dropped **" + str(len(_pruned_re)) + "** stale type realignment(s) that no "
+                    "longer change anything the platform cares about (integer width only): "
+                    + ", ".join(f"`{k.replace('::', '.')}`" for k in _pruned_re[:8])
+                    + (", …" if len(_pruned_re) > 8 else "")
+                    + ". These columns now keep the source TML's own type.")
         _active_re = st.session_state.get("realign_types") or {}
         if _active_re:
             with st.expander(f"{len(_active_re)} type realignment(s) are applied to every export",
@@ -3445,12 +3460,15 @@ elif step == 3:
             _bad_props = [f for f in findings if f["kind"] == "invalid_column_property"]
             if _bad_props:
                 st.markdown("#### Model columns with a property the target doesn't have")
-                st.caption("ThoughtSpot is rejecting the property NAME, not reporting a missing "
-                           "object — its own answer is \"use one of the valid properties\". That "
-                           "usually means the source cluster emits a property the target's TML "
-                           "schema has no slot for, so it is worth comparing the two release "
-                           "numbers. The column itself is fine and keeps its data; only the "
-                           "property has to go.")
+                st.caption("A `calendar` here names a CUSTOM CALENDAR object, and custom calendars "
+                           "are cluster-local — a promotion never carries them. So this is almost "
+                           "always a calendar that exists on the source and was never created on "
+                           "the target. (It is not a schema-version gap: other columns in the same "
+                           "model keep their calendars fine.) Removing the property lets the "
+                           "promotion land and **reverts that column's date grouping to standard "
+                           "periods instead of the custom calendar** — no error, just different "
+                           "buckets. Creating the calendar on the target preserves the behaviour. "
+                           "The column and its data are untouched either way.")
                 _prop_map = {}
                 for _f in _bad_props:
                     _pl = ", ".join(f"`{p}`" for p in (_f.get("properties") or [])) or "(not named)"

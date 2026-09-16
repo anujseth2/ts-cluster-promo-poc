@@ -536,6 +536,40 @@ def test_within_family_type_drift_is_flagged_not_swallowed():
         assert found[0]["source_type"] == "DOUBLE"
 
 
+def test_a_realignment_that_changes_no_class_is_never_applied():
+    # Anuj, 2026-09-17: "CALLS should not even appear in the list, this is a clear regression."
+    # Not flagging it any more is not enough: an approval is DURABLE and is re-applied to every
+    # export, so one collected under the older, stricter rule keeps rewriting INT64 to INT32
+    # forever and keeps earning "DataType is being changed". The apply step itself must refuse a
+    # realignment that changes no storage class, so the pipeline self-corrects with no one having
+    # to remember to clear anything.
+    from services.import_diagnostics import realign_column_types, prune_stale_realignments
+    doc = {"table": {"name": "fact_x", "columns": [
+        {"name": "Calls", "db_column_name": "CALLS",
+         "db_column_properties": {"data_type": "INT64"}},
+        {"name": "Hcp Id", "db_column_name": "HCP_ID",
+         "db_column_properties": {"data_type": "VARCHAR"}}]}}
+    items = [{"info": {"name": "fact_x"}, "edoc": json.dumps(doc)}]
+    stale_and_real = {"fact_x::CALLS": "INT32",     # integer width only — must be ignored
+                      "fact_x::HCP_ID": "INT64"}    # str -> int — must still apply
+    out, n = realign_column_types(items, stale_and_real)
+    cols = {c["db_column_name"]: c["db_column_properties"]["data_type"]
+            for c in json.loads(out[0]["edoc"])["table"]["columns"]}
+    assert cols["CALLS"] == "INT64", "a width-only realignment must not rewrite the TML"
+    assert cols["HCP_ID"] == "INT64", "a real class change must still be applied"
+    assert n == 1
+    # and the durable map prunes itself, so the UI cannot claim a realignment that isn't happening
+    kept, dropped = prune_stale_realignments(items, stale_and_real)
+    assert kept == {"fact_x::HCP_ID": "INT64"}
+    assert dropped == {"fact_x::CALLS": "INT32"}
+    # float <-> int is a class change in both directions and survives pruning
+    doc2 = {"table": {"name": "t", "columns": [
+        {"db_column_name": "AGE", "db_column_properties": {"data_type": "DOUBLE"}}]}}
+    k2, d2 = prune_stale_realignments([{"info": {"name": "t"}, "edoc": json.dumps(doc2)}],
+                                      {"t::AGE": "INT64"})
+    assert k2 == {"t::AGE": "INT64"} and d2 == {}
+
+
 def test_integer_width_is_never_drift():
     # Anuj, 2026-09-16: "why are CALLS and all other columns with INT to INT32 and INT64 being
     # changed? I don't think that this change is required." He is right, and the corpus proves it:

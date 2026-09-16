@@ -168,13 +168,14 @@ _ERROR_RULES = [
                 "guid is a PRE-EXISTING target object your model depends on, not one being "
                 "promoted — look it up on the target and share it, then re-run.")),
     (re.compile(r"Model/Worksheet columns have invalid properties", re.I),
-     lambda m: ("A model column carries a property the TARGET doesn't accept on a model column.",
-                "ThoughtSpot's answer is 'use one of the valid properties', so it is rejecting the "
-                "property NAME, not a missing object — usually the source cluster is on a newer "
-                "release that emits a property the target's TML schema has no slot for. Remove the "
-                "property from that column (the column itself is fine and keeps its data), or "
-                "align the target's version. Check the source and target release numbers if this "
-                "keeps appearing on a property you did not add.")),
+     lambda m: ("A model column names something that doesn't exist on the target.",
+                "For a `calendar` property this is a CUSTOM CALENDAR: those are cluster-local "
+                "objects that a TML promotion never carries, so one defined on the source is "
+                "simply absent on the target. Create the calendar there to keep the column's "
+                "fiscal/custom period grouping, or remove the property to let the promotion land "
+                "and accept standard date periods for that column. The column and its data are "
+                "unaffected either way. (Not a schema-version gap: other columns in the same model "
+                "keep their calendars without complaint.)")),
     (re.compile(r"10086|not authorized|permission|privilege|access denied", re.I),
      lambda m: ("Permission problem talking to the connection.",
                 "The account running the promotion needs access to the connection "
@@ -1257,7 +1258,16 @@ def realign_column_types(items, realign):
     shared column name isn't retyped everywhere). The type is written to the TABLE column's
     `db_column_properties.data_type` (where column_signature and TS's 14536 check read it); the
     caller re-validates afterward, which is the source of truth on whether the new type satisfied
-    the warehouse. Returns (new_items, count_changed)."""
+    the warehouse.
+
+    SELF-CORRECTING: a realignment is applied only when it actually changes the storage CLASS
+    (int / float / str / bool / date). An approval is durable — it is re-applied to every export
+    from then on — so an approval collected under an older, stricter rule would keep rewriting the
+    TML forever. Retyping INT64 to INT32 buys nothing the platform cares about and costs a
+    "DataType is being changed ... may break the dependents" warning, so it is skipped here rather
+    than relying on someone remembering to clear it. VARCHAR to INT64 still applies.
+
+    Returns (new_items, count_changed)."""
     want = {}   # (table_lower, col_lower) -> new_type
     for k, v in (realign or {}).items():
         if "::" in (k or "") and v:
@@ -1276,6 +1286,10 @@ def realign_column_types(items, realign):
                 dbn = (c.get("db_column_name", "") or "").strip().lower()
                 new_t = want.get((_tl, nm)) or want.get((_tl, dbn))
                 if new_t:
+                    cur_t = (c.get("db_column_properties") or {}).get("data_type") or ""
+                    # No class change => nothing the platform needs => leave the TML alone.
+                    if type_class(cur_t) and type_class(cur_t) == type_class(new_t):
+                        continue
                     c.setdefault("db_column_properties", {})["data_type"] = new_t
                     n += 1
         out.append({**item, "edoc": json.dumps(doc)})
@@ -1325,6 +1339,46 @@ def drop_column_properties(items, targets):
                         touched = True
         out.append({**item, "edoc": json.dumps(doc)} if touched else item)
     return out, removed
+
+
+def prune_stale_realignments(items, realign):
+    """Split a durable realign map into the entries that still change something and the ones that
+    no longer do. Returns (kept, dropped) as {"table::col": type} dicts.
+
+    Approvals outlive the rule that asked for them. When the flagging rule tightened and then
+    loosened again, integer-width approvals stayed in the map and kept rewriting types nobody
+    needed rewritten. Rather than leaving that for the operator to notice, the map is pruned on
+    every export against what the TML actually says, so a realignment that is no longer a class
+    change simply stops existing."""
+    if not realign:
+        return {}, {}
+    current = {}
+    for item in items:
+        try:
+            doc = _parse_edoc(item)
+        except Exception:
+            continue
+        t = doc.get("table")
+        if not (t and t.get("name")):
+            continue
+        tl = t["name"].strip().lower()
+        for c in t.get("columns") or []:
+            dt = (c.get("db_column_properties") or {}).get("data_type") or ""
+            for key in ((c.get("name") or "").strip().lower(),
+                        (c.get("db_column_name") or "").strip().lower()):
+                if key:
+                    current[(tl, key)] = dt
+    kept, dropped = {}, {}
+    for k, v in realign.items():
+        if "::" not in (k or ""):
+            continue
+        _t, _c = k.split("::", 1)
+        cur = current.get((_t.strip().lower(), _c.strip().lower()))
+        if cur is not None and type_class(cur) and type_class(cur) == type_class(v):
+            dropped[k] = v
+        else:
+            kept[k] = v
+    return kept, dropped
 
 
 def recase_columns(items, case_map):
