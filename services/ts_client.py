@@ -556,7 +556,11 @@ class TSClient:
         return [d for d in deps if d.get("type") != "FEEDBACK"]
 
     def delete_metadata(self, obj_type: str, identifier: str) -> int:
-        """Delete a metadata object. Returns the HTTP status (204 on success)."""
+        """Delete a metadata object. Returns the HTTP status (204 on success).
+
+        CAUTION: 204 does NOT prove the object is gone. Verified on ps-internal 2026-09-22 — a
+        non-admin asked to delete an object they cannot see and got 204 while the object survived
+        untouched. Use delete_metadata_verified() for anything the operator is told succeeded."""
         payload = {"metadata": [{"type": obj_type, "identifier": identifier}]}
         url = f"{self.host}/api/rest/2.0/metadata/delete"
         resp = self._session.post(url, json=payload, timeout=60)
@@ -564,6 +568,31 @@ class TSClient:
             self._session_login()
             resp = self._session.post(url, json=payload, timeout=60)
         return resp.status_code
+
+    def object_exists(self, obj_type: str, identifier: str) -> bool:
+        """Whether this account can still find the object. False also when it was never visible."""
+        try:
+            data = self._post("/api/rest/2.0/metadata/search",
+                              {"metadata": [{"type": obj_type, "identifier": identifier}]})
+        except Exception:
+            return True          # can't tell -> assume it is still there, never claim success
+        items = data if isinstance(data, list) else data.get("metadata", [])
+        return bool(items)
+
+    def delete_metadata_verified(self, obj_type: str, identifier: str):
+        """Delete, then CHECK. Returns (ok, status, detail).
+
+        The API answers 204 whether or not it removed anything, so a caller that trusts the status
+        reports a deletion that did not happen — and in this tool that would tell the operator a
+        blocking dependent was cleared when it is still there, sending them into an import that
+        fails for the reason they thought they had fixed."""
+        status = self.delete_metadata(obj_type, identifier)
+        if status not in (200, 204):
+            return False, status, f"HTTP {status}"
+        if self.object_exists(obj_type, identifier):
+            return False, status, ("the server accepted the request but the object is still "
+                                   "there — you most likely lack rights to delete it")
+        return True, status, "deleted"
 
     def export_feedback_entries(self, model_guid: str) -> List[Dict]:
         """The model's CURRENT feedback entries (list of dicts); [] if none / not exportable."""

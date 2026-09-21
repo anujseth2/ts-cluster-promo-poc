@@ -4166,21 +4166,36 @@ elif step == 4:
                                     _res = {}
                                     with st.status("Deleting on the target…", expanded=True) as _dl:
                                         for _r in _picked:
+                                            # VERIFY, never trust the status. ps-internal
+                                            # 2026-09-22: deleting an object you lack rights to
+                                            # returns 204 and changes nothing. Reporting that as
+                                            # success would tell the operator a blocking dependent
+                                            # was cleared and send them into an import that fails
+                                            # for the very reason they thought they had fixed.
                                             try:
-                                                _res[_r["id"]] = target_client().delete_metadata(
-                                                    _r.get("type") or "ANSWER", _r["id"])
+                                                _okd, _stt, _detail = \
+                                                    target_client().delete_metadata_verified(
+                                                        _r.get("type") or "ANSWER", _r["id"])
                                             except Exception as _e:
-                                                _res[_r["id"]] = str(_e)[:120]
-                                            _dl.write(f"{_r.get('name')}: {_res[_r['id']]}")
+                                                _okd, _detail = False, str(_e)[:120]
+                                            _res[_r["id"]] = "deleted" if _okd else _detail
+                                            _dl.write(("✓ " if _okd else "✗ ")
+                                                      + f"{_r.get('name')}: {_res[_r['id']]}")
                                         _log_target_delete(opt_env("TS_TARGET_HOST"), team_name,
                                                            _picked, _res)
-                                        _ok = sum(1 for v in _res.values() if v in (200, 204))
+                                        _ok = sum(1 for v in _res.values() if v == "deleted")
                                         _dl.update(label=f"Deleted {_ok} of {len(_picked)} "
                                                          f"(logged to logs/target_deletes.jsonl)",
                                                    state="complete" if _ok == len(_picked) else "error")
+                                    if _ok < len(_picked):
+                                        st.warning("Some objects were NOT removed. The API accepts "
+                                                   "the request either way, so this means the "
+                                                   "account lacks rights on them — they have to go "
+                                                   "through their owner or an admin. They are still "
+                                                   "listed below and will still block the import.")
                                     st.session_state._tgt_dep_rows = [
                                         r for r in _dep_rows
-                                        if _res.get(r.get("id")) not in (200, 204)]
+                                        if _res.get(r.get("id")) != "deleted"]
                                     _dsel.clear()
                                     st.session_state.pop("tgt_del_confirm", None)
                                     st.rerun()
