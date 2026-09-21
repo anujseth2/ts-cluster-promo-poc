@@ -896,3 +896,34 @@ def test_drop_tables_prunes_dimension_from_model(model_item):
     tbls = {mt["name"] for mt in doc["model"]["model_tables"]}
     assert "country" not in tbls
     assert summary["tables"] == 1
+
+
+def test_deleted_columns_have_dependents_reads_like_a_human_wrote_it():
+    # VERIFIED live on ps-internal 2026-09-22: removing a column an answer uses fails the import
+    # (at VALIDATE_ONLY too), and deleting the dependent then lets it through. So the message is a
+    # hard stop with exactly two ways out, and it should say both. VERBATIM platform bytes.
+    from services.import_diagnostics import friendly_error
+    msg = ("Deleted columns have dependents.<br/>- <b>O Clerk</b></br><ul><li>ZZ Dep Test Answer "
+           "(anuj) - delete me</li></ul><br/><b>SOLUTION:</b><br/>Either replace the deleted "
+           "columns, or remove the dependencies.<br/>")
+    headline, action, _raw = friendly_error(msg)
+    assert "O Clerk" in headline, "name the column that is blocked"
+    assert "ZZ Dep Test Answer (anuj) - delete me" in headline, "name what is blocking it"
+    assert "Source Audit" in action and "delete" in action.lower(), "give both ways out"
+    assert "can't see" in action.lower(), "be honest about the invisible-dependent case"
+
+    # the table-named shape names the table and claims no dependents
+    h2, _a2, _ = friendly_error("Error: <br/>- <b>fact_x</b>: Deleted columns have dependents.")
+    assert "fact_x" in h2 and "still use it" in h2
+    # several dependents are listed, not just counted
+    h3, _a3, _ = friendly_error("Deleted columns have dependents.<br/>- <b>C</b></br><ul>"
+                                "<li>One</li><li>Two</li></ul>")
+    assert "One" in h3 and "Two" in h3 and "2 object(s)" in h3
+    # the bare form still produces a usable sentence
+    assert friendly_error("Deleted columns have dependents.")[0]
+
+
+def test_clean_handles_the_malformed_closing_break():
+    # ThoughtSpot emits "</br>" in this payload. Left alone it survives into the rendered text.
+    from services.import_diagnostics import _clean
+    assert "</br>" not in _clean("a</br>b")

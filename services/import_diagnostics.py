@@ -113,7 +113,7 @@ def _clean(msg: str) -> str:
     <li>…</li>, and without this they render to the operator as the literal text
     "<li>dim_territory_bridge_lupus</li>" (seen on screen, GSK 2026-09-11)."""
     s = str(msg or "")
-    for br in ("<br/>", "<br />", "<br>", "</li>", "</ul>", "</ol>"):
+    for br in ("<br/>", "<br />", "<br>", "</br>", "</li>", "</ul>", "</ol>"):
         s = s.replace(br, "\n")
     for drop in ("<ul>", "<ol>"):
         s = s.replace(drop, "")
@@ -144,7 +144,55 @@ def _guids_by_type(blob):
     return out
 
 
+def _dep_block_detail(text):
+    """(column, [dependent names]) out of a CLEANED "Deleted columns have dependents" payload.
+
+    friendly_error matches against _clean()'ed text, not raw HTML, so this parses the cleaned
+    shape: the offending column arrives bolded on its own bullet and its dependents follow as
+    plain bullets, up to the SOLUTION line. The other shape names only a bolded table.
+    Verified against the verbatim ps-internal message, 2026-09-22."""
+    body = re.split(r"\*\*SOLUTION", text or "", 1)[0]
+    col, deps = "", []
+    for ln in body.split("\n"):
+        ln = ln.strip()
+        if not ln.startswith("- "):
+            continue
+        item = ln[2:].strip()
+        if re.match(r"^\*\*[^*]+\*\*\s*:", item) or "Deleted columns have dependents" in item:
+            # the table-named shape: "**fact_x**: Deleted columns have dependents." — a table,
+            # not a dependent, and never a dependent name.
+            _t = re.match(r"^\*\*([^*]+)\*\*", item)
+            if _t and not col:
+                col = _t.group(1).strip()
+            continue
+        if item.startswith("**") and item.endswith("**"):
+            col = item.strip("*").strip()
+        elif item:
+            deps.append(item)
+    if not col:
+        t = re.search(r"\*\*([^*]+)\*\*\s*:\s*Deleted columns have dependents", text or "", re.I)
+        col = t.group(1).strip() if t else ""
+    return col, deps
+
+
 _ERROR_RULES = [
+    # VERIFIED on ps-internal 2026-09-22: removing a column an answer uses fails the import, at
+    # VALIDATE_ONLY as well as on the real one, and deleting the dependent then lets it through.
+    # So this is a hard stop with exactly two ways out, and the platform names both halves.
+    (re.compile(r"Deleted columns have dependents", re.I),
+     lambda m: (
+         (lambda col, deps: (
+             (f"Can't remove `{col}` — " if col else "Can't remove a column — ")
+             + (f"{len(deps)} object(s) on the target still use it: "
+                + ", ".join(f"**{d}**" for d in deps[:6])
+                + (", …" if len(deps) > 6 else "") + "."
+                if deps else "objects on the target still use it."),
+             "Two ways through, and no third: keep the column (untick it on Source Audit so it "
+             "promotes), or delete the dependent object(s) on the target first — the Git "
+             "Operations step can list and delete the ones your account can see. Anything owned "
+             "by someone you can't see has to go through its owner or an admin."
+         ))(*_dep_block_detail(getattr(m, "string", "")))
+     )),
     (re.compile(r"free trial has ended|warehouses? (?:have|has) been suspended|CONNECTION_CREATION_ERROR", re.I),
      lambda m: ("The target warehouse can't be reached — it looks paused or suspended "
                 "(e.g. a Snowflake trial that ended, or a stopped Databricks warehouse).",
