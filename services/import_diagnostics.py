@@ -1341,6 +1341,32 @@ def drop_column_properties(items, targets):
     return out, removed
 
 
+def scan_names_for_drops(drop_set, cascade_names=None):
+    """Every spelling a dependent might use to refer to a dropped column.
+
+    The drop set is keyed `table::PHYSICAL_COL`, while an answer refers to the column by its
+    DISPLAY name, and the cascade log records physical columns dotted (`table.COL`) and model /
+    formula columns bare. Miss a spelling and the dependency scan quietly reports nothing, which
+    is the most dangerous possible failure here — it would read as "safe to drop".
+
+    Returns a lowercased set of bare names to match against."""
+    out = set()
+    for s in (drop_set or ()):
+        s = (s or "").strip()
+        if not s:
+            continue
+        out.add(s.lower())
+        out.add(s.split("::")[-1].strip().lower())
+    for s in (cascade_names or ()):
+        s = (s or "").strip()
+        if not s:
+            continue
+        out.add(s.lower())
+        out.add(s.split(".")[-1].strip().lower())
+        out.add(s.split("::")[-1].strip().lower())
+    return {s for s in out if s}
+
+
 def dependents_using_columns(dependents, dropped_names):
     """Narrow TABLE-level dependents down to the ones that actually reference a DROPPED COLUMN.
 

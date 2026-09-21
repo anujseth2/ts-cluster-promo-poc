@@ -536,6 +536,24 @@ def test_within_family_type_drift_is_flagged_not_swallowed():
         assert found[0]["source_type"] == "DOUBLE"
 
 
+def test_scan_names_cover_every_spelling_of_a_dropped_column():
+    # The drop set is keyed table::PHYSICAL_COL, an answer refers to the DISPLAY name, and the
+    # cascade log writes physical columns dotted. Missing a spelling makes the dependency scan
+    # report nothing, which reads as "safe to drop" — the most dangerous way for this to fail.
+    from services.import_diagnostics import scan_names_for_drops, dependents_using_columns
+    names = scan_names_for_drops(
+        {"fact_subnational_respbio_br::CALLS"},
+        {"Calls", "fact_subnational_respbio_br.CALLS", "Total Calls Formula"})
+    assert "calls" in names                                   # physical, unqualified
+    assert "fact_subnational_respbio_br::calls" in names      # as scoped in the drop set
+    assert "total calls formula" in names                     # a cascaded formula name
+    # and those names actually catch an answer that refers to the column by display name
+    ans = {"id": "a1", "name": "Calls by Rep", "type": "ANSWER",
+           "tml": json.dumps({"answer": {"answer_columns": [{"name": "Calls"}]}})}
+    assert [f["id"] for f in dependents_using_columns([ans], names)] == ["a1"]
+    assert scan_names_for_drops(set(), set()) == set()
+
+
 def test_dependents_are_narrowed_to_the_dropped_column():
     # list_dependents answers "what depends on this TABLE", which implicates every answer built on
     # a 45-column table when one column goes. Dropping a column must only implicate the dependents

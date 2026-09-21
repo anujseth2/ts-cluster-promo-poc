@@ -29,7 +29,8 @@ from services.import_diagnostics import (
     column_drop_cascade, finding_key, dangling_reference_findings, table_cleanup_findings,
     realign_column_types, warehouse_type_to_ts, warehouse_type_findings, type_family, type_class,
     recase_columns, model_tables_without_columns, prune_tables_whole, prune_stale_realignments,
-    restore_unneeded_type_changes, promotion_plan,
+    restore_unneeded_type_changes, promotion_plan, scan_names_for_drops,
+    dependents_using_columns,
     blocking, warnings_only, is_blocking_result, drop_column_properties,
 )
 from services.table_matcher import column_signature
@@ -392,6 +393,30 @@ def _log_discovery_pass(passes, errs, found, drop_set, viz_set, man, removed):
         logdir = Path(__file__).parent / "logs"
         logdir.mkdir(exist_ok=True)
         with open(logdir / "discovery.jsonl", "a") as fh:
+            fh.write(json.dumps(rec) + "\n")
+    except Exception:
+        pass
+    return rec
+
+
+def _log_target_delete(host, team, rows, results):
+    """Append an audit record of objects DELETED ON THE TARGET to logs/target_deletes.jsonl.
+
+    This is the only action in the tool that destroys customer content on another cluster, so it
+    records what was removed, who authored it, which dropped column implicated it, and the HTTP
+    status per object — before anyone has to reconstruct it from memory. Never raises."""
+    import datetime
+    rec = {
+        "ts":   datetime.datetime.now().isoformat(timespec="seconds"),
+        "host": host, "team": team,
+        "deleted": [{"id": r.get("id"), "name": r.get("name"), "type": r.get("type"),
+                     "author": r.get("author"), "columns": r.get("columns"),
+                     "status": results.get(r.get("id"))} for r in rows],
+    }
+    try:
+        logdir = Path(__file__).parent / "logs"
+        logdir.mkdir(exist_ok=True)
+        with open(logdir / "target_deletes.jsonl", "a") as fh:
             fh.write(json.dumps(rec) + "\n")
     except Exception:
         pass
@@ -4031,6 +4056,135 @@ elif step == 4:
                                  "model": m["name"]}
                                 for m in nl_models]
                     nl_ack = render_nl_panel(st.session_state._nl_previews)
+
+                # ── Target dependents of the columns being dropped ────────────────────────────
+                # Last gate before import. A column leaving the model can break answers and
+                # liveboards that already exist ON THE TARGET, and the operator usually cannot see
+                # all of them (GSK has no RBAC/OMS, so there is no limited-admin path).
+                _scan_names = scan_names_for_drops(
+                    st.session_state.get("dropped_col_names") or set(),
+                    st.session_state.get("dropped_cascade_names") or set())
+                if _scan_names:
+                    st.divider()
+                    st.markdown("##### Target objects built on the dropped column(s)")
+                    _dep_rows = st.session_state.get("_tgt_dep_rows")
+                    _c1, _c2 = st.columns([1.6, 3])
+                    with _c1:
+                        if st.button("Check the target for dependents", key="chk_tgt_deps"):
+                            with st.status("Asking the target what depends on these columns…",
+                                           expanded=True) as _ds:
+                                try:
+                                    _tnames = sorted({s.split("::")[0] for s in
+                                                      (st.session_state.get("dropped_col_names") or set())
+                                                      if "::" in s})
+                                    _ds.write(f"Resolving {len(_tnames)} table(s) on the target…")
+                                    _tgt = target_client()
+                                    _ids = _tgt._resolve_names_to_ids(_tnames, "LOGICAL_TABLE")
+                                    _ds.write(f"Listing dependents of {len(_ids)} table(s)…")
+                                    _cand = []
+                                    for _sid, _deps in _tgt.list_dependents(
+                                            list(_ids.values()), "LOGICAL_TABLE").items():
+                                        _cand.extend(_deps)
+                                    _seen_d, _uniq = set(), []
+                                    for _d in _cand:
+                                        if _d.get("id") and _d["id"] not in _seen_d:
+                                            _seen_d.add(_d["id"]); _uniq.append(_d)
+                                    _ds.write(f"{len(_uniq)} object(s) depend on those tables. "
+                                              f"Reading each one to see which use the dropped "
+                                              f"column(s)…")
+                                    for _d in _uniq:
+                                        try:
+                                            _raw = _tgt.export_tml([_d["id"]])
+                                            _its = _raw if isinstance(_raw, list) else _raw.get("object", [])
+                                            _d["tml"] = (_its[0].get("edoc") if _its else None)
+                                        except Exception:
+                                            _d["tml"] = None
+                                    _hits = dependents_using_columns(_uniq, _scan_names)
+                                    for _h in _hits:
+                                        _src = next((x for x in _uniq if x["id"] == _h["id"]), {})
+                                        _h["author"] = _src.get("author", "")
+                                        _h["label"] = _src.get("label") or _h.get("type")
+                                    st.session_state._tgt_dep_rows = _hits
+                                    st.session_state._tgt_dep_scanned = len(_uniq)
+                                    _ds.update(label=f"{len(_hits)} of {len(_uniq)} dependent(s) "
+                                                     f"use a dropped column.",
+                                               state="complete", expanded=False)
+                                except Exception as _e:
+                                    _ds.update(label="Couldn't read the target's dependents: "
+                                                     + str(_e)[:160], state="error")
+                            st.rerun()
+                    with _c2:
+                        st.caption("Only objects **this account can see**. GSK has no RBAC/OMS, so "
+                                   "an answer owned by someone else may exist and not appear here. "
+                                   "A clean result is not proof that nothing depends on the column.")
+                    if _dep_rows is not None:
+                        if not _dep_rows:
+                            st.success(f"No visible dependent uses these columns "
+                                       f"({st.session_state.get('_tgt_dep_scanned', 0)} object(s) "
+                                       f"checked).")
+                        else:
+                            import pandas as pd
+                            _dsel = st.session_state.setdefault("tgt_dep_selected", set())
+                            _ddf = pd.DataFrame([{
+                                "#": _i + 1,
+                                "Object": _r.get("name") or "(unnamed)",
+                                "Type": _r.get("label") or _r.get("type") or "",
+                                "Author": _r.get("author") or "",
+                                "Uses": ", ".join(_r.get("columns") or []) or "unreadable TML",
+                                "Delete?": _r.get("id") in _dsel,
+                                "_scoped": _r.get("id")} for _i, _r in enumerate(_dep_rows)],
+                                columns=["#", "Object", "Type", "Author", "Uses", "Delete?",
+                                         "_scoped"])
+                            st.warning(f"**{len(_ddf)}** target object(s) reference a column this "
+                                       "promotion removes. Importing will break them, or be "
+                                       "rejected because they depend on the column.")
+                            _select_editor(
+                                _ddf, ["Delete?"], ["tgt_dep_selected"], "tgtdep",
+                                column_config={
+                                    "#":       st.column_config.TextColumn("#", width="small"),
+                                    "Object":  st.column_config.TextColumn("Object", width="large"),
+                                    "Type":    st.column_config.TextColumn("Type", width="small"),
+                                    "Author":  st.column_config.TextColumn("Author", width="medium"),
+                                    "Uses":    st.column_config.TextColumn("Uses", width="medium"),
+                                    "Delete?": st.column_config.CheckboxColumn(
+                                        "Delete?", width="small",
+                                        help="Permanently delete this object ON THE TARGET."),
+                                },
+                                disabled=["#", "Object", "Type", "Author", "Uses"])
+                            _picked = [r for r in _dep_rows if r.get("id") in _dsel]
+                            if _picked:
+                                st.error(f"**{len(_picked)} object(s) will be PERMANENTLY DELETED "
+                                         f"on `{opt_env('TS_TARGET_HOST')}`.** This cannot be "
+                                         "undone, and it removes someone else's work. Type "
+                                         "**DELETE** to confirm.")
+                                _typed = st.text_input("Confirm deletion", key="tgt_del_confirm",
+                                                       label_visibility="collapsed",
+                                                       placeholder="type DELETE")
+                                if st.button(f"Delete {len(_picked)} object(s) on the target",
+                                             key="do_tgt_del", type="secondary",
+                                             disabled=_typed.strip().upper() != "DELETE"):
+                                    _res = {}
+                                    with st.status("Deleting on the target…", expanded=True) as _dl:
+                                        for _r in _picked:
+                                            try:
+                                                _res[_r["id"]] = target_client().delete_metadata(
+                                                    _r.get("type") or "ANSWER", _r["id"])
+                                            except Exception as _e:
+                                                _res[_r["id"]] = str(_e)[:120]
+                                            _dl.write(f"{_r.get('name')}: {_res[_r['id']]}")
+                                        _log_target_delete(opt_env("TS_TARGET_HOST"), team_name,
+                                                           _picked, _res)
+                                        _ok = sum(1 for v in _res.values() if v in (200, 204))
+                                        _dl.update(label=f"Deleted {_ok} of {len(_picked)} "
+                                                         f"(logged to logs/target_deletes.jsonl)",
+                                                   state="complete" if _ok == len(_picked) else "error")
+                                    st.session_state._tgt_dep_rows = [
+                                        r for r in _dep_rows
+                                        if _res.get(r.get("id")) not in (200, 204)]
+                                    _dsel.clear()
+                                    st.session_state.pop("tgt_del_confirm", None)
+                                    st.rerun()
+                    st.divider()
 
                 if st.button("Merge & Import to Target", type="primary",
                              disabled=not (proceed and replace_ack and nl_ack)):
