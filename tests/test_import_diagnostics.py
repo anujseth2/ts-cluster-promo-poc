@@ -536,6 +536,31 @@ def test_within_family_type_drift_is_flagged_not_swallowed():
         assert found[0]["source_type"] == "DOUBLE"
 
 
+def test_dependents_are_narrowed_to_the_dropped_column():
+    # list_dependents answers "what depends on this TABLE", which implicates every answer built on
+    # a 45-column table when one column goes. Dropping a column must only implicate the dependents
+    # that actually reference THAT column, or the operator is handed a list they cannot act on.
+    from services.import_diagnostics import dependents_using_columns
+    uses = {"id": "a1", "name": "Calls by Rep", "type": "ANSWER",
+            "tml": json.dumps({"answer": {"name": "Calls by Rep", "answer_columns": [
+                {"name": "Calls"}, {"name": "Rep"}]}})}
+    other = {"id": "a2", "name": "Patients by Brand", "type": "ANSWER",
+             "tml": json.dumps({"answer": {"answer_columns": [{"name": "Patients"}]}})}
+    formula = {"id": "a3", "name": "Derived", "type": "ANSWER",
+               "tml": json.dumps({"answer": {"formulas": [
+                   {"name": "f", "expr": "sum([fact_x::CALLS]) / 2"}]}})}
+    unreadable = {"id": "a4", "name": "Broken export", "type": "LIVEBOARD", "tml": None}
+    found = dependents_using_columns([uses, other, formula, unreadable], {"Calls", "CALLS"})
+    by_id = {f["id"]: f for f in found}
+    assert set(by_id) == {"a1", "a3", "a4"}, "only the dependents that use the column, plus unknowns"
+    assert by_id["a1"]["columns"] == ["calls"] and by_id["a1"]["certain"]
+    assert by_id["a3"]["certain"], "a formula reference counts, qualified or not"
+    assert by_id["a4"]["certain"] is False, "an unreadable dependent is surfaced, not dropped"
+    assert "a2" not in by_id, "a dependent of the same table that uses other columns is not implicated"
+    # no drop set => nothing is implicated at all
+    assert dependents_using_columns([uses], set()) == []
+
+
 def test_promotion_plan_distinguishes_the_four_cases():
     # The Select page's promotion set moved from a stack of checkboxes to one table. The four
     # outcomes of leaving something out differ in what they DESTROY, so they are tested here

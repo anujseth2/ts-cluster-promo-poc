@@ -1341,6 +1341,58 @@ def drop_column_properties(items, targets):
     return out, removed
 
 
+def dependents_using_columns(dependents, dropped_names):
+    """Narrow TABLE-level dependents down to the ones that actually reference a DROPPED COLUMN.
+
+    `list_dependents` answers "what depends on this table", which is far too broad: dropping one
+    column of a 45-column table would otherwise implicate every answer built on it. So each
+    candidate's own TML is scanned for a reference to the specific columns going away.
+
+    `dependents`: [{"id", "name", "type", "tml": str|dict}] — tml as exported from the TARGET.
+    `dropped_names`: the names to look for. Pass BOTH spellings of each column, its display name
+    and its physical db_column_name, because a dependent refers to it by display name while the
+    drop set is keyed on the physical one.
+
+    Returns [{"id", "name", "type", "columns": [names actually referenced], "certain": bool}].
+    `certain` is False when the dependent's TML could not be read, in which case it is still
+    reported — an unreadable dependent is a reason for caution, not a reason to go quiet.
+
+    IMPORTANT: this can only see dependents the calling account can see. It does not, and cannot,
+    prove that nothing else depends on the column."""
+    want = {(n or "").strip().lower() for n in (dropped_names or ()) if (n or "").strip()}
+    if not want:
+        return []
+    out = []
+    for d in dependents or []:
+        tml = d.get("tml")
+        if not tml:
+            out.append({"id": d.get("id"), "name": d.get("name"), "type": d.get("type"),
+                        "columns": [], "certain": False})
+            continue
+        try:
+            doc = tml if isinstance(tml, dict) else (
+                json.loads(tml) if str(tml).strip().startswith("{") else _yaml_load(tml))
+        except Exception:
+            out.append({"id": d.get("id"), "name": d.get("name"), "type": d.get("type"),
+                        "columns": [], "certain": False})
+            continue
+        hit = set()
+        for s in _iter_strings(doc):
+            low = s.strip().lower()
+            if low in want:                       # a bare name (answer_columns entry, viz column)
+                hit.add(low)
+            for inner in _BRACKET_REF.findall(s):  # [Display Name] / [table::COL] in a formula
+                tail = inner.split("::")[-1].strip().lower()
+                if tail in want:
+                    hit.add(tail)
+                elif inner.strip().lower() in want:
+                    hit.add(inner.strip().lower())
+        if hit:
+            out.append({"id": d.get("id"), "name": d.get("name"), "type": d.get("type"),
+                        "columns": sorted(hit), "certain": True})
+    return out
+
+
 def promotion_plan(model_ids, table_ids, id2name, present, selected):
     """What leaving an object out of the promotion set actually means.
 

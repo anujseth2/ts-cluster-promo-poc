@@ -4508,11 +4508,13 @@ elif step == 5:
                     _e["src"] += 1
                     _e["promo"] += 1 if _r["Promoted"] == "✓" else 0
                     _e["land"] += 1 if _r["Target TML"] == "✓" else 0
+                # Two counts, named for WHERE the columns are. "Promoted" and "landed" meant
+                # different things to each side of the GSK call, so the table says what this run
+                # sent and what the target holds, and nothing else. (The source count and the
+                # not-promoted count moved into the per-column drill-down below.)
                 _tbl_rows = [{"Table": _t,
-                              "Source TML cols": _v["src"],
-                              "Promoted cols":   _v["promo"],
-                              "Landed cols":     _v["land"],
-                              "Not promoted":    _v["src"] - _v["promo"]}
+                              "Promoted columns": _v["promo"],
+                              "Target columns":   _v["land"]}
                              for _t, _v in sorted(_per_tbl.items())]
                 _n_land  = sum(1 for r in _cj_rows if r["Target TML"] == "✓")
                 _n_drop  = sum(1 for r in _cj_rows if r["Note"].startswith("dropped"))
@@ -4522,8 +4524,11 @@ elif step == 5:
                             f"{_n_casc} removed as dependents · {_n_stale} stale in the source "
                             f"warehouse · {_n_land} landed on target")
                 st.dataframe(_sno(pd.DataFrame(_tbl_rows, columns=[
-                    "Table", "Source TML cols", "Promoted cols", "Landed cols", "Not promoted"])),
+                    "Table", "Promoted columns", "Target columns"])),
                     use_container_width=True, hide_index=True)
+                st.caption("**Promoted columns** = what this run sent. **Target columns** = what "
+                           "the target model holds now. They differ when a column was dropped, or "
+                           "when the target already carried columns this promotion didn't include.")
 
                 with st.expander(f"Per-column detail ({len(_cj_rows)} row(s))", expanded=False):
                     _cjdf = pd.DataFrame(_cj_rows, columns=["Table", "Column", "Source TML",
