@@ -286,6 +286,24 @@ class TSClient:
         "LOGICAL_TABLE":         "model/table",
     }
 
+    # metadata/search's dependent_objects reports the OLD type names; metadata/delete and the rest
+    # of the v2 API only accept the new ones. VERIFIED on ps-internal 2026-09-23: deleting with
+    # "QUESTION_ANSWER_BOOK" returns 400 'got invalid value', while "ANSWER" is accepted. Passing
+    # the dependency type straight through is why deleting a blocking answer failed.
+    DEP_TYPE_TO_METADATA = {
+        "PINBOARD_ANSWER_BOOK":  "LIVEBOARD",
+        "QUESTION_ANSWER_BOOK":  "ANSWER",
+        "ANSWER":                "ANSWER",
+        "LIVEBOARD":             "LIVEBOARD",
+        "LOGICAL_TABLE":         "LOGICAL_TABLE",
+    }
+
+    @classmethod
+    def metadata_type_for(cls, obj_type: str) -> str:
+        """The v2 metadata type for a type that may have come from a dependency listing."""
+        t = (obj_type or "").strip()
+        return cls.DEP_TYPE_TO_METADATA.get(t.upper(), t.upper() or "ANSWER")
+
     def list_dependents(self, object_ids: List[str],
                         obj_type: str = "LOGICAL_TABLE",
                         record_size: int = 500) -> Dict[str, List[Dict]]:
@@ -602,13 +620,18 @@ class TSClient:
         CAUTION: 204 does NOT prove the object is gone. Verified on ps-internal 2026-09-22 — a
         non-admin asked to delete an object they cannot see and got 204 while the object survived
         untouched. Use delete_metadata_verified() for anything the operator is told succeeded."""
-        payload = {"metadata": [{"type": obj_type, "identifier": identifier}]}
+        return self._delete_once(self.metadata_type_for(obj_type), identifier).status_code
+
+    def _delete_once(self, metadata_type: str, identifier: str):
+        """POST metadata/delete once and return the RESPONSE, so callers can read the body.
+        `metadata_type` must already be a v2 type — use metadata_type_for() to normalise."""
+        payload = {"metadata": [{"type": metadata_type, "identifier": identifier}]}
         url = f"{self.host}/api/rest/2.0/metadata/delete"
         resp = self._session.post(url, json=payload, timeout=60)
         if resp.status_code == 401 and self._username and self._password:
             self._session_login()
             resp = self._session.post(url, json=payload, timeout=60)
-        return resp.status_code
+        return resp
 
     def object_exists(self, obj_type: str, identifier: str) -> bool:
         """Whether this account can still find the object. False also when it was never visible."""
@@ -627,12 +650,32 @@ class TSClient:
         reports a deletion that did not happen — and in this tool that would tell the operator a
         blocking dependent was cleared when it is still there, sending them into an import that
         fails for the reason they thought they had fixed."""
-        status = self.delete_metadata(obj_type, identifier)
+        mtype = self.metadata_type_for(obj_type)
+        resp = self._delete_once(mtype, identifier)
+        status = resp.status_code
         if status not in (200, 204):
-            return False, status, f"HTTP {status}"
-        if self.object_exists(obj_type, identifier):
+            body = ""
+            try:
+                body = json.dumps(resp.json())
+            except Exception:
+                body = resp.text or ""
+            # Distinguish the three very different reasons a delete can fail, because telling the
+            # operator "you lack rights" when the request was malformed sends them to an admin for
+            # a bug in this tool (VERIFIED: that is exactly what happened on 2026-09-23).
+            if "got invalid value" in body:
+                detail = (f"the request was malformed — `{mtype}` was rejected as a metadata "
+                          "type. That is a bug in this tool, not a permission problem.")
+            elif '"code":13003' in body.replace(" ", "") or "13003" in body:
+                detail = ("the target says no such object — it may already be gone, or it is not "
+                          "visible to this account.")
+            elif status == 403:
+                detail = "the account lacks rights to delete it; its owner or an admin must."
+            else:
+                detail = f"HTTP {status}: {body[:200]}"
+            return False, status, detail
+        if self.object_exists(mtype, identifier):
             return False, status, ("the server accepted the request but the object is still "
-                                   "there — you most likely lack rights to delete it")
+                                   "there — the account most likely lacks rights on it.")
         return True, status, "deleted"
 
     def export_feedback_entries(self, model_guid: str) -> List[Dict]:
