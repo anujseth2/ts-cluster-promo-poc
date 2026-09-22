@@ -972,6 +972,24 @@ class TSClient:
                     time.sleep(_RETRY_BACKOFF[min(attempt, len(_RETRY_BACKOFF) - 1)])
         raise last
 
+    # "Warning: Existing guid <g> corresponding to object Id <o> will be used." is the platform
+    # confirming an update-in-place, and on its own it is not a failure. But it is APPENDED to
+    # whatever else happened, so a real error arrives with the notice glued on the end. Matching
+    # the substring anywhere therefore silences genuine failures: on 2026-09-23 an import that was
+    # rejected with 14544 "Deleted columns have dependents" was reported as "Import complete", the
+    # objects were listed as succeeded, and the target was of course unchanged.
+    _GUID_NOTICE = re.compile(
+        r"(?:Warning:\s*)?Existing guid\s+\S+\s+corresponding to object Id\s+\S+\s+will be used\.?",
+        re.I)
+
+    @classmethod
+    def _is_benign_update_notice(cls, error_message: str) -> bool:
+        """True only when the message is the update-in-place notice AND NOTHING ELSE."""
+        rest = cls._GUID_NOTICE.sub("", error_message or "")
+        for tag in ("<br/>", "<br />", "<br>", "</br>", "<b>", "</b>", "Warning:"):
+            rest = rest.replace(tag, " ")
+        return not rest.strip()
+
     @staticmethod
     def _raw_has_error(data) -> bool:
         """True if any object in a raw import/validate response is non-OK (ignoring the benign
@@ -982,7 +1000,8 @@ class TSClient:
                 continue
             status = (item.get("response", item).get("status") or {})
             code = status.get("status_code", "OK")
-            if code and code != "OK" and "will be used" not in (status.get("error_message") or ""):
+            if code and code != "OK" and not TSClient._is_benign_update_notice(
+                    status.get("error_message") or ""):
                 return True
         return False
 
@@ -1086,8 +1105,9 @@ class TSClient:
             status   = response.get("status", {})
             status_code = status.get("status_code", "UNKNOWN")
             error_msg   = status.get("error_message", "")
-            # "Existing guid ... will be used" is an informational update notice, not a failure
-            if status_code != "OK" and "will be used" in error_msg:
+            # The update-in-place notice on its OWN is not a failure. It is appended to whatever
+            # else happened, so only neutralise the status when nothing else is in the message.
+            if status_code != "OK" and self._is_benign_update_notice(error_msg):
                 status_code = "OK"
                 error_msg   = ""
             results.append({
