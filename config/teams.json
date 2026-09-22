@@ -1,8 +1,8 @@
 {
   "Commercial SBU": {
     "tags": [],
-    "source_connection": "",
-    "target_connection": "",
+    "source_connection": "DB Dev",
+    "target_connection": "DB Prod",
     "db_map": {},
     "schema_map": {}
   },
@@ -12,6 +12,13 @@
     ],
     "source_connection": "",
     "target_connection": "",
+    "db_map": {},
+    "schema_map": {}
+  },
+  "GitDevProd": {
+    "tags": [],
+    "source_connection": "DB Dev",
+    "target_connection": "DB Prod",
     "db_map": {},
     "schema_map": {}
   }

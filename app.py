@@ -4183,10 +4183,23 @@ elif step == 4:
                                         except Exception:
                                             _d["tml"] = None
                                     _hits = dependents_using_columns(_uniq, _scan_names)
+                                    # An object THIS PROMOTION is updating is not a casualty of the
+                                    # drop — it IS the drop. The model being promoted depends on
+                                    # its own table, so it lands in the dependents list, and
+                                    # deleting it would remove the very thing being updated plus
+                                    # everything hanging off it, most of which never touched the
+                                    # dropped column. Mark those in-promotion and never offer them.
+                                    _promo_names = {(_i.get("info", {}).get("name") or "").strip().lower()
+                                                    for _i in (filtered_items or [])}
+                                    _promo_names |= {(_n or "").strip().lower() for _n in
+                                                     (st.session_state.get("_promo_id2name") or {}).values()}
+                                    _promo_names.discard("")
                                     for _h in _hits:
                                         _src = next((x for x in _uniq if x["id"] == _h["id"]), {})
                                         _h["author"] = _src.get("author", "")
                                         _h["label"] = _src.get("label") or _h.get("type")
+                                        _h["in_promotion"] = (
+                                            (_h.get("name") or "").strip().lower() in _promo_names)
                                     st.session_state._tgt_dep_rows = _hits
                                     st.session_state._tgt_dep_scanned = len(_uniq)
                                     _ds.update(label=f"{len(_hits)} of {len(_uniq)} dependent(s) "
@@ -4208,19 +4221,35 @@ elif step == 4:
                         else:
                             import pandas as pd
                             _dsel = st.session_state.setdefault("tgt_dep_selected", set())
+                            # Never offer an object this promotion is updating. It is listed so the
+                            # operator can see WHY it is implicated, but it is not a casualty — the
+                            # import rewrites it, and deleting it would take its own dependents with
+                            # it, most of which never used the dropped column.
+                            _inpromo = {_r.get("id") for _r in _dep_rows if _r.get("in_promotion")}
+                            for _gid in list(_dsel):
+                                if _gid in _inpromo:
+                                    _dsel.discard(_gid)
                             _ddf = pd.DataFrame([{
                                 "#": _i + 1,
                                 "Object": _r.get("name") or "(unnamed)",
                                 "Type": _r.get("label") or _r.get("type") or "",
                                 "Author": _r.get("author") or "",
                                 "Uses": ", ".join(_r.get("columns") or []) or "unreadable TML",
-                                "Delete?": _r.get("id") in _dsel,
+                                "Status": ("in this promotion — updated, not deleted"
+                                           if _r.get("in_promotion") else "would break"),
+                                "Delete?": (False if _r.get("in_promotion")
+                                            else _r.get("id") in _dsel),
                                 "_scoped": _r.get("id")} for _i, _r in enumerate(_dep_rows)],
-                                columns=["#", "Object", "Type", "Author", "Uses", "Delete?",
-                                         "_scoped"])
-                            st.warning(f"**{len(_ddf)}** target object(s) reference a column this "
-                                       "promotion removes. Importing will break them, or be "
-                                       "rejected because they depend on the column.")
+                                columns=["#", "Object", "Type", "Author", "Uses", "Status",
+                                         "Delete?", "_scoped"])
+                            _n_break = sum(1 for _r in _dep_rows if not _r.get("in_promotion"))
+                            _n_own = len(_dep_rows) - _n_break
+                            st.warning(f"**{_n_break}** target object(s) reference a column this "
+                                       "promotion removes and would break, or make the import be "
+                                       "rejected."
+                                       + (f"  A further **{_n_own}** are part of this promotion "
+                                          "and are UPDATED in place — never delete those, it would "
+                                          "take their own dependents with them." if _n_own else ""))
                             _select_editor(
                                 _ddf, ["Delete?"], ["tgt_dep_selected"], "tgtdep",
                                 column_config={
@@ -4229,12 +4258,18 @@ elif step == 4:
                                     "Type":    st.column_config.TextColumn("Type", width="small"),
                                     "Author":  st.column_config.TextColumn("Author", width="medium"),
                                     "Uses":    st.column_config.TextColumn("Uses", width="medium"),
+                                    "Status":  st.column_config.TextColumn(
+                                        "Status", width="medium",
+                                        help="Objects in this promotion are rewritten by the "
+                                             "import, so they are never deletion candidates."),
                                     "Delete?": st.column_config.CheckboxColumn(
                                         "Delete?", width="small",
-                                        help="Permanently delete this object ON THE TARGET."),
+                                        help="Permanently delete this object ON THE TARGET. "
+                                             "Ignored for rows that are part of this promotion."),
                                 },
-                                disabled=["#", "Object", "Type", "Author", "Uses"])
-                            _picked = [r for r in _dep_rows if r.get("id") in _dsel]
+                                disabled=["#", "Object", "Type", "Author", "Uses", "Status"])
+                            _picked = [r for r in _dep_rows
+                                       if r.get("id") in _dsel and not r.get("in_promotion")]
                             if _picked:
                                 st.error(f"**{len(_picked)} object(s) will be PERMANENTLY DELETED "
                                          f"on `{opt_env('TS_TARGET_HOST')}`.** This cannot be "

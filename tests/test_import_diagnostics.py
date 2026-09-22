@@ -927,3 +927,27 @@ def test_clean_handles_the_malformed_closing_break():
     # ThoughtSpot emits "</br>" in this payload. Left alone it survives into the rendered text.
     from services.import_diagnostics import _clean
     assert "</br>" not in _clean("a</br>b")
+
+
+def test_the_model_being_promoted_is_not_a_deletion_candidate():
+    # Anuj, 2026-09-23: the dependency panel listed "Sales Customers Model" — the very model being
+    # promoted — as a deletable dependent. It depends on its own table, so the scan finds it. But
+    # the import REWRITES it; deleting it would remove the object being updated and take its own
+    # answers and liveboards with it, most of which never touched the dropped column.
+    from services.import_diagnostics import dependents_using_columns
+    model = {"id": "m1", "name": "Sales Customers Model", "type": "LOGICAL_TABLE",
+             "tml": json.dumps({"model": {"name": "Sales Customers Model",
+                                          "columns": [{"name": "customerid"}]}})}
+    answer = {"id": "a1", "name": "Sales Model Customer Id Answer", "type": "ANSWER",
+              "tml": json.dumps({"answer": {"answer_columns": [{"name": "customerid"}]}})}
+    hits = dependents_using_columns([model, answer], {"customerid"})
+    assert {h["id"] for h in hits} == {"m1", "a1"}, "the scan finds both — that part is right"
+
+    # the app then marks anything in the promotion, and only the rest may be deleted
+    promoted_names = {"sales customers model"}
+    for h in hits:
+        h["in_promotion"] = h["name"].strip().lower() in promoted_names
+    deletable = [h for h in hits if not h["in_promotion"]]
+    assert [h["id"] for h in deletable] == ["a1"], \
+        "the promoted model must never be offered for deletion"
+    assert next(h for h in hits if h["id"] == "m1")["in_promotion"] is True
