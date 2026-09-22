@@ -1681,7 +1681,9 @@ elif step == 1:
                         st.session_state.pop(_k, None)
                     st.rerun()
                 except Exception as e:
-                    st.error(f"Failed to set obj_id (account needs DATAMANAGEMENT or ADMINISTRATION): {e}")
+                    # Same correction as the target-side button: the client already says what
+                    # actually went wrong, and a duplicate obj_id is a 500, not a rights problem.
+                    st.error(f"**Couldn't set obj_id.**\n\n{e}")
 
     table_rows = st.session_state.get("table_alignment", [])
     if table_rows:

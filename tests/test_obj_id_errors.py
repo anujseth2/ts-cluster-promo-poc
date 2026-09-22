@@ -108,3 +108,38 @@ def test_find_objects_by_name_sends_the_original_spelling():
     assert hit == {"id": "g1", "type": "ANSWER",
                    "name": "DEP TEST Answer (uses O Clerk)", "author": "anuj.seth"}
     assert "ghost object" not in got, "a name that resolves to nothing is simply absent"
+
+
+def test_duplicate_error_names_the_holder_when_it_can_be_found():
+    # obj_ids are arbitrary strings, so "it is taken" leaves the operator with nothing to act on.
+    # Naming the holder is what turns the error into a fix — especially when several objects share
+    # a NAME and the wrong one got picked, which is exactly the ps-internal ORDERS case.
+    class _C(TSClient):
+        def __init__(self): pass
+        def _update_obj_id_once(self, mappings): return _Resp(500, _REAL_DUP)
+        def find_holder_of_obj_id(self, obj_id, types=None):
+            return {"id": "605b4cc0", "name": "ORDERS", "type": "LOGICAL_TABLE",
+                    "obj_id": obj_id, "author": "misha.beek@thoughtspot.com"}
+    try:
+        _C().update_obj_ids([{"identifier": "g", "new_obj_id": "orders"}])
+        assert False, "must raise"
+    except RuntimeError as e:
+        msg = str(e)
+    assert "**ORDERS**" in msg and "605b4cc0" in msg
+    assert "misha.beek@thoughtspot.com" in msg
+    assert "sharing a NAME" in msg, "point at the usual cause"
+    assert "per org" in msg and "per cluster" not in msg, \
+        "VERIFIED per-org on ps-internal 2026-09-22, not per-cluster"
+
+
+def test_an_invisible_holder_is_said_to_be_invisible():
+    class _C(TSClient):
+        def __init__(self): pass
+        def _update_obj_id_once(self, mappings): return _Resp(500, _REAL_DUP)
+        def find_holder_of_obj_id(self, obj_id, types=None): return None
+    try:
+        _C().update_obj_ids([{"identifier": "g", "new_obj_id": "orders"}])
+        assert False
+    except RuntimeError as e:
+        msg = str(e)
+    assert "cannot see" in msg and "owner or an admin" in msg

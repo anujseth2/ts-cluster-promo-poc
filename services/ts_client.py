@@ -748,6 +748,39 @@ class TSClient:
             resp = self._session.post(url, json=payload, timeout=60)
         return resp
 
+    def find_holder_of_obj_id(self, obj_id: str, types: Optional[List[str]] = None):
+        """The object currently holding this obj_id in THIS token's org, or None.
+
+        There is no obj_id filter on metadata/search (it 400s), so this pages the org's objects
+        and matches. Called only when a write has already failed, so the cost buys an answer the
+        operator otherwise has to hunt for by hand."""
+        want = (obj_id or "").strip().lower()
+        if not want:
+            return None
+        for obj_type in (types or ["LOGICAL_TABLE", "ANSWER", "LIVEBOARD"]):
+            offset = 0
+            while True:
+                try:
+                    data = self._post("/api/rest/2.0/metadata/search",
+                                      {"metadata": [{"type": obj_type}], "record_size": 500,
+                                       "record_offset": offset})
+                except Exception:
+                    break
+                items = data if isinstance(data, list) else data.get("metadata", [])
+                for it in items:
+                    if (it.get("metadata_obj_id") or "").strip().lower() == want:
+                        hdr = it.get("metadata_header") or {}
+                        return {"id": it.get("metadata_id"),
+                                "name": it.get("metadata_name") or hdr.get("name", ""),
+                                "type": it.get("metadata_type") or obj_type,
+                                "obj_id": it.get("metadata_obj_id"),
+                                "author": hdr.get("authorDisplayName")
+                                or hdr.get("authorName", "")}
+                if len(items) < 500:
+                    break
+                offset += 500
+        return None
+
     @staticmethod
     def _obj_id_error(resp) -> str:
         """Plain reason out of an update-obj-id failure.
@@ -755,7 +788,10 @@ class TSClient:
         VERIFIED on ps-internal 2026-09-22: asking for an obj_id another object already holds
         returns HTTP 500 with code 14009 / DUPLICATE_CUSTOM_OBJECT_ID. It is not a privilege
         problem, which is what this used to be reported as, sending the operator to check rights
-        that were never the issue. A genuine privilege failure comes back 403."""
+        that were never the issue. A genuine privilege failure comes back 403.
+
+        Scope is per-ORG, not per-cluster: the same obj_id was set successfully on an object in a
+        second org while a Primary object held it."""
         body = ""
         try:
             body = json.dumps(resp.json())
@@ -767,12 +803,36 @@ class TSClient:
             flat = body.replace("\\\\u003d", "=").replace("\\u003d", "=").replace("\u003d", "=")
             m = re.search(r"customObjectId\s*=\s*([^\s\\\"',}\]]+)", flat)
             taken = m.group(1) if m else "that obj_id"
-            return (f"obj_id `{taken}` is already held by a different object on this cluster. "
-                    "obj_ids are unique per cluster, so find the object that has it (it is often "
-                    "an older copy of the same content) and delete or re-id that one first.")
+            return (f"obj_id `{taken}` is already held by a different object in this ORG. "
+                    "obj_ids are unique per org (VERIFIED on ps-internal 2026-09-22: the same "
+                    "obj_id CAN exist in another org), so the clash is with something in the org "
+                    "you are pointed at.")
         if resp.status_code == 403:
             return "the account lacks DATAMANAGEMENT or ADMINISTRATION."
         return f"HTTP {resp.status_code}: {body[:300]}"
+
+    def _explain_obj_id_failure(self, resp, wanted_obj_id: str) -> str:
+        """The reason, plus WHO is holding the obj_id when that is the reason.
+
+        Naming the holder is the difference between an error and a fix: obj_ids are arbitrary
+        strings, so "it is taken" leaves the operator with nothing to go on, while "ORDERS
+        (605b4cc0) has it" tells them immediately whether they picked the wrong slug or the model
+        is pointed at the wrong one of several same-named tables."""
+        base = self._obj_id_error(resp)
+        if "already held" not in base:
+            return base
+        try:
+            holder = self.find_holder_of_obj_id(wanted_obj_id)
+        except Exception:
+            holder = None
+        if holder:
+            who = f"**{holder['name']}** ({holder['type']}, `{holder['id']}`"
+            who += f", author {holder['author']})" if holder.get("author") else ")"
+            return (base + f" It is held by {who}. Either choose a different obj_id here, or if "
+                    "that object is the one you actually meant, point at it instead — several "
+                    "objects sharing a NAME is the usual reason the wrong one got picked.")
+        return base + (" Nothing visible to this account holds it, so the holder is an object "
+                       "you cannot see — its owner or an admin has to free it.")
 
     def update_obj_ids(self, mappings: List[Dict]) -> bool:
         """
@@ -791,14 +851,15 @@ class TSClient:
         if resp.status_code in (200, 204):
             return True
         if len(mappings) == 1:
-            raise RuntimeError(self._obj_id_error(resp))
+            raise RuntimeError(self._explain_obj_id_failure(resp, mappings[0]["new_obj_id"]))
         bad, ok = [], 0
         for m in mappings:
             r1 = self._update_obj_id_once([m])
             if r1.status_code in (200, 204):
                 ok += 1
             else:
-                bad.append(f"`{m['new_obj_id']}` — {self._obj_id_error(r1)}")
+                bad.append(f"`{m['new_obj_id']}` — "
+                           + self._explain_obj_id_failure(r1, m["new_obj_id"]))
         raise RuntimeError(
             f"{ok} of {len(mappings)} obj_id(s) set; {len(bad)} failed:\n- " + "\n- ".join(bad))
 
