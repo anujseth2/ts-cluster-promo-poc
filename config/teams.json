@@ -5,5 +5,14 @@
     "target_connection": "",
     "db_map": {},
     "schema_map": {}
+  },
+  "DepTest": {
+    "tags": [
+      "dep-test"
+    ],
+    "source_connection": "",
+    "target_connection": "",
+    "db_map": {},
+    "schema_map": {}
   }
 }

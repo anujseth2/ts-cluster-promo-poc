@@ -7,6 +7,7 @@ client, each with its own host + credentials.
 """
 
 import json
+import re
 import time
 import yaml
 from datetime import datetime
@@ -696,12 +697,8 @@ class TSClient:
         row = res[0] if res else {}
         return {"name": name, "status": row.get("status", "ERROR"), "error": row.get("error", "")}
 
-    def update_obj_ids(self, mappings: List[Dict]) -> bool:
-        """
-        Set obj_id on existing objects. mappings: [{"identifier": <guid>, "new_obj_id": <str>}].
-        POST /metadata/update-obj-id (10.8.0.cl+). Needs DATAMANAGEMENT or ADMINISTRATION.
-        Returns True on success (HTTP 204 No Content).
-        """
+    def _update_obj_id_once(self, mappings: List[Dict]):
+        """POST /metadata/update-obj-id for these mappings. Returns the response."""
         payload = {"metadata": [{"metadata_identifier": m["identifier"],
                                  "new_obj_id": m["new_obj_id"]} for m in mappings]}
         url = f"{self.host}/api/rest/2.0/metadata/update-obj-id"
@@ -709,8 +706,61 @@ class TSClient:
         if resp.status_code == 401 and self._username and self._password:
             self._session_login()
             resp = self._session.post(url, json=payload, timeout=60)
-        resp.raise_for_status()
-        return resp.status_code in (200, 204)
+        return resp
+
+    @staticmethod
+    def _obj_id_error(resp) -> str:
+        """Plain reason out of an update-obj-id failure.
+
+        VERIFIED on ps-internal 2026-09-22: asking for an obj_id another object already holds
+        returns HTTP 500 with code 14009 / DUPLICATE_CUSTOM_OBJECT_ID. It is not a privilege
+        problem, which is what this used to be reported as, sending the operator to check rights
+        that were never the issue. A genuine privilege failure comes back 403."""
+        body = ""
+        try:
+            body = json.dumps(resp.json())
+        except Exception:
+            body = resp.text or ""
+        if "DUPLICATE_CUSTOM_OBJECT_ID" in body or '"code":14009' in body.replace(" ", ""):
+            # The platform writes "=" as the escaped \u003d, and json.dumps doubles the backslash
+            # again, so normalise both before reading the id back out.
+            flat = body.replace("\\\\u003d", "=").replace("\\u003d", "=").replace("\u003d", "=")
+            m = re.search(r"customObjectId\s*=\s*([^\s\\\"',}\]]+)", flat)
+            taken = m.group(1) if m else "that obj_id"
+            return (f"obj_id `{taken}` is already held by a different object on this cluster. "
+                    "obj_ids are unique per cluster, so find the object that has it (it is often "
+                    "an older copy of the same content) and delete or re-id that one first.")
+        if resp.status_code == 403:
+            return "the account lacks DATAMANAGEMENT or ADMINISTRATION."
+        return f"HTTP {resp.status_code}: {body[:300]}"
+
+    def update_obj_ids(self, mappings: List[Dict]) -> bool:
+        """
+        Set obj_id on existing objects. mappings: [{"identifier": <guid>, "new_obj_id": <str>}].
+        POST /metadata/update-obj-id (10.8.0.cl+). Needs DATAMANAGEMENT or ADMINISTRATION.
+        Returns True on success (HTTP 204 No Content); raises RuntimeError naming the offending
+        object when it fails.
+
+        The API takes the whole batch in one call, so ONE bad mapping fails all of them and the
+        response says nothing about which. On failure this retries them individually to name the
+        culprit — without that, a 20-object fix reports a single opaque 500.
+        """
+        if not mappings:
+            return True
+        resp = self._update_obj_id_once(mappings)
+        if resp.status_code in (200, 204):
+            return True
+        if len(mappings) == 1:
+            raise RuntimeError(self._obj_id_error(resp))
+        bad, ok = [], 0
+        for m in mappings:
+            r1 = self._update_obj_id_once([m])
+            if r1.status_code in (200, 204):
+                ok += 1
+            else:
+                bad.append(f"`{m['new_obj_id']}` — {self._obj_id_error(r1)}")
+        raise RuntimeError(
+            f"{ok} of {len(mappings)} obj_id(s) set; {len(bad)} failed:\n- " + "\n- ".join(bad))
 
     # ── TML export ────────────────────────────────────────────────────────────
 

@@ -1752,7 +1752,10 @@ elif step == 1:
                             st.session_state.pop(_k, None)
                         st.rerun()
                     except Exception as e:
-                        st.error(f"Failed to set obj_id (account needs DATAMANAGEMENT or ADMINISTRATION): {e}")
+                        # The client names the offending object and the real reason. Do not guess
+                        # at privileges here: a duplicate obj_id returns 500, not 403, and telling
+                        # the operator to go check rights sends them somewhere with nothing wrong.
+                        st.error(f"**Couldn't set obj_id.**\n\n{e}")
 
     all_ok = (
         bool(status) and not [r for r in status if not r["ok"]]
