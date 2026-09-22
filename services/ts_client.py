@@ -550,6 +550,46 @@ class TSClient:
                 out[t["name"].strip().lower()] = cmap
         return out
 
+    def find_objects_by_name(self, names: List[str],
+                             types: Optional[List[str]] = None) -> Dict[str, Dict]:
+        """Resolve object NAMES to {id, type, name, author} across several metadata types.
+
+        A "Deleted columns have dependents" error names the blocking objects but gives no guid and
+        no type, and deleting one needs both. Returns {name_lower: {...}} for those found; a name
+        that resolves to nothing is simply absent, which is itself the signal that the object is
+        not visible to this account.
+
+        The search `identifier` is CASE-SENSITIVE, so the original spelling is sent and the match
+        is compared case-insensitively — lowercasing the query returns zero rows."""
+        out: Dict[str, Dict] = {}
+        originals = [n.strip() for n in (names or []) if (n or "").strip()]
+        if not originals:
+            return out
+        for obj_type in (types or ["ANSWER", "LIVEBOARD", "LOGICAL_TABLE"]):
+            for original in originals:
+                key = original.lower()
+                if key in out:
+                    continue
+                try:
+                    data = self._post("/api/rest/2.0/metadata/search",
+                                      {"metadata": [{"type": obj_type, "identifier": original}],
+                                       "record_size": 10})
+                except Exception:
+                    continue
+                items = data if isinstance(data, list) else data.get("metadata", [])
+                for it in items:
+                    hdr = it.get("metadata_header") or {}
+                    found = (it.get("metadata_name") or hdr.get("name") or "").strip()
+                    if found.lower() != key:
+                        continue
+                    out[key] = {"id": it.get("metadata_id"),
+                                "type": it.get("metadata_type") or obj_type,
+                                "name": found,
+                                "author": hdr.get("authorDisplayName")
+                                or hdr.get("authorName", "")}
+                    break
+        return out
+
     def real_dependents(self, model_guid: str) -> List[Dict]:
         """Cluster-wide dependents of a model EXCLUDING its own feedback (type=FEEDBACK).
         Feedback appears as a dependent but dies with the model, so it must not block deletion."""

@@ -3231,6 +3231,84 @@ elif step == 3:
                         _line += " — likely from column(s): " + ", ".join(f"`{c}`" for c in _cols)
                     st.warning(_line + ".")
 
+                # ── remove the blockers, HERE ──────────────────────────────────────────────
+                # The remedy belongs where the problem is stated. This used to live only on Git
+                # Operations, so the operator read "blocked by X" on this page and had to go
+                # looking for the way to act on it.
+                _blk_names = sorted({d for ds in _col_deps.values() for d in ds if d})
+                if _blk_names:
+                    with st.spinner("Looking up the blocking object(s) on the target…"):
+                        _resolved = target_client().find_objects_by_name(_blk_names)
+                    _rows_b = []
+                    for _n in _blk_names:
+                        _hit = _resolved.get(_n.strip().lower())
+                        _rows_b.append({
+                            "Object": _n,
+                            "Type": (_hit or {}).get("type", "—"),
+                            "Author": (_hit or {}).get("author", "—"),
+                            "Can this account delete it?": "yes" if _hit else "not visible",
+                            "_scoped": (_hit or {}).get("id") or f"__unresolved__{_n}",
+                            "_deletable": bool(_hit)})
+                    _bsel = st.session_state.setdefault("blk_del_selected", set())
+                    for _r in _rows_b:
+                        _r["Delete?"] = _r["_scoped"] in _bsel
+                    import pandas as pd
+                    _bdf = pd.DataFrame(_rows_b, columns=[
+                        "Object", "Type", "Author", "Can this account delete it?", "Delete?",
+                        "_scoped", "_deletable"]).drop(columns=["_deletable"])
+                    _select_editor(
+                        _bdf, ["Delete?"], ["blk_del_selected"], "blkdel",
+                        column_config={
+                            "Object": st.column_config.TextColumn("Object", width="large"),
+                            "Type":   st.column_config.TextColumn("Type", width="small"),
+                            "Author": st.column_config.TextColumn("Author", width="medium"),
+                            "Can this account delete it?": st.column_config.TextColumn(
+                                "Can this account delete it?", width="medium",
+                                help="'not visible' means the object exists but this account "
+                                     "cannot see it — its owner or an admin has to remove it."),
+                            "Delete?": st.column_config.CheckboxColumn("Delete?", width="small"),
+                        },
+                        disabled=["Object", "Type", "Author", "Can this account delete it?"])
+                    _pick_b = [r for r in _rows_b if r["_scoped"] in _bsel and r["_deletable"]]
+                    _pick_x = [r for r in _rows_b if r["_scoped"] in _bsel and not r["_deletable"]]
+                    if _pick_x:
+                        st.warning("Not visible to this account, so it can't be deleted here: "
+                                   + ", ".join(f"**{r['Object']}**" for r in _pick_x)
+                                   + ". Ask its owner, or run the tool as an admin.")
+                    if _pick_b:
+                        st.error(f"**{len(_pick_b)} object(s) will be PERMANENTLY DELETED on "
+                                 f"`{opt_env('TS_TARGET_HOST')}`.** This removes someone's saved "
+                                 "work and cannot be undone. Type **DELETE** to confirm.")
+                        _tb = st.text_input("Confirm", key="blk_del_confirm",
+                                            label_visibility="collapsed", placeholder="type DELETE")
+                        if st.button(f"Delete {len(_pick_b)} blocking object(s)", key="blk_del_go",
+                                     disabled=_tb.strip().upper() != "DELETE"):
+                            _res_b = {}
+                            with st.status("Deleting on the target…", expanded=True) as _bs:
+                                for _r in _pick_b:
+                                    try:
+                                        _okb, _st_b, _det = target_client().delete_metadata_verified(
+                                            _r["Type"], _r["_scoped"])
+                                    except Exception as _e:
+                                        _okb, _det = False, str(_e)[:140]
+                                    _res_b[_r["_scoped"]] = "deleted" if _okb else _det
+                                    _bs.write(("✓ " if _okb else "✗ ")
+                                              + f"{_r['Object']}: {_res_b[_r['_scoped']]}")
+                                _log_target_delete(opt_env("TS_TARGET_HOST"), team_name,
+                                                   [{"id": r["_scoped"], "name": r["Object"],
+                                                     "type": r["Type"], "author": r["Author"],
+                                                     "columns": []} for r in _pick_b], _res_b)
+                                _okn = sum(1 for v in _res_b.values() if v == "deleted")
+                                _bs.update(label=f"Deleted {_okn} of {len(_pick_b)} "
+                                                 "(logged to logs/target_deletes.jsonl)",
+                                           state="complete" if _okn == len(_pick_b) else "error")
+                            _bsel.clear()
+                            st.session_state.pop("blk_del_confirm", None)
+                            for _k in ("validation_errors", "validation_ok",
+                                       "discovered_findings", "discovered_meta"):
+                                st.session_state.pop(_k, None)
+                            st.rerun()
+
             # ── type drift: column exists on both sides, types differ ──
             if type_mismatch:
                 import pandas as pd

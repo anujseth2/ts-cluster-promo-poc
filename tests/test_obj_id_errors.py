@@ -82,3 +82,29 @@ def test_a_clean_batch_never_retries():
     assert c.update_obj_ids([{"identifier": "g", "new_obj_id": "x"}]) is True
     assert c.calls == 1
     assert c.update_obj_ids([]) is True and c.calls == 1
+
+
+def test_find_objects_by_name_sends_the_original_spelling():
+    # metadata/search's `identifier` is CASE-SENSITIVE. Lowercasing the query before sending it
+    # returns zero rows, so the blocking object looks "not visible" when it is right there — which
+    # would tell the operator to go chase an owner for something they could delete themselves.
+    sent = []
+
+    class _C(TSClient):
+        def __init__(self): pass
+        def _post(self, path, payload):
+            ident = payload["metadata"][0]["identifier"]
+            sent.append(ident)
+            if ident != "DEP TEST Answer (uses O Clerk)":
+                return []
+            return [{"metadata_id": "g1", "metadata_name": "DEP TEST Answer (uses O Clerk)",
+                     "metadata_type": "ANSWER",
+                     "metadata_header": {"authorName": "anuj.seth"}}]
+
+    got = _C().find_objects_by_name(["DEP TEST Answer (uses O Clerk)", "Ghost Object"])
+    assert all(s == s.strip() and s != s.lower() or s == "Ghost Object" for s in sent), sent
+    assert "DEP TEST Answer (uses O Clerk)" in sent, "query must use the original spelling"
+    hit = got["dep test answer (uses o clerk)"]
+    assert hit == {"id": "g1", "type": "ANSWER",
+                   "name": "DEP TEST Answer (uses O Clerk)", "author": "anuj.seth"}
+    assert "ghost object" not in got, "a name that resolves to nothing is simply absent"
