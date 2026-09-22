@@ -3790,9 +3790,10 @@ elif step == 3:
                 # responses (validate_raw.jsonl) and every discovery pass's drops (discovery.jsonl).
                 # Grab them instantly; no re-running anything.
                 st.caption("Captured live as the tool ran — download directly, no re-validation:")
-                _dlrow = st.columns(2)
+                _dlrow = st.columns(3)
                 for _i, (_lf, _lbl) in enumerate([
                         ("validate_raw.jsonl", "⬇ Raw validation errors"),
+                        ("import_raw.jsonl",   "⬇ Raw IMPORT responses"),
                         ("discovery.jsonl",    "⬇ Per-pass drop log")]):
                     _lp = Path(__file__).parent / "logs" / _lf
                     with _dlrow[_i]:

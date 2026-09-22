@@ -193,8 +193,13 @@ def capture(items, client, out_root, timestamp, target_host="", target_connectio
     _write(run_dir, "00_manifest.json", manifest)
 
     # ── copy the as-you-go logs (the primary artifact now — captured while the tool ran) ──
-    for cand in ("logs/validate_runs.jsonl", "logs/validate_raw.jsonl", "logs/discovery.jsonl",
-                 "validate_runs.jsonl", "validate_raw.jsonl", "discovery.jsonl"):
+    # import_raw.jsonl is the record of what was actually WRITTEN to the target, and
+    # apply_detail/target_deletes record what the operator removed. A bundle without them can
+    # explain a failed dry run but not a promotion that landed wrong.
+    for cand in ("logs/validate_runs.jsonl", "logs/validate_raw.jsonl", "logs/import_raw.jsonl",
+                 "logs/discovery.jsonl", "logs/apply_detail.jsonl", "logs/target_deletes.jsonl",
+                 "validate_runs.jsonl", "validate_raw.jsonl", "import_raw.jsonl",
+                 "discovery.jsonl", "apply_detail.jsonl", "target_deletes.jsonl"):
         if os.path.exists(cand):
             os.makedirs(os.path.join(run_dir, "logs"), exist_ok=True)
             with open(cand) as src, open(os.path.join(run_dir, "logs", os.path.basename(cand)), "w") as dst:

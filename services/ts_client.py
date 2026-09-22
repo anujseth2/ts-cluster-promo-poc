@@ -986,20 +986,62 @@ class TSClient:
                 return True
         return False
 
-    def _append_raw_log(self, policy, count, status_code, data):
-        """Append the FULL raw response to debug_raw_log when it carries an error. Best-effort:
-        logging must never break a validate/import. No auth is written."""
+    def _append_raw_log(self, policy, count, status_code, data, files=None):
+        """Append the FULL raw response. Best-effort: logging must never break a validate/import.
+        No auth is written.
+
+        An IMPORT is always logged, success or failure. A validate is only logged when it carries
+        an error. The asymmetry is deliberate: a validate is a dry run you can simply repeat, while
+        an import WRITES to the target and is the one call you cannot reconstruct afterwards. On
+        2026-09-23 a promotion left the target's columns unchanged and reported its objects as
+        "created", and there was no way to tell what the platform had actually done, because nine
+        validations were on disk and not one import.
+
+        Imports go to their own file next to the validate log, so a write is never buried in
+        dry-run noise."""
         try:
-            if not self._raw_has_error(data):
+            is_import = (policy or "").upper() != "VALIDATE_ONLY"
+            if not is_import and not self._raw_has_error(data):
                 return
             rec = {"ts": datetime.now().isoformat(timespec="seconds"), "host": self.host,
-                   "policy": policy, "tml_count": count, "http_status": status_code, "raw": data}
+                   "policy": policy, "tml_count": count, "http_status": status_code,
+                   "had_error": self._raw_has_error(data), "raw": data}
+            if files:
+                rec["files"] = list(files)
+            path = self.debug_raw_log
+            if is_import:
+                import os.path as _op
+                d, base = _op.split(path)
+                path = _op.join(d, "import_raw.jsonl") if base.startswith("validate") else path
             import os
-            os.makedirs(os.path.dirname(self.debug_raw_log) or ".", exist_ok=True)
-            with open(self.debug_raw_log, "a") as fh:
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            with open(path, "a") as fh:
                 fh.write(json.dumps(rec, default=str) + "\n")
         except Exception:
             pass
+
+    @staticmethod
+    def _describe_tmls(tml_strings):
+        """A one-line identity for each TML being sent: kind, name and obj_id.
+
+        The obj_id is the whole basis of update-in-place, so a log that omits it cannot answer
+        "why was this created instead of updated". Parsing must never break an import."""
+        out = []
+        for t in tml_strings or []:
+            try:
+                d = json.loads(t) if str(t).strip().startswith("{") else yaml.safe_load(t)
+                kind = next((k for k in ("table", "model", "worksheet", "liveboard", "answer")
+                             if isinstance(d, dict) and k in d), "?")
+                node = (d.get(kind) or {}) if isinstance(d, dict) else {}
+                out.append({"kind": kind,
+                            "name": node.get("name"),
+                            "obj_id": (d or {}).get("obj_id"),
+                            "guid": (d or {}).get("guid"),
+                            "columns": len(node.get("columns") or [])})
+            except Exception:
+                out.append({"kind": "?", "name": None, "obj_id": None,
+                            "guid": None, "columns": None})
+        return out
 
     def import_tml(self, tml_strings: List[str],
                    policy: str = "PARTIAL") -> List[Dict]:
@@ -1025,7 +1067,11 @@ class TSClient:
         # moment it happens (no need to re-run every validate in a one-shot capture later).
         self.last_raw_import = data
         if self.debug_raw_log:
-            self._append_raw_log(policy, len(tml_strings), resp.status_code, data)
+            # Record WHAT WAS SENT alongside the response. Without it the log says objects were
+            # "created" and leaves you unable to check whether the TML carried the obj_id that
+            # should have made it an update instead.
+            self._append_raw_log(policy, len(tml_strings), resp.status_code, data,
+                                 files=self._describe_tmls(tml_strings))
 
         # Normalise — API may return list or {"object": [...]}
         if isinstance(data, list):
