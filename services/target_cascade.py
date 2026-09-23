@@ -18,7 +18,8 @@ IO is injected (fetch_tml, fetch_deps) so the walk is testable without a cluster
 """
 
 from services.import_diagnostics import (
-    _parse_edoc, dependents_using_columns, drop_columns, strip_vizzes_from_tml,
+    _parse_edoc, classify_import_errors, dependents_using_columns, drop_columns,
+    strip_vizzes_from_tml,
 )
 
 MODEL_KINDS = ("model", "worksheet")
@@ -33,7 +34,7 @@ def _kind_of(doc):
     return "?"
 
 
-def plan_cascade(seeds, column_names, fetch_tml, fetch_deps, skip_ids=()):
+def plan_cascade(seeds, column_names, fetch_tml, fetch_deps, skip_ids=(), skip_names=()):
     """Walk the dependency tree and decide what happens to each object.
 
     seeds:        [{"id", "name", "type"}] objects already known to reference the column
@@ -41,17 +42,27 @@ def plan_cascade(seeds, column_names, fetch_tml, fetch_deps, skip_ids=()):
     fetch_tml:    id -> edoc string, or None when it cannot be read
     fetch_deps:   id -> [{"id", "name", "type"}] dependents of that object
     skip_ids:     objects the promotion itself is updating — never touched here
+    skip_names:   the same exclusion by NAME, for objects the walk discovers mid-flight and
+                  whose target guid the caller therefore does not know up front. The model
+                  being promoted depends on its own table, so it turns up as a dependent of
+                  its own drop; stripping or deleting it would undo the promotion itself.
 
     Returns (actions, blocked).
 
-    actions: [{"id","name","type","action","detail","new_edoc"}] where action is one of
-             "strip_columns" | "remove_tiles" | "delete"; new_edoc is None for a delete.
+    actions: [{"id","name","type","action","detail","removed","new_edoc"}] where action is one
+             of "strip_columns" | "remove_tiles" | "delete"; new_edoc is None for a delete, and
+             "removed" is what must be gone from the object afterwards for the write to count
+             as verified.
     blocked: [{"id","name","reason"}] anything that cannot be planned — unreadable, or a
              liveboard where EVERY tile uses the column so there is nothing surgical to do.
              Any entry here means the cascade must not be applied.
+
+    Actions come back in walk order, parents before children. Applying runs the other way —
+    see apply_order().
     """
     want = {str(c).strip().lower() for c in (column_names or ()) if str(c).strip()}
     skip = {str(i) for i in (skip_ids or ())}
+    skipn = {str(n).strip().lower() for n in (skip_names or ()) if str(n).strip()}
     actions, blocked, seen = [], [], set()
     queue = list(seeds or [])
 
@@ -61,6 +72,8 @@ def plan_cascade(seeds, column_names, fetch_tml, fetch_deps, skip_ids=()):
         if not oid or oid in seen or oid in skip:
             continue
         seen.add(oid)
+        if (obj.get("name") or "").strip().lower() in skipn:
+            continue
 
         edoc = fetch_tml(oid)
         if not edoc:
@@ -79,7 +92,7 @@ def plan_cascade(seeds, column_names, fetch_tml, fetch_deps, skip_ids=()):
 
         if kind == "answer":
             actions.append({"id": oid, "name": obj.get("name"), "type": "ANSWER",
-                            "action": "delete", "new_edoc": None,
+                            "action": "delete", "new_edoc": None, "removed": [],
                             "detail": "deleted — an answer is a single visualisation, so there "
                                       "is nothing to strip"})
             continue
@@ -100,7 +113,7 @@ def plan_cascade(seeds, column_names, fetch_tml, fetch_deps, skip_ids=()):
             ids = [v["id"] for v in vz]
             new_edoc, removed, remaining = strip_vizzes_from_tml(edoc, ids)
             actions.append({"id": oid, "name": obj.get("name"), "type": "LIVEBOARD",
-                            "action": "remove_tiles", "new_edoc": new_edoc,
+                            "action": "remove_tiles", "new_edoc": new_edoc, "removed": list(ids),
                             "detail": f"remove {removed} tile(s) ({', '.join(ids)}); "
                                       f"{remaining} left on the board"})
             continue
@@ -119,6 +132,7 @@ def plan_cascade(seeds, column_names, fetch_tml, fetch_deps, skip_ids=()):
             new_items, man = drop_columns([{"edoc": edoc}], scoped)
             actions.append({"id": oid, "name": obj.get("name"), "type": "LOGICAL_TABLE",
                             "action": "strip_columns", "new_edoc": new_items[0]["edoc"],
+                            "removed": sorted(scoped),
                             "detail": "remove " + ", ".join(sorted(scoped))
                                       + (f"; cascades {len(man.get('formulas') or [])} formula(s)"
                                          if man.get("formulas") else "")})
@@ -141,13 +155,54 @@ def plan_summary(actions, blocked):
     return lines
 
 
-def dry_run_plan(actions, validate):
+def apply_order(actions):
+    """Leaves first.
+
+    plan_cascade walks DOWN the tree, so a model appears before the answers and boards hanging
+    off it. Writing in that order fails: stripping a column from a model while its own dependents
+    still reference that column is exactly the 14544 block this cascade exists to clear. So the
+    walk order is reversed to apply — children go first, and each parent is edited only once
+    nothing below it still points at the column.
+    """
+    return list(reversed(list(actions or [])))
+
+
+def planned_names(actions):
+    """Lowercased names of every object the plan changes — what dry_run_plan forgives."""
+    return {(a.get("name") or "").strip().lower() for a in (actions or [])
+            if (a.get("name") or "").strip()}
+
+
+def _only_blocked_by(msg, planned):
+    """True when the ONLY thing standing in this object's way is something the plan removes."""
+    findings = classify_import_errors(
+        [{"name": "?", "type": "", "status": "ERROR", "error": msg or ""}])
+    named = set()
+    for f in findings:
+        if f.get("kind") != "drop_blocked_by_dependents":
+            return False                  # a different problem entirely; that is a real blocker
+        for d in f.get("dependents") or []:
+            if str(d).strip():
+                named.add(str(d).strip().lower())
+    return bool(named) and named <= planned
+
+
+def dry_run_plan(actions, validate, planned=None):
     """VALIDATE_ONLY every edited object BEFORE anything is written.
 
     `validate(edoc) -> (ok, message)`. Returns [] when the whole plan is clean, otherwise a list
     of {"id","name","error"}. A cascade applied halfway leaves the target inconsistent and the
     import still blocked, so the plan is all-or-nothing and this is the gate.
+
+    One expected failure is forgiven. A model that strips a column CANNOT validate cleanly while
+    its own answers and boards still reference that column — the platform answers 14544 and names
+    them. That is the plan working, not a problem, so a failure whose named dependents are ALL
+    objects this same plan removes passes. A failure naming anything else, or failing for any
+    other reason, is a genuine blocker and stops the whole cascade before a single write.
+
+    `planned` is the set from planned_names(actions); pass it or nothing is forgiven.
     """
+    forgive = {str(n).strip().lower() for n in (planned or ()) if str(n).strip()}
     problems = []
     for a in actions:
         if not a.get("new_edoc"):
@@ -156,8 +211,11 @@ def dry_run_plan(actions, validate):
             ok, msg = validate(a["new_edoc"])
         except Exception as e:
             ok, msg = False, str(e)
-        if not ok:
-            problems.append({"id": a["id"], "name": a.get("name"), "error": msg})
+        if ok:
+            continue
+        if forgive and _only_blocked_by(msg, forgive):
+            continue
+        problems.append({"id": a["id"], "name": a.get("name"), "error": msg})
     return problems
 
 

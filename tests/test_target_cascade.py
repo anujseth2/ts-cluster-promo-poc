@@ -7,8 +7,11 @@ handled the way that costs least — strip a model, take only the impacted tiles
 and delete an answer because an answer is a single visualisation.
 """
 import json
+import pathlib
 
-from services.target_cascade import plan_cascade, plan_summary
+from services.target_cascade import (
+    apply_order, dry_run_plan, plan_cascade, plan_summary, planned_names,
+)
 
 
 def _model(name, cols):
@@ -142,3 +145,137 @@ def test_a_snapshot_that_cannot_be_taken_stops_everything():
         assert False, "must raise"
     except RuntimeError as e:
         assert "nothing has been changed" in str(e)
+
+
+# ── order, and the one failure the dry run is right to forgive ───────────────────────────────
+
+def test_leaves_are_written_before_the_model_they_hang_off():
+    # plan_cascade walks DOWN; writing in that order would strip the model while its own answers
+    # still reference the column, which is the exact 14544 block the cascade exists to clear.
+    tml = {"m": _model("M", ["gender"]), "a1": _answer("A", "gender")}
+    deps = {"m": [{"id": "a1", "name": "A", "type": "QUESTION_ANSWER_BOOK"}]}
+    actions, _ = plan_cascade([{"id": "m", "name": "M", "type": "LOGICAL_TABLE"}],
+                              {"gender"}, tml.get, lambda i: deps.get(i, []))
+    assert [a["id"] for a in actions] == ["m", "a1"]
+    assert [a["id"] for a in apply_order(actions)] == ["a1", "m"]
+
+
+def test_a_model_blocked_only_by_objects_this_plan_removes_still_validates():
+    # The real 14544 shape, names and trailing space included (tests/corpus/validate_errors.jsonl).
+    err = ("Deleted columns have dependents.<br/>- <b>gender</b></br><ul>"
+           "<li>Their Answer </li></ul><br/><b>SOLUTION:</b><br/>Either replace the deleted "
+           "columns, or remove the dependencies.<br/>")
+    actions = [{"id": "m", "name": "Other Team Model", "new_edoc": "x"},
+               {"id": "a1", "name": "Their Answer", "new_edoc": None}]
+    problems = dry_run_plan(actions, lambda e: (False, err), planned_names(actions))
+    assert problems == [], "the plan removes the only blocker, so this is the plan working"
+
+
+def test_a_model_blocked_by_something_outside_the_plan_stops_everything():
+    err = ("Deleted columns have dependents.<br/>- <b>gender</b></br><ul>"
+           "<li>Their Answer </li><li>Somebody Elses Board</li></ul><br/>")
+    actions = [{"id": "m", "name": "Other Team Model", "new_edoc": "x"},
+               {"id": "a1", "name": "Their Answer", "new_edoc": None}]
+    problems = dry_run_plan(actions, lambda e: (False, err), planned_names(actions))
+    assert [p["id"] for p in problems] == ["m"]
+
+
+def test_a_different_failure_is_never_forgiven():
+    # Only the dependents block is expected. Anything else is a genuine reason not to start.
+    err = "Unable to import tml: <b>PATIENT_AGE</b>: DataType mismatch for column."
+    actions = [{"id": "m", "name": "M", "new_edoc": "x"}]
+    assert dry_run_plan(actions, lambda e: (False, err), planned_names(actions))
+
+
+def test_a_dependents_block_that_names_nobody_is_not_forgiven():
+    # The table-only shape tells us WHICH table, never who is holding it. With no names to check
+    # against the plan there is no evidence the plan clears it, so it stops the cascade.
+    err = ("Unable to import tml due to following errors:<br/>- <b>sales_customers</b>: "
+           "Deleted columns have dependents.<br/>")
+    actions = [{"id": "m", "name": "M", "new_edoc": "x"}]
+    assert dry_run_plan(actions, lambda e: (False, err), planned_names(actions))
+
+
+def test_the_promoted_model_is_skipped_even_when_found_mid_walk():
+    # It is discovered as a dependent, not selected, so its guid is not known up front — only
+    # its name is. Stripping it would undo the very update being promoted.
+    tml = {"m": _model("Other Team Model", ["gender"]),
+           "promoted": _model("Sales Customers Model", ["gender"])}
+    deps = {"m": [{"id": "promoted", "name": "Sales Customers Model", "type": "LOGICAL_TABLE"}]}
+    actions, blocked = plan_cascade(
+        [{"id": "m", "name": "Other Team Model", "type": "LOGICAL_TABLE"}],
+        {"gender"}, tml.get, lambda i: deps.get(i, []),
+        skip_names={"sales customers model"})
+    assert blocked == []
+    assert [a["id"] for a in actions] == ["m"]
+
+
+def test_each_action_records_what_must_be_gone_afterwards():
+    # The write half re-reads the object and checks for these; without them a 200 would pass
+    # as proof, which is how the tool once reported success while the target never changed.
+    tml = {"m": _model("M", ["gender", "city"]),
+           "lb": _board("B", [("Viz_1", "gender"), ("Viz_2", "city")]),
+           "a1": _answer("A", "gender")}
+    deps = {"m": [{"id": "lb", "name": "B", "type": "PINBOARD_ANSWER_BOOK"},
+                  {"id": "a1", "name": "A", "type": "QUESTION_ANSWER_BOOK"}]}
+    by_id = {a["id"]: a for a in plan_cascade(
+        [{"id": "m", "name": "M", "type": "LOGICAL_TABLE"}],
+        {"gender"}, tml.get, lambda i: deps.get(i, []))[0]}
+    assert by_id["m"]["removed"] == ["t::gender"]
+    assert by_id["lb"]["removed"] == ["Viz_1"]
+    assert by_id["a1"]["removed"] == []
+
+
+# ── the sequence the UI actually runs ────────────────────────────────────────────────────────
+
+def test_plan_then_snapshot_then_dry_run_then_apply_leaves_first(tmp_path):
+    """End to end over the real functions, in the order the blocked-dependents panel calls them.
+
+    The shape is the one verified on ps-internal 2026-09-23: another team's model on the shared
+    table, that model's own board and answer, and the model being promoted turning up as a
+    dependent of its own drop.
+    """
+    tml = {
+        "m_other": _model("ZZ Other Team Model", ["gender", "city"]),
+        "lb1":     _board("Their Board", [("Viz_1", "gender"), ("Viz_2", "city")]),
+        "a1":      _answer("Their Answer", "gender"),
+        "promoted": _model("Sales Customers Model", ["gender"]),
+    }
+    deps = {"m_other": [{"id": "lb1", "name": "Their Board", "type": "PINBOARD_ANSWER_BOOK"},
+                        {"id": "a1", "name": "Their Answer", "type": "QUESTION_ANSWER_BOOK"},
+                        {"id": "promoted", "name": "Sales Customers Model",
+                         "type": "LOGICAL_TABLE"}]}
+    actions, blocked = plan_cascade(
+        [{"id": "m_other", "name": "ZZ Other Team Model", "type": "LOGICAL_TABLE"}],
+        {"gender"}, tml.get, lambda i: deps.get(i, []),
+        skip_names={"sales customers model"})
+
+    # Nothing unplannable, and the promotion's own model is left alone.
+    assert blocked == []
+    assert sorted(a["id"] for a in actions) == ["a1", "lb1", "m_other"]
+
+    # Every object's current TML is on disk before a single write.
+    from services.target_cascade import snapshot_plan
+    def _write(name, text):
+        (tmp_path / name).write_text(text)
+        return str(tmp_path / name)
+
+    written = snapshot_plan(actions, tml.get, _write)
+    assert len(written) == 3
+    assert all(pathlib.Path(w).read_text() for w in written)
+
+    # The model cannot validate while its own answer still uses the column; that is the plan
+    # working. Everything else validates outright.
+    err = ("Deleted columns have dependents.<br/>- <b>gender</b></br><ul>"
+           "<li>Their Answer </li></ul><br/>")
+    seen_validate = []
+
+    def _validate(edoc):
+        seen_validate.append(edoc)
+        return (False, err) if "ZZ Other Team Model" in edoc else (True, "")
+
+    assert dry_run_plan(actions, _validate, planned_names(actions)) == []
+    assert len(seen_validate) == 2, "the answer is a delete, so there is nothing to validate"
+
+    # Written children-first, so the model loses the column only once nothing below it uses it.
+    assert [a["id"] for a in apply_order(actions)] == ["a1", "lb1", "m_other"]

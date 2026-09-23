@@ -619,6 +619,56 @@ class TSClient:
             return False, f"the target still has {', '.join(sorted(still))} — nothing was removed"
         return True, f"removed {removed} tile(s); {remaining} left on the board"
 
+    def apply_tml_verified(self, guid: str, new_edoc: str, gone_vizzes=(), gone_columns=()):
+        """Import an edited TML over an object that ALREADY exists, then re-read and confirm.
+
+        A 200 from the import API is not proof the target moved: the update-in-place notice read
+        as success for weeks while nothing changed on the other cluster. So whatever the edit was
+        meant to remove is looked for again on a fresh export, and anything still present is
+        reported as a failure rather than a success.
+
+        This is the write half of a planned cascade (services/target_cascade), where the edoc was
+        built and validated up front — so the exact document that passed the dry run is the one
+        sent, instead of re-deriving it here and hoping the two agree.
+
+        Returns (ok, detail).
+        """
+        if not new_edoc:
+            return False, "no TML to import"
+        try:
+            res = self.import_tml([new_edoc], policy="ALL_OR_NONE")
+        except Exception as e:
+            return False, f"import failed: {e}"
+        bad = [r for r in res if r.get("status") != "OK"]
+        if bad:
+            return False, (bad[0].get("error") or "the target rejected the edited object")
+        try:
+            raw = self.export_tml([guid])
+            items = raw if isinstance(raw, list) else raw.get("object", [])
+            doc = json.loads(items[0]["edoc"]) if items else {}
+        except Exception:
+            return False, ("the import was accepted but the object could not be re-read, so the "
+                           "change is unconfirmed")
+        left = set()
+        want_v = {str(v).strip() for v in (gone_vizzes or ()) if str(v).strip()}
+        if want_v:
+            have = {str(v.get("id") or v.get("viz_id") or "")
+                    for v in ((doc.get("liveboard") or {}).get("visualizations") or [])}
+            left |= (want_v & have)
+        want_c = {str(c).strip().lower() for c in (gone_columns or ()) if str(c).strip()}
+        if want_c:
+            node = doc.get("model") or doc.get("worksheet") or doc.get("table") or {}
+            for c in node.get("columns") or []:
+                nm  = (c.get("name") or "").strip()
+                cid = (c.get("column_id") or "").strip()
+                if (nm.lower() in want_c or cid.lower() in want_c
+                        or cid.split("::")[-1].strip().lower() in want_c):
+                    left.add(cid or nm)
+        if left:
+            return False, (f"the target still has {', '.join(sorted(left))} — "
+                           "the import was accepted but nothing was removed")
+        return True, "applied and verified on the target"
+
     def find_objects_by_name(self, names: List[str],
                              types: Optional[List[str]] = None) -> Dict[str, Dict]:
         """Resolve object NAMES to {id, type, name, author} across several metadata types.
