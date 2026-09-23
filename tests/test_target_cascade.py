@@ -61,13 +61,28 @@ def test_an_object_that_cannot_be_read_blocks_the_whole_cascade():
     assert blocked and "cannot see it" in blocked[0]["reason"]
 
 
-def test_a_board_whose_every_tile_uses_the_column_is_refused_not_emptied():
+def test_a_board_whose_every_tile_uses_the_column_is_deleted_whole():
+    # One rule for both leaf kinds: delete when EVERY visualisation is impacted, trim when only
+    # some are. Trimming this board would leave an empty page, and the platform does not even
+    # keep a gap to mark why, so there is nothing left worth being proportionate about.
     tml = {"lb": _board("All Affected", [("Viz_1", "gender"), ("Viz_2", "gender")])}
     actions, blocked = plan_cascade(
         [{"id": "lb", "name": "All Affected", "type": "LIVEBOARD"}],
         {"gender"}, tml.get, lambda i: [])
-    assert actions == []
-    assert "empty board" in blocked[0]["reason"]
+    assert blocked == []
+    assert [(a["action"], a["type"]) for a in actions] == [("delete", "LIVEBOARD")]
+    assert "WHOLE BOARD" in actions[0]["detail"], "deleting a board must not read like a trim"
+
+
+def test_a_board_with_one_untouched_tile_is_trimmed_not_deleted():
+    # The boundary of the same rule: one survivor is enough to keep the board.
+    tml = {"lb": _board("Mostly Affected", [("Viz_1", "gender"), ("Viz_2", "gender"),
+                                            ("Viz_3", "city")])}
+    actions, _b = plan_cascade(
+        [{"id": "lb", "name": "Mostly Affected", "type": "LIVEBOARD"}],
+        {"gender"}, tml.get, lambda i: [])
+    assert [a["action"] for a in actions] == ["remove_tiles"]
+    assert actions[0]["verify"]["viz_count"] == 1
 
 
 def test_objects_the_promotion_is_updating_are_never_touched():

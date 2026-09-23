@@ -6,8 +6,12 @@ may feed further objects. Deleting the top of the tree to unblock an import is t
 and takes work nobody asked to lose, so each kind is handled the way that costs least:
 
     model      strip the column out of it, then walk ITS dependents
-    liveboard  remove only the tiles that use the column, leaving the rest of the board
+    liveboard  remove only the tiles that use the column, leaving the rest of the board,
+               OR delete it outright when every tile on it uses the column
     answer     delete it, because an answer IS a single visualisation
+
+One rule sits under the last two: delete the object when EVERY visualisation in it is impacted,
+trim it when only some are. An answer is simply the case that always has exactly one.
 
 Planning is separated from doing on purpose. The plan is built first, in full, with no writes:
 it can be shown to the operator, dry-run against the cluster, and refused as a whole. A cascade
@@ -94,8 +98,8 @@ def plan_cascade(seeds, column_names, fetch_tml, fetch_deps, skip_ids=(), skip_n
         if kind == "answer":
             actions.append({"id": oid, "name": obj.get("name"), "type": "ANSWER",
                             "action": "delete", "new_edoc": None, "removed": [], "verify": {},
-                            "detail": "deleted — an answer is a single visualisation, so there "
-                                      "is nothing to strip"})
+                            "detail": "deleted — an answer is a single visualisation, so every "
+                                      "part of it uses the column"})
             continue
 
         if kind == "liveboard":
@@ -106,10 +110,15 @@ def plan_cascade(seeds, column_names, fetch_tml, fetch_deps, skip_ids=(), skip_n
             if not vz:
                 continue                      # nothing on this board uses the column after all
             if len(vz) >= total:
-                blocked.append({"id": oid, "name": obj.get("name"),
-                                "reason": f"all {total} tile(s) use the column, so removing them "
-                                          "would leave an empty board — decide on that one "
-                                          "deliberately"})
+                # One rule, not two: delete the object when EVERY visualisation in it is
+                # impacted, trim it when only some are. Trimming here would leave an empty page
+                # rather than a board, and the platform will not even keep a gap to mark why
+                # (ps-internal 2026-09-23), so there is nothing left to be proportionate about.
+                # An answer is the degenerate case of the same rule, never more than one viz.
+                actions.append({"id": oid, "name": obj.get("name"), "type": "LIVEBOARD",
+                                "action": "delete", "new_edoc": None, "removed": [], "verify": {},
+                                "detail": f"DELETE THE WHOLE BOARD — all {total} tile(s) use the "
+                                          "column, so there is nothing left to keep"})
                 continue
             ids = [v["id"] for v in vz]
             new_edoc, removed, remaining = strip_vizzes_from_tml(edoc, ids)

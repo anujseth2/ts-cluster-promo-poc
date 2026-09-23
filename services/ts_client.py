@@ -568,57 +568,6 @@ class TSClient:
                 out[t["name"].strip().lower()] = cmap
         return out
 
-    def remove_vizzes_verified(self, guid: str, viz_ids):
-        """Remove visualisations from a liveboard ON THE TARGET, then CHECK.
-
-        Returns (ok, detail). Export the board, strip the named tiles, import it back under the
-        same guid, then re-read it and confirm those tiles are actually gone — the same rule as
-        deletion, because a 200 from the import API is not proof of anything.
-
-        Refuses to leave an EMPTY board: if every tile uses the dropped column there is nothing
-        surgical to do, and the operator should decide to delete the board rather than have this
-        quietly hollow it out.
-        """
-        from services.import_diagnostics import strip_vizzes_from_tml
-        want = {str(v).strip() for v in (viz_ids or []) if str(v).strip()}
-        if not want:
-            return False, "no visualisation ids given"
-        try:
-            raw = self.export_tml([guid])
-            items = raw if isinstance(raw, list) else raw.get("object", [])
-            if not items:
-                return False, "the liveboard could not be exported from the target"
-            edoc = items[0].get("edoc")
-        except Exception as e:
-            return False, f"export failed: {e}"
-        new_edoc, removed, remaining = strip_vizzes_from_tml(edoc, want)
-        if removed == 0:
-            return False, "none of those visualisations are on the board any more"
-        if remaining == 0:
-            return False, ("every tile on the board uses the dropped column, so removing them "
-                           "would leave an empty liveboard — delete the board instead, "
-                           "deliberately")
-        try:
-            res = self.import_tml([new_edoc], policy="ALL_OR_NONE")
-        except Exception as e:
-            return False, f"import failed: {e}"
-        bad = [r for r in res if r.get("status") != "OK"]
-        if bad:
-            return False, (bad[0].get("error") or "the target rejected the edited liveboard")
-        try:
-            raw2 = self.export_tml([guid])
-            it2 = raw2 if isinstance(raw2, list) else raw2.get("object", [])
-            doc2 = json.loads(it2[0]["edoc"]) if it2 else {}
-            left = {str(v.get("id") or v.get("viz_id") or "")
-                    for v in ((doc2.get("liveboard") or {}).get("visualizations") or [])}
-        except Exception:
-            return False, ("the import was accepted but the board could not be re-read, so the "
-                           "removal is unconfirmed")
-        still = want & left
-        if still:
-            return False, f"the target still has {', '.join(sorted(still))} — nothing was removed"
-        return True, f"removed {removed} tile(s); {remaining} left on the board"
-
     def apply_tml_verified(self, guid: str, new_edoc: str, columns=(), viz_count=None):
         """Import an edited TML over an object that ALREADY exists, then re-read and confirm.
 
