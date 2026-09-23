@@ -4192,14 +4192,39 @@ elif step == 4:
 
                 proceed = True
                 if silent:
-                    st.warning("**Silent-drop risk** — these columns exist on the target but not in the "
-                               "source, so import will **remove them from the target table** (no platform "
-                               "error when they have no dependents):")
-                    for s in silent:
-                        st.markdown(f"- **{s['table']}**: " + ", ".join(f"`{c}`" for c in s["columns"]))
-                    st.caption("To keep one, add it back to the source. Otherwise acknowledge to proceed.")
-                    proceed = st.checkbox("I understand these target columns will be removed — proceed.",
-                                          key="ack_silent")
+                    # Split by CAUSE. A column you dropped in this run is not a risk, it is the
+                    # plan, and describing your own decision back as a hazard trains people to
+                    # tick past the panel. Only a column that vanished from the SOURCE without
+                    # anyone asking is a surprise worth stopping for.
+                    _chosen = scan_names_for_drops(
+                        st.session_state.get("dropped_col_names") or set(),
+                        st.session_state.get("dropped_cascade_names") or set())
+                    _expected, _surprise = [], []
+                    for _s in silent:
+                        _mine = [c for c in _s["columns"] if c.strip().lower() in _chosen]
+                        _theirs = [c for c in _s["columns"] if c.strip().lower() not in _chosen]
+                        if _mine:
+                            _expected.append((_s["table"], _mine))
+                        if _theirs:
+                            _surprise.append((_s["table"], _theirs))
+                    if _expected:
+                        st.info("**As requested** — you dropped these in this run, so the import "
+                                "will remove them from the target table. Nothing to decide:")
+                        for _t, _cs in _expected:
+                            st.markdown(f"- **{_t}**: " + ", ".join(f"`{c}`" for c in _cs))
+                    if _surprise:
+                        st.warning("**Silent-drop risk** — these are on the target and are NOT in "
+                                   "this promotion, and you did not drop them. Import will "
+                                   "**remove them from the target table**, and the platform "
+                                   "raises no error when they have no dependents:")
+                        for _t, _cs in _surprise:
+                            st.markdown(f"- **{_t}**: " + ", ".join(f"`{c}`" for c in _cs))
+                        st.caption("Usually this means the column was removed at source since the "
+                                   "last promotion. To keep one, add it back to the source. "
+                                   "Otherwise acknowledge to proceed.")
+                        proceed = st.checkbox(
+                            "I understand these target columns will be removed — proceed.",
+                            key="ack_silent")
 
                 # ── Spotter feedback: merge preview + optional Replace ──
                 fb_specs = _feedback_specs(filtered_items) if st.session_state.get("_include_feedback") else []

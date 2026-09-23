@@ -1006,3 +1006,24 @@ def test_removing_every_tile_is_reported_rather_than_done():
         {"id": "V1", "answer": {"answer_columns": [{"name": "customerid"}]}}]}})
     _new, removed, remaining = strip_vizzes_from_tml(lb, ["V1"])
     assert removed == 1 and remaining == 0, "the caller must refuse on remaining == 0"
+
+
+def test_a_column_you_dropped_is_not_a_silent_drop_risk():
+    # The panel compares the bundle against the target, so a column YOU dropped shows up as
+    # "on the target, not in the promotion" — i.e. your own decision described back as a hazard.
+    # Splitting by cause is what makes the remaining warning worth reading.
+    from services.import_diagnostics import scan_names_for_drops
+    chosen = scan_names_for_drops({"sales_customers::customerid"},
+                                  {"Customer ID", "sales_customers.customerID"})
+    found = [{"table": "sales_customers", "columns": ["customerID", "legacy_flag"]}]
+    expected, surprise = [], []
+    for s in found:
+        mine = [c for c in s["columns"] if c.strip().lower() in chosen]
+        theirs = [c for c in s["columns"] if c.strip().lower() not in chosen]
+        if mine:
+            expected.append((s["table"], mine))
+        if theirs:
+            surprise.append((s["table"], theirs))
+    assert expected == [("sales_customers", ["customerID"])], "your own drop is expected, not a risk"
+    assert surprise == [("sales_customers", ["legacy_flag"])], \
+        "a column nobody dropped IS the surprise worth stopping for"
