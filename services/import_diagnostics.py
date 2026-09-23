@@ -1316,17 +1316,15 @@ def scan_names_for_drops(drop_set, cascade_names=None):
     return {s for s in out if s}
 
 
-def strip_vizzes_from_tml(edoc, viz_ids, keep_layout_hole=True):
-    """Remove named visualisations from ONE exported liveboard TML.
+def strip_vizzes_from_tml(edoc, viz_ids):
+    """Remove named visualisations from ONE exported liveboard TML, layout tile and all.
 
-    `keep_layout_hole=True` (the default) leaves the layout tile behind, pointing at a
-    visualisation that is gone. That is DELIBERATE: the board's owner did not ask for this change
-    and is not in the room when it happens, so the board should carry a visible sign that
-    something was taken out rather than quietly reflowing as if it had always been that shape.
-    ThoughtSpot accepts the orphaned tile — verified against a real board on ps-internal
-    2026-09-23, VALIDATE_ONLY returns OK with the tile kept and with it pruned.
-
-    Pass False to prune the tile as well, which leaves a tidy board and no trace.
+    This used to keep the orphaned layout tile on purpose, so the board's owner would see a hole
+    where something was taken out. It does not work: ThoughtSpot accepts the orphan at import and
+    then DISCARDS it, and the board comes back closed up with no gap (verified against a real
+    board on ps-internal 2026-09-23). So the tile goes, the board reflows, and the owners are told
+    out of band instead. A visible marker would need a real placeholder visualisation, which is a
+    bigger and more intrusive thing than anyone asked for.
 
     Returns (new_edoc, removed, remaining). `remaining` is how many tiles the board still has, so
     the caller can refuse to leave an empty liveboard behind rather than discovering it after the
@@ -1344,18 +1342,17 @@ def strip_vizzes_from_tml(edoc, viz_ids, keep_layout_hole=True):
     lb["visualizations"] = [v for v in lb["visualizations"]
                             if str(v.get("id") or v.get("viz_id") or "") not in targets]
     remaining = len(lb["visualizations"])
-    if not keep_layout_hole:
-        layout = lb.get("layout") or {}
+    layout = lb.get("layout") or {}
 
-        def _prune(tiles):
-            return [t for t in tiles
-                    if str(t.get("visualization_id", "")) not in targets]
+    def _prune(tiles):
+        return [t for t in tiles
+                if str(t.get("visualization_id", "")) not in targets]
 
-        if isinstance(layout.get("tiles"), list):
-            layout["tiles"] = _prune(layout["tiles"])
-        for tab in (layout.get("tabs") or []):
-            if isinstance(tab.get("tiles"), list):
-                tab["tiles"] = _prune(tab["tiles"])
+    if isinstance(layout.get("tiles"), list):
+        layout["tiles"] = _prune(layout["tiles"])
+    for tab in (layout.get("tabs") or []):
+        if isinstance(tab.get("tiles"), list):
+            tab["tiles"] = _prune(tab["tiles"])
     return json.dumps(doc), before - remaining, remaining
 
 
