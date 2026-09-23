@@ -3263,14 +3263,40 @@ elif step == 3:
                 _blk_names = sorted({d for ds in _col_deps.values() for d in ds if d})
                 if _blk_names:
                     with st.spinner("Looking up the blocking object(s) on the target…"):
-                        _resolved = target_client().find_objects_by_name(_blk_names)
+                        _tgtc = target_client()
+                        _resolved = _tgtc.find_objects_by_name(_blk_names)
+                        # Read each one's TML so a LIVEBOARD can name the tile(s) actually using
+                        # the column. "Test dev is blocked" is not actionable; "Viz_1 of 2 tiles"
+                        # tells the operator how much of the board is really at stake.
+                        _cand = []
+                        for _n in _blk_names:
+                            _h2 = _resolved.get(_n.strip().lower())
+                            if not _h2:
+                                continue
+                            try:
+                                _raw2 = _tgtc.export_tml([_h2["id"]])
+                                _its2 = _raw2 if isinstance(_raw2, list) else _raw2.get("object", [])
+                                _tml2 = _its2[0].get("edoc") if _its2 else None
+                            except Exception:
+                                _tml2 = None
+                            _cand.append({**_h2, "tml": _tml2})
+                        _scan = {c["id"]: c for c in
+                                 dependents_using_columns(_cand, _scan_names)}
                     _rows_b = []
                     for _n in _blk_names:
                         _hit = _resolved.get(_n.strip().lower())
+                        _det = _scan.get((_hit or {}).get("id"), {})
+                        _vz = _det.get("vizzes") or []
+                        _tot = _det.get("viz_total") or 0
+                        _vlabel = ("—" if not _tot else
+                                   ", ".join(f"{v['id']}" + (f" ({v['name']})" if v.get("name") else "")
+                                             for v in _vz) + f"  · of {_tot} tile(s)"
+                                   if _vz else f"(none of {_tot} tile(s) matched)")
                         _rows_b.append({
                             "Object": _n,
                             "Type": (_hit or {}).get("type", "—"),
                             "Author": (_hit or {}).get("author", "—"),
+                            "Tile(s) using the column": _vlabel,
                             "Can this account delete it?": "yes" if _hit else "not visible",
                             "_scoped": (_hit or {}).get("id") or f"__unresolved__{_n}",
                             "_deletable": bool(_hit)})
@@ -3279,7 +3305,8 @@ elif step == 3:
                         _r["Delete?"] = _r["_scoped"] in _bsel
                     import pandas as pd
                     _bdf = pd.DataFrame(_rows_b, columns=[
-                        "Object", "Type", "Author", "Can this account delete it?", "Delete?",
+                        "Object", "Type", "Author", "Tile(s) using the column",
+                        "Can this account delete it?", "Delete?",
                         "_scoped", "_deletable"]).drop(columns=["_deletable"])
                     _select_editor(
                         _bdf, ["Delete?"], ["blk_del_selected"], "blkdel",
@@ -3287,13 +3314,18 @@ elif step == 3:
                             "Object": st.column_config.TextColumn("Object", width="large"),
                             "Type":   st.column_config.TextColumn("Type", width="small"),
                             "Author": st.column_config.TextColumn("Author", width="medium"),
+                            "Tile(s) using the column": st.column_config.TextColumn(
+                                "Tile(s) using the column", width="large",
+                                help="For a liveboard, which visualisation(s) reference the "
+                                     "dropped column, and how many tiles the board has in total."),
                             "Can this account delete it?": st.column_config.TextColumn(
                                 "Can this account delete it?", width="medium",
                                 help="'not visible' means the object exists but this account "
                                      "cannot see it — its owner or an admin has to remove it."),
                             "Delete?": st.column_config.CheckboxColumn("Delete?", width="small"),
                         },
-                        disabled=["Object", "Type", "Author", "Can this account delete it?"])
+                        disabled=["Object", "Type", "Author", "Tile(s) using the column",
+                                  "Can this account delete it?"])
                     _pick_b = [r for r in _rows_b if r["_scoped"] in _bsel and r["_deletable"]]
                     _pick_x = [r for r in _rows_b if r["_scoped"] in _bsel and not r["_deletable"]]
                     if _pick_x:
@@ -3301,6 +3333,9 @@ elif step == 3:
                                    + ", ".join(f"**{r['Object']}**" for r in _pick_x)
                                    + ". Ask its owner, or run the tool as an admin.")
                     if _pick_b:
+                        st.caption("Deleting removes the WHOLE object. When only some tiles of a "
+                                   "liveboard use the column, removing just those tiles in the "
+                                   "product keeps the rest of the board — the ids are listed above.")
                         st.error(f"**{len(_pick_b)} object(s) will be PERMANENTLY DELETED on "
                                  f"`{opt_env('TS_TARGET_HOST')}`.** This removes someone's saved "
                                  "work and cannot be undone. Type **DELETE** to confirm.")
@@ -4251,13 +4286,16 @@ elif step == 4:
                                 "Type": _r.get("label") or _r.get("type") or "",
                                 "Author": _r.get("author") or "",
                                 "Uses": ", ".join(_r.get("columns") or []) or "unreadable TML",
+                                "Tile(s)": (", ".join(v["id"] for v in (_r.get("vizzes") or []))
+                                            + (f"  · of {_r.get('viz_total')}"
+                                               if _r.get("viz_total") else "")) or "—",
                                 "Status": ("in this promotion — updated, not deleted"
                                            if _r.get("in_promotion") else "would break"),
                                 "Delete?": (False if _r.get("in_promotion")
                                             else _r.get("id") in _dsel),
                                 "_scoped": _r.get("id")} for _i, _r in enumerate(_dep_rows)],
-                                columns=["#", "Object", "Type", "Author", "Uses", "Status",
-                                         "Delete?", "_scoped"])
+                                columns=["#", "Object", "Type", "Author", "Uses", "Tile(s)",
+                                         "Status", "Delete?", "_scoped"])
                             _n_break = sum(1 for _r in _dep_rows if not _r.get("in_promotion"))
                             _n_own = len(_dep_rows) - _n_break
                             st.warning(f"**{_n_break}** target object(s) reference a column this "
@@ -4274,6 +4312,10 @@ elif step == 4:
                                     "Type":    st.column_config.TextColumn("Type", width="small"),
                                     "Author":  st.column_config.TextColumn("Author", width="medium"),
                                     "Uses":    st.column_config.TextColumn("Uses", width="medium"),
+                                    "Tile(s)": st.column_config.TextColumn(
+                                        "Tile(s)", width="medium",
+                                        help="For a liveboard: the visualisation id(s) that use "
+                                             "the dropped column, and the board's total tiles."),
                                     "Status":  st.column_config.TextColumn(
                                         "Status", width="medium",
                                         help="Objects in this promotion are rewritten by the "
@@ -4283,7 +4325,8 @@ elif step == 4:
                                         help="Permanently delete this object ON THE TARGET. "
                                              "Ignored for rows that are part of this promotion."),
                                 },
-                                disabled=["#", "Object", "Type", "Author", "Uses", "Status"])
+                                disabled=["#", "Object", "Type", "Author", "Uses", "Tile(s)",
+                                          "Status"])
                             _picked = [r for r in _dep_rows
                                        if r.get("id") in _dsel and not r.get("in_promotion")]
                             if _picked:

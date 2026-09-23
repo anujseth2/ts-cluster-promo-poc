@@ -941,3 +941,27 @@ def test_there_is_no_hint_layer_and_the_raw_text_always_survives():
     long = "Error: " + ("x" * 4000) + " <br/>SOLUTION: do the thing."
     assert len(I.friendly_error(long)[2]) > 3900, "never truncated"
     assert "SOLUTION: do the thing." in I.friendly_error(long)[2]
+
+
+def test_a_blocking_liveboard_names_the_tiles_that_use_the_column():
+    # "Test dev is blocked" is not actionable. Naming the visualisation, and how many tiles the
+    # board has in total, tells the operator whether losing the board is proportionate — and lets
+    # them remove just that tile in the product instead.
+    from services.import_diagnostics import dependents_using_columns
+    lb = {"id": "lb1", "name": "Test dev", "type": "PINBOARD_ANSWER_BOOK",
+          "tml": json.dumps({"liveboard": {"name": "Test dev", "visualizations": [
+              {"id": "Viz_1", "answer": {"name": "Customers by id",
+                                         "answer_columns": [{"name": "customerid"}]}},
+              {"id": "Viz_2", "answer": {"name": "Orders by city",
+                                         "answer_columns": [{"name": "city"}]}}]}})}
+    answer = {"id": "a1", "name": "An answer", "type": "QUESTION_ANSWER_BOOK",
+              "tml": json.dumps({"answer": {"answer_columns": [{"name": "customerid"}]}})}
+    by_id = {r["id"]: r for r in dependents_using_columns([lb, answer], {"customerid"})}
+    assert by_id["lb1"]["vizzes"] == [{"id": "Viz_1", "name": "Customers by id"}]
+    assert by_id["lb1"]["viz_total"] == 2, "say how much of the board is NOT affected"
+    # an answer is a single visualisation, so it has no tile breakdown
+    assert by_id["a1"]["vizzes"] == [] and by_id["a1"]["viz_total"] == 0
+    # a dependent whose TML could not be read still reports, with empty tiles
+    unreadable = dependents_using_columns(
+        [{"id": "x", "name": "?", "type": "ANSWER", "tml": None}], {"customerid"})
+    assert unreadable[0]["vizzes"] == [] and unreadable[0]["certain"] is False

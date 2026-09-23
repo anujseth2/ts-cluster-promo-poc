@@ -1342,7 +1342,7 @@ def dependents_using_columns(dependents, dropped_names):
         tml = d.get("tml")
         if not tml:
             out.append({"id": d.get("id"), "name": d.get("name"), "type": d.get("type"),
-                        "columns": [], "certain": False})
+                        "columns": [], "vizzes": [], "viz_total": 0, "certain": False})
             continue
         try:
             doc = tml if isinstance(tml, dict) else (
@@ -1351,20 +1351,38 @@ def dependents_using_columns(dependents, dropped_names):
             out.append({"id": d.get("id"), "name": d.get("name"), "type": d.get("type"),
                         "columns": [], "certain": False})
             continue
-        hit = set()
-        for s in _iter_strings(doc):
-            low = s.strip().lower()
-            if low in want:                       # a bare name (answer_columns entry, viz column)
-                hit.add(low)
-            for inner in _BRACKET_REF.findall(s):  # [Display Name] / [table::COL] in a formula
-                tail = inner.split("::")[-1].strip().lower()
-                if tail in want:
-                    hit.add(tail)
-                elif inner.strip().lower() in want:
-                    hit.add(inner.strip().lower())
+        def _refs(node):
+            """Which of the wanted names this subtree mentions."""
+            found = set()
+            for txt in _iter_strings(node):
+                low = txt.strip().lower()
+                if low in want:                    # a bare name (answer_columns, viz column)
+                    found.add(low)
+                for inner in _BRACKET_REF.findall(txt):   # [Display] / [table::COL] in a formula
+                    tail = inner.split("::")[-1].strip().lower()
+                    if tail in want:
+                        found.add(tail)
+                    elif inner.strip().lower() in want:
+                        found.add(inner.strip().lower())
+            return found
+
+        hit = _refs(doc)
+        # For a LIVEBOARD, say WHICH tiles are involved. A board can have many, and only some use
+        # the column — naming the viz lets the operator judge the blast radius (and remove just
+        # that tile in the product) instead of treating the whole board as lost.
+        vizzes = []
+        lb = doc.get("liveboard") if isinstance(doc, dict) else None
+        for viz in ((lb or {}).get("visualizations") or []):
+            if _refs(viz):
+                vid = viz.get("id") or viz.get("viz_id") or ""
+                nm = ((viz.get("answer") or {}).get("name")
+                      or viz.get("name") or "")
+                vizzes.append({"id": str(vid), "name": nm})
         if hit:
             out.append({"id": d.get("id"), "name": d.get("name"), "type": d.get("type"),
-                        "columns": sorted(hit), "certain": True})
+                        "columns": sorted(hit), "vizzes": vizzes,
+                        "viz_total": len((lb or {}).get("visualizations") or []) if lb else 0,
+                        "certain": True})
     return out
 
 
