@@ -29,7 +29,6 @@ from services.import_diagnostics import (
     column_drop_cascade, finding_key, dangling_reference_findings, table_cleanup_findings,
     realign_column_types, warehouse_type_to_ts, warehouse_type_findings, type_family, type_class,
     recase_columns, model_tables_without_columns, prune_tables_whole, prune_stale_realignments,
-    friendly_error_with_evidence,
     restore_unneeded_type_changes, promotion_plan, scan_names_for_drops,
     dependents_using_columns,
     blocking, warnings_only, is_blocking_result, drop_column_properties,
@@ -199,9 +198,10 @@ def _safe_validate(items, step=None):
                        "`GITHUB_TOKEN` is exported in your shell (it would shadow `.env`). "
                        "Nothing was committed or promoted.")
         else:
-            _h, _a, _ = friendly_error(_msg)
-            st.error("Validation couldn't reach the target — " + (_h or "the connection failed."))
-            st.caption("→ " + (_a or "Try again; the client auto-retries transient resets."))
+            st.error("Validation couldn't reach the target. The client already auto-retries "
+                     "transient resets, so try again; if it persists the message below is the "
+                     "platform's own.")
+            st.code(friendly_error(_msg)[2], language=None)
         return None
 
 
@@ -789,11 +789,10 @@ def _prepare_bundle():
                 raw = source_client().export_tml(selected_ids)
             except Exception as _ex:
                 _exp_status.update(label="Export failed — source connection reset", state="error")
-                _h, _a, _ = friendly_error(str(_ex))
-                st.error("Couldn't export from the source cluster — "
-                         + (_h or "the connection was reset by the remote host (WinError 10054)."))
-                st.caption("→ " + (_a or "A transient network reset (proxy/gateway), not related to "
-                           "dropping columns — the client already retried with backoff. Retry below."))
+                st.error("Couldn't export from the source cluster. This is usually a transient "
+                         "network reset from a proxy or gateway, not anything to do with dropped "
+                         "columns, and the client already retried with backoff. Retry below.")
+                st.code(friendly_error(str(_ex))[2], language=None)
                 if st.button("↻ Retry export"):
                     st.rerun()
                 st.stop()
@@ -2387,7 +2386,7 @@ elif step == 3:
                 try:
                     results = target_client().import_tml(strings, policy="VALIDATE_ONLY")
                 except Exception as _e:
-                    _tick(f"Pass {passes}: {friendly_error(str(_e))[0] or 'validation failed'}")
+                    _tick(f"Pass {passes}: validation request failed — {_e}")
                     reason = "request_failed"
                     break
                 _log_validate(files, results)
@@ -2617,9 +2616,9 @@ elif step == 3:
                     "ts": "(request failed)", "files": [],
                     "results": [{"name": "(validation request)", "status": "ERROR",
                                  "error": _msg}]}
-                _h, _a, _ = friendly_error(_msg)
-                st.error("Validation couldn't reach the target — " + (_h or "the connection failed."))
-                st.caption("→ " + (_a or "Try again; the client auto-retries transient resets."))
+                st.error("Validation couldn't reach the target. The client already auto-retries "
+                         "transient resets, so try again; the platform's own message is below.")
+                st.code(friendly_error(_msg)[2], language=None)
                 return None
 
         def _detect_silent_drops(items):
@@ -3036,7 +3035,7 @@ elif step == 3:
                         if f["kind"] == "type_changed_notice":
                             continue
                         st.markdown(f"**{f.get('object') or '(not named)'}** — "
-                                    f"{friendly_error(f.get('error', ''))[0] or f.get('error', '')}")
+                                    f"{f.get('error', '')}")
 
             # Casing diagnostic: if a column is flagged as "missing from warehouse", it usually
             # means the connection-based recasing did not resolve that table. Show what happened.
@@ -3763,17 +3762,10 @@ elif step == 3:
                 st.markdown("#### Other validation errors")
                 for f in other:
                     st.markdown(f"**{f['object']}**")
-                    headline, action, raw, evidence = friendly_error_with_evidence(f["error"])
-                    # The platform's own words are ALWAYS shown, in full and copyable. A hint is
-                    # additional and only appears when its remedy was actually confirmed on a
-                    # cluster — an unproven guess is worse than the raw text, because people act
-                    # on it.
-                    if headline:
-                        st.markdown(f"- {headline}")
-                        if action:
-                            st.caption(action)
-                        st.caption(f"_{evidence}_")
-                    st.code(raw, language=None)
+                    # The platform's own words, in full and copyable. We do not paraphrase them:
+                    # classify_import_errors already extracted the names into the sections above,
+                    # and ThoughtSpot's own SOLUTION: line is better than anything we'd guess.
+                    st.code(friendly_error(f["error"])[2], language=None)
 
                 # These errors are often unattributed (name "unknown"). Validate each file on its
                 # own to name the culprit AND itemize its real error — a missing column becomes a

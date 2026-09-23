@@ -144,167 +144,20 @@ def _guids_by_type(blob):
     return out
 
 
-def _dep_block_detail(text):
-    """(column, [dependent names]) out of a CLEANED "Deleted columns have dependents" payload.
+def friendly_error(msg: str):
+    """Return (None, None, cleaned_raw) — the platform's own words, tidied for display.
 
-    friendly_error matches against _clean()'ed text, not raw HTML, so this parses the cleaned
-    shape: the offending column arrives bolded on its own bullet and its dependents follow as
-    plain bullets, up to the SOLUTION line. The other shape names only a bolded table.
-    Verified against the verbatim ps-internal message, 2026-09-22."""
-    body = re.split(r"\*\*SOLUTION", text or "", 1)[0]
-    col, deps = "", []
-    for ln in body.split("\n"):
-        ln = ln.strip()
-        if not ln.startswith("- "):
-            continue
-        item = ln[2:].strip()
-        if re.match(r"^\*\*[^*]+\*\*\s*:", item) or "Deleted columns have dependents" in item:
-            # the table-named shape: "**fact_x**: Deleted columns have dependents." — a table,
-            # not a dependent, and never a dependent name.
-            _t = re.match(r"^\*\*([^*]+)\*\*", item)
-            if _t and not col:
-                col = _t.group(1).strip()
-            continue
-        if item.startswith("**") and item.endswith("**"):
-            col = item.strip("*").strip()
-        elif item:
-            deps.append(item)
-    if not col:
-        t = re.search(r"\*\*([^*]+)\*\*\s*:\s*Deleted columns have dependents", text or "", re.I)
-        col = t.group(1).strip() if t else ""
-    return col, deps
+    The hint layer that used to live here is GONE, deliberately. It paraphrased ThoughtSpot's
+    errors from single observed strings and was wrong twice in a week: a `calendar` property is
+    not a schema-version gap, and a 204 from metadata/delete is not a successful delete. It was
+    also largely redundant — classify_import_errors already pulls the column, table and dependent
+    names out of the payload and routes them to a section with real controls, and the platform
+    ships its own SOLUTION: line, normalised by the people who emit the error.
 
-
-# Each rule is (pattern, fn, EVIDENCE). EVIDENCE is where the remedy was actually confirmed —
-# a cluster and a date. A rule with an empty EVIDENCE is a GUESS, and friendly_error will not
-# show it: the operator sees the platform's own words instead.
-#
-# This is deliberate and was learned the hard way. Hints written from a single observed string
-# were wrong twice in one week (a `calendar` property is not a schema-version gap; a 204 from
-# metadata/delete is not a successful delete), and a confident wrong action line is worse than
-# raw platform text because people act on it. If you cannot point at a run that proves the
-# remedy, leave EVIDENCE empty and let the raw message speak.
-_ERROR_RULES = [
-    # VERIFIED on ps-internal 2026-09-22: removing a column an answer uses fails the import, at
-    # VALIDATE_ONLY as well as on the real one, and deleting the dependent then lets it through.
-    # So this is a hard stop with exactly two ways out, and the platform names both halves.
-    (re.compile(r"Deleted columns have dependents", re.I),
-     lambda m: (
-         (lambda col, deps: (
-             (f"Can't remove `{col}` — " if col else "Can't remove a column — ")
-             + (f"{len(deps)} object(s) on the target still use it: "
-                + ", ".join(f"**{d}**" for d in deps[:6])
-                + (", …" if len(deps) > 6 else "") + "."
-                if deps else "objects on the target still use it."),
-             "Two ways through, and no third: keep the column (untick it on Source Audit so it "
-             "promotes), or delete the dependent object(s) on the target first — the Git "
-             "Operations step can list and delete the ones your account can see. Anything owned "
-             "by someone you can't see has to go through its owner or an admin."
-         ))(*_dep_block_detail(getattr(m, "string", "")))
-     )),
-    (re.compile(r"free trial has ended|warehouses? (?:have|has) been suspended|CONNECTION_CREATION_ERROR", re.I),
-     lambda m: ("The target warehouse can't be reached — it looks paused or suspended "
-                "(e.g. a Snowflake trial that ended, or a stopped Databricks warehouse).",
-                "Resume/resize the warehouse in the data platform, then re-run. This is a warehouse "
-                "state problem, not a TML problem.")),
-    (re.compile(r"Data source metadata could not be found", re.I),
-     lambda m: ("ThoughtSpot couldn't read the connection's metadata.",
-                "Usually the warehouse is asleep/suspended or the connection lost its credential — "
-                "wake the warehouse or re-test the connection, then re-run.")),
-    # Object-level denial: the payload NAMES the objects, so say which ones. This must sit ahead of
-    # the generic permission rule below, which used to answer it by pointing at the CONNECTION — the
-    # wrong object, so the operator checks the wrong permission and finds nothing wrong (GSK, twice).
-    (re.compile(r"AUTHORIZATION_FAILURE.*?No permission to update objects\s*:\s*(\{.*?\})",
-                re.I | re.S),
-     lambda m: ("No permission to UPDATE an object that already exists on the target: "
-                + ", ".join(f"{k} {v}" for k, v in sorted(_guids_by_type(m.group(1)).items()))
-                + ".",
-                "This is not the connection and not the warehouse — it is object-level sharing on "
-                "the target. The promoting account needs edit/MODIFY on the object(s) above (and "
-                "read on their columns), or DATAMANAGEMENT to update objects it does not own. The "
-                "guid is a PRE-EXISTING target object your model depends on, not one being "
-                "promoted — look it up on the target and share it, then re-run.")),
-    (re.compile(r"Model/Worksheet columns have invalid properties", re.I),
-     lambda m: ("A model column names something that doesn't exist on the target.",
-                "For a `calendar` property this is a CUSTOM CALENDAR: those are cluster-local "
-                "objects that a TML promotion never carries, so one defined on the source is "
-                "simply absent on the target. Create the calendar there to keep the column's "
-                "fiscal/custom period grouping, or remove the property to let the promotion land "
-                "and accept standard date periods for that column. The column and its data are "
-                "unaffected either way. (Not a schema-version gap: other columns in the same model "
-                "keep their calendars without complaint.)")),
-    (re.compile(r"10086|not authorized|permission|privilege|access denied", re.I),
-     lambda m: ("Permission problem talking to the connection.",
-                "The account running the promotion needs access to the connection "
-                "(shared at MODIFY/edit) and DATAMANAGEMENT — grant it, then re-run.")),
-    (re.compile(r"Existing guid.*will be used", re.I),
-     lambda m: ("This object already exists on the target and was updated in place (not an error).",
-                "No action needed — this is the normal obj_id update path.")),
-    (re.compile(r"timed out|timeout|504|gateway", re.I),
-     lambda m: ("The request to the warehouse timed out.",
-                "A cold warehouse can exceed the gateway limit — warm it (run a quick query) and "
-                "re-run; if it persists it's the connection's column-introspection latency.")),
-    (re.compile(r"schema validation failed", re.I),
-     lambda m: ("One object's TML failed schema validation, but ThoughtSpot didn't say which.",
-                "Use 'Find which object fails' below to validate each file on its own and pin "
-                "down the culprit — then skip or fix that object.")),
-    (re.compile(r"10054|connection (?:reset|aborted)|forcibly closed|Max retries", re.I),
-     lambda m: ("The connection to the target was reset before the request finished.",
-                "Usually a slow server-side warehouse validation dropped by a gateway/proxy. The "
-                "client already auto-retries transient resets; if it persists, warm the warehouse "
-                "(run a quick query) and try again.")),
-]
-
-
-# Where each rule's remedy was actually confirmed. A pattern absent from this map is UNVERIFIED
-# and its hint is suppressed — see the note above _ERROR_RULES.
-_RULE_EVIDENCE = {
-    "Deleted columns have dependents":
-        "verified on ps-internal, 2026-09-23 — the drop was blocked at VALIDATE_ONLY and on "
-        "import, and deleting the dependent let it straight through",
-    "Existing guid.*will be used":
-        "verified on ps-internal, 2026-09-23 — this notice is appended to real errors too, so on "
-        "its own it only means the object was matched for update",
-}
-
-
-def rule_evidence(pattern) -> str:
-    """The provenance string for a rule, or "" when nobody has proven its remedy."""
-    return _RULE_EVIDENCE.get(getattr(pattern, "pattern", str(pattern)), "")
-
-
-def friendly_error(msg: str, include_unverified: bool = False):
-    """Translate a raw TS error into (headline, action, raw_clean).
-
-    headline/action are None when no rule matches OR when the matching rule has no EVIDENCE —
-    an unproven hint is not shown, because the operator acts on it. The cleaned raw text is
-    always returned, so the caller can always show the platform's own words.
-
-    `include_unverified=True` is for tooling that wants to see what a rule WOULD say (the gaps
-    report), never for the operator-facing path."""
-    raw = _clean(msg)
-    for pat, fn in _ERROR_RULES:
-        m = pat.search(raw)
-        if m:
-            if not rule_evidence(pat) and not include_unverified:
-                return None, None, raw
-            headline, action = fn(m)
-            return headline, action, raw
-    return None, None, raw
-
-
-def friendly_error_with_evidence(msg: str):
-    """(headline, action, raw, evidence). evidence is "" for an unmatched or unproven message."""
-    raw = _clean(msg)
-    for pat, fn in _ERROR_RULES:
-        m = pat.search(raw)
-        if m:
-            ev = rule_evidence(pat)
-            if not ev:
-                return None, None, raw, ""
-            headline, action = fn(m)
-            return headline, action, raw, ev
-    return None, None, raw, ""
+    The tuple shape is kept so callers need no change: headline and action are always None, so
+    every caller falls through to showing the raw text, which is the correct default.
+    """
+    return None, None, _clean(msg)
 
 
 def classify_import_errors(results):

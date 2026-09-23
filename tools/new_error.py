@@ -26,7 +26,7 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 CORPUS = ROOT / "tests" / "corpus" / "validate_errors.jsonl"
 
-from services.import_diagnostics import classify_import_errors, friendly_error, _clean  # noqa: E402
+from services.import_diagnostics import classify_import_errors, _clean  # noqa: E402
 
 # Identifiers worth pulling out of a message, in the order a human would notice them.
 _IDENT = [
@@ -198,9 +198,7 @@ def _report_gaps():
                                           "status": rec.get("status") or "ERROR",
                                           "error": rec["error"]}]):
             k = f["kind"]
-            # A hint only counts when it is proven; an unverified rule is suppressed for the
-            # operator, so for this report it does not exist either.
-            has = friendly_error(rec["error"])[0] is not None
+            has = False   # the hint layer is gone; a kind is served by its UI section
             e = by_kind.setdefault(k, {"n": 0, "friendly": False, "sample": rec["error"]})
             e["n"] += 1
             e["friendly"] = e["friendly"] or has
@@ -281,9 +279,7 @@ def main():
             continue
         already += 1
         if args.all:
-            head = friendly_error(rec["error"])[0]
             print(f"[handled: {found[0]['kind']}] {rec['error'][:70]!r}")
-            print(f"          says: {head[:100] if head else '(raw text shown — no PROVEN hint)'}")
 
     print(f"\n{len(recs)} message(s) in, {already} already handled, "
           f"{len(unhandled)} unhandled.\n")

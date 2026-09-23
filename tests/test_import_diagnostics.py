@@ -459,17 +459,6 @@ def test_warning_status_is_not_an_issue_to_resolve():
     assert all(f["object"] and f["object"] != "unknown" for f in warns)
 
 
-def test_authorization_failure_hint_is_suppressed_until_its_remedy_is_proven():
-    # We can PARSE this payload reliably (it names the objects), but nobody has confirmed that
-    # sharing the named object actually clears it. Until someone does, show the raw message.
-    from services.import_diagnostics import friendly_error_with_evidence
-    msg = ('Unable to save worksheet. Error Code: AUTHORIZATION_FAILURE Incident Id: 8f74b135 '
-           'Error Message: No permission to update objects: {   "LOGICAL_TABLE": [     '
-           '"7c4f181a-1b69-4de2-a73b-766aa0ff9a11"   ] } or to read child securable objects')
-    h, a, raw, ev = friendly_error_with_evidence(msg)
-    assert h is None and ev == ""
-    assert "7c4f181a-1b69-4de2-a73b-766aa0ff9a11" in raw, "the guid must survive into the raw text"
-
 
 def _unused_authorization_failure_names_the_object_not_the_connection():
     # The hint used to send the operator to check the CONNECTION, which is not what the payload
@@ -803,30 +792,6 @@ def test_source_absent_flags_only_out_of_sync_column_case_insensitively():
 
 # ── friendly_error (humanised messages) ─────────────────────────────────────────
 
-def test_an_unverified_hint_is_not_shown_to_the_operator():
-    # A hint whose remedy nobody has confirmed on a cluster is a guess, and a confident wrong
-    # action line is worse than the platform's own words because people act on it. These two
-    # rules have no evidence entry, so the operator sees the raw message instead.
-    from services.import_diagnostics import friendly_error_with_evidence
-    for msg in ("Failed to initialize pool: Your free trial has ended and all of your virtual "
-                "warehouses have been suspended.",
-                "Error code 10086: not authorized"):
-        h, a, raw, ev = friendly_error_with_evidence(msg)
-        assert h is None and a is None and ev == "", f"unproven hint leaked for: {msg[:40]}"
-        assert raw, "the raw text is always returned"
-    # the rule text still EXISTS, so it can be proven later without rewriting it
-    h, a, _raw = friendly_error("Error code 10086: not authorized", include_unverified=True)
-    assert h and "permission" in h.lower()
-
-
-def test_a_verified_hint_is_shown_with_its_provenance():
-    from services.import_diagnostics import friendly_error_with_evidence
-    h, a, raw, ev = friendly_error_with_evidence(
-        "Deleted columns have dependents.<br/>- <b>customerID</b></br><ul><li>Test dev</li></ul>")
-    assert h and a, "this one was confirmed live, so it may speak"
-    assert "ps-internal" in ev and "2026-09-23" in ev
-    assert "customerID" in h and "Test dev" in h
-    assert raw, "and the raw text is still available alongside it"
 
 
 def test_friendly_error_unknown_returns_none_headline():
@@ -925,30 +890,6 @@ def test_drop_tables_prunes_dimension_from_model(model_item):
     assert summary["tables"] == 1
 
 
-def test_deleted_columns_have_dependents_reads_like_a_human_wrote_it():
-    # VERIFIED live on ps-internal 2026-09-22: removing a column an answer uses fails the import
-    # (at VALIDATE_ONLY too), and deleting the dependent then lets it through. So the message is a
-    # hard stop with exactly two ways out, and it should say both. VERBATIM platform bytes.
-    from services.import_diagnostics import friendly_error
-    msg = ("Deleted columns have dependents.<br/>- <b>O Clerk</b></br><ul><li>ZZ Dep Test Answer "
-           "(anuj) - delete me</li></ul><br/><b>SOLUTION:</b><br/>Either replace the deleted "
-           "columns, or remove the dependencies.<br/>")
-    headline, action, _raw = friendly_error(msg)
-    assert "O Clerk" in headline, "name the column that is blocked"
-    assert "ZZ Dep Test Answer (anuj) - delete me" in headline, "name what is blocking it"
-    assert "Source Audit" in action and "delete" in action.lower(), "give both ways out"
-    assert "can't see" in action.lower(), "be honest about the invisible-dependent case"
-
-    # the table-named shape names the table and claims no dependents
-    h2, _a2, _ = friendly_error("Error: <br/>- <b>fact_x</b>: Deleted columns have dependents.")
-    assert "fact_x" in h2 and "still use it" in h2
-    # several dependents are listed, not just counted
-    h3, _a3, _ = friendly_error("Deleted columns have dependents.<br/>- <b>C</b></br><ul>"
-                                "<li>One</li><li>Two</li></ul>")
-    assert "One" in h3 and "Two" in h3 and "2 object(s)" in h3
-    # the bare form still produces a usable sentence
-    assert friendly_error("Deleted columns have dependents.")[0]
-
 
 def test_clean_handles_the_malformed_closing_break():
     # ThoughtSpot emits "</br>" in this payload. Left alone it survives into the rendered text.
@@ -978,3 +919,25 @@ def test_the_model_being_promoted_is_not_a_deletion_candidate():
     assert [h["id"] for h in deletable] == ["a1"], \
         "the promoted model must never be offered for deletion"
     assert next(h for h in hits if h["id"] == "m1")["in_promotion"] is True
+
+
+def test_there_is_no_hint_layer_and_the_raw_text_always_survives():
+    # The paraphrasing layer was deleted on 2026-09-23. It restated what classify_import_errors
+    # already extracts, and ThoughtSpot ships its own SOLUTION: line written by the people who
+    # emit the error. Ours was wrong twice in a week, so the tuple now always yields the platform's
+    # words and nothing of our own invention.
+    from services import import_diagnostics as I
+    assert not hasattr(I, "_ERROR_RULES"), "the rule table must stay deleted"
+    assert not hasattr(I, "_RULE_EVIDENCE")
+    assert not hasattr(I, "friendly_error_with_evidence")
+    for msg in ("Deleted columns have dependents.<br/>- <b>customerID</b></br>"
+                "<ul><li>Test dev</li></ul>",
+                "Error code 10086: not authorized",
+                "totally novel error nobody has seen"):
+        h, a, raw = I.friendly_error(msg)
+        assert h is None and a is None, "we no longer speak for the platform"
+        assert raw and "<br/>" not in raw, "raw text is returned, tidied but complete"
+    # and nothing is lost in the tidying
+    long = "Error: " + ("x" * 4000) + " <br/>SOLUTION: do the thing."
+    assert len(I.friendly_error(long)[2]) > 3900, "never truncated"
+    assert "SOLUTION: do the thing." in I.friendly_error(long)[2]
