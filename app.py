@@ -3333,24 +3333,50 @@ elif step == 3:
                                    + ", ".join(f"**{r['Object']}**" for r in _pick_x)
                                    + ". Ask its owner, or run the tool as an admin.")
                     if _pick_b:
-                        st.caption("Deleting removes the WHOLE object. When only some tiles of a "
-                                   "liveboard use the column, removing just those tiles in the "
-                                   "product keeps the rest of the board — the ids are listed above.")
-                        st.error(f"**{len(_pick_b)} object(s) will be PERMANENTLY DELETED on "
-                                 f"`{opt_env('TS_TARGET_HOST')}`.** This removes someone's saved "
-                                 "work and cannot be undone. Type **DELETE** to confirm.")
+                        # A liveboard loses only the tiles that use the column; an answer IS a
+                        # single visualisation, so there is nothing to strip and the answer goes.
+                        _lb_rows = [r for r in _pick_b
+                                    if str(r.get("Type", "")).upper() == "LIVEBOARD"
+                                    and (_scan.get(r["_scoped"], {}).get("vizzes"))]
+                        _del_rows = [r for r in _pick_b if r not in _lb_rows]
+                        _plan = []
+                        for r in _lb_rows:
+                            _v = _scan.get(r["_scoped"], {})
+                            _ids = [x["id"] for x in _v.get("vizzes") or []]
+                            _rem = (_v.get("viz_total") or 0) - len(_ids)
+                            _plan.append(f"**{r['Object']}** — remove {len(_ids)} tile(s) "
+                                         f"({', '.join(_ids)}); {_rem} left on the board")
+                        for r in _del_rows:
+                            _plan.append(f"**{r['Object']}** — DELETE the whole "
+                                         f"{str(r.get('Type','object')).lower()}")
+                        st.error("**This will change `" + opt_env("TS_TARGET_HOST") + "`:**\n\n"
+                                 + "\n".join(f"- {x}" for x in _plan)
+                                 + "\n\nIt cannot be undone. Type **DELETE** to confirm.")
                         _tb = st.text_input("Confirm", key="blk_del_confirm",
                                             label_visibility="collapsed", placeholder="type DELETE")
-                        if st.button(f"Delete {len(_pick_b)} blocking object(s)", key="blk_del_go",
+                        _btn = (f"Apply to {len(_pick_b)} object(s) "
+                                f"({len(_lb_rows)} tile removal, {len(_del_rows)} delete)")
+                        if st.button(_btn, key="blk_del_go",
                                      disabled=_tb.strip().upper() != "DELETE"):
                             _res_b = {}
-                            with st.status("Deleting on the target…", expanded=True) as _bs:
-                                for _r in _pick_b:
+                            with st.status("Changing the target…", expanded=True) as _bs:
+                                for _r in _lb_rows:
+                                    _ids = [x["id"] for x in
+                                            (_scan.get(_r["_scoped"], {}).get("vizzes") or [])]
+                                    try:
+                                        _okb, _det = target_client().remove_vizzes_verified(
+                                            _r["_scoped"], _ids)
+                                    except Exception as _e:
+                                        _okb, _det = False, str(_e)
+                                    _res_b[_r["_scoped"]] = "deleted" if _okb else _det
+                                    _bs.write(("✓ " if _okb else "✗ ")
+                                              + f"{_r['Object']}: {_det}")
+                                for _r in _del_rows:
                                     try:
                                         _okb, _st_b, _det = target_client().delete_metadata_verified(
                                             _r["Type"], _r["_scoped"])
                                     except Exception as _e:
-                                        _okb, _det = False, str(_e)[:140]
+                                        _okb, _det = False, str(_e)
                                     _res_b[_r["_scoped"]] = "deleted" if _okb else _det
                                     _bs.write(("✓ " if _okb else "✗ ")
                                               + f"{_r['Object']}: {_res_b[_r['_scoped']]}")
@@ -3359,8 +3385,8 @@ elif step == 3:
                                                      "type": r["Type"], "author": r["Author"],
                                                      "columns": []} for r in _pick_b], _res_b)
                                 _okn = sum(1 for v in _res_b.values() if v == "deleted")
-                                _bs.update(label=f"Deleted {_okn} of {len(_pick_b)} "
-                                                 "(logged to logs/target_deletes.jsonl)",
+                                _bs.update(label=(f"Applied {_okn} of {len(_pick_b)} "
+                                                  "(logged to logs/target_deletes.jsonl)"),
                                            state="complete" if _okn == len(_pick_b) else "error")
                             _bsel.clear()
                             st.session_state.pop("blk_del_confirm", None)

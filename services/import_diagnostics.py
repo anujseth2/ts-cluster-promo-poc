@@ -1316,6 +1316,28 @@ def scan_names_for_drops(drop_set, cascade_names=None):
     return {s for s in out if s}
 
 
+def strip_vizzes_from_tml(edoc, viz_ids):
+    """Remove named visualisations from ONE exported liveboard TML.
+
+    Returns (new_edoc, removed, remaining). `remaining` is how many tiles the board still has, so
+    the caller can refuse to leave an empty liveboard behind rather than discovering it after the
+    write. Raises nothing: an edoc that is not a liveboard comes back unchanged with removed=0.
+
+    An ANSWER has no tiles to strip — it IS a single visualisation — so removing its column means
+    deleting the answer. Only a liveboard gets this surgical treatment.
+    """
+    item = {"edoc": edoc}
+    doc = _parse_edoc(item)
+    lb = doc.get("liveboard") if isinstance(doc, dict) else None
+    if not lb or lb.get("visualizations") is None:
+        return edoc, 0, 0
+    before = len(lb["visualizations"])
+    out_items, removed = drop_vizzes([item], viz_ids)
+    new_doc = _parse_edoc(out_items[0])
+    remaining = len((new_doc.get("liveboard") or {}).get("visualizations") or [])
+    return out_items[0]["edoc"], before - remaining, remaining
+
+
 def dependents_using_columns(dependents, dropped_names):
     """Narrow TABLE-level dependents down to the ones that actually reference a DROPPED COLUMN.
 

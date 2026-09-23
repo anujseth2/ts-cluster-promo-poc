@@ -965,3 +965,37 @@ def test_a_blocking_liveboard_names_the_tiles_that_use_the_column():
     unreadable = dependents_using_columns(
         [{"id": "x", "name": "?", "type": "ANSWER", "tml": None}], {"customerid"})
     assert unreadable[0]["vizzes"] == [] and unreadable[0]["certain"] is False
+
+
+def test_stripping_tiles_keeps_the_rest_of_the_board():
+    # The agreement: an ANSWER is deleted whole (it IS one visualisation), but a LIVEBOARD only
+    # loses the tiles that use the dropped column. Deleting a two-tile board to resolve one tile
+    # destroys work that has nothing to do with the column.
+    from services.import_diagnostics import strip_vizzes_from_tml
+    lb = json.dumps({"liveboard": {"name": "Test dev", "visualizations": [
+        {"id": "Viz_1", "answer": {"name": "A", "answer_columns": [{"name": "customerid"}]}},
+        {"id": "Viz_2", "answer": {"name": "B", "answer_columns": [{"name": "city"}]}}],
+        "layout": {"tiles": [{"visualization_id": "Viz_1"}, {"visualization_id": "Viz_2"}]}}})
+    new, removed, remaining = strip_vizzes_from_tml(lb, ["Viz_1"])
+    doc = json.loads(new)["liveboard"]
+    assert (removed, remaining) == (1, 1)
+    assert [v["id"] for v in doc["visualizations"]] == ["Viz_2"]
+    assert [t["visualization_id"] for t in doc["layout"]["tiles"]] == ["Viz_2"], \
+        "the orphaned layout tile must go too, or the board imports with a hole"
+
+
+def test_an_answer_tml_is_left_alone_by_tile_stripping():
+    from services.import_diagnostics import strip_vizzes_from_tml
+    ans = json.dumps({"answer": {"name": "An answer"}})
+    new, removed, remaining = strip_vizzes_from_tml(ans, ["Viz_1"])
+    assert (new, removed, remaining) == (ans, 0, 0), "nothing to strip; the answer is deleted whole"
+
+
+def test_removing_every_tile_is_reported_rather_than_done():
+    # If all tiles use the column there is nothing surgical left. Hollowing the board out silently
+    # is worse than saying so and letting the operator choose to delete it.
+    from services.import_diagnostics import strip_vizzes_from_tml
+    lb = json.dumps({"liveboard": {"visualizations": [
+        {"id": "V1", "answer": {"answer_columns": [{"name": "customerid"}]}}]}})
+    _new, removed, remaining = strip_vizzes_from_tml(lb, ["V1"])
+    assert removed == 1 and remaining == 0, "the caller must refuse on remaining == 0"
