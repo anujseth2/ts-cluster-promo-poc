@@ -49,10 +49,11 @@ def plan_cascade(seeds, column_names, fetch_tml, fetch_deps, skip_ids=(), skip_n
 
     Returns (actions, blocked).
 
-    actions: [{"id","name","type","action","detail","removed","new_edoc"}] where action is one
-             of "strip_columns" | "remove_tiles" | "delete"; new_edoc is None for a delete, and
-             "removed" is what must be gone from the object afterwards for the write to count
-             as verified.
+    actions: [{"id","name","type","action","detail","removed","verify","new_edoc"}] where action
+             is one of "strip_columns" | "remove_tiles" | "delete". new_edoc is None for a delete,
+             "removed" is the audit record of what the edit took out, and "verify" is what must be
+             true on a fresh re-read for the write to count — pass it straight to
+             TSClient.apply_tml_verified as keyword arguments.
     blocked: [{"id","name","reason"}] anything that cannot be planned — unreadable, or a
              liveboard where EVERY tile uses the column so there is nothing surgical to do.
              Any entry here means the cascade must not be applied.
@@ -92,7 +93,7 @@ def plan_cascade(seeds, column_names, fetch_tml, fetch_deps, skip_ids=(), skip_n
 
         if kind == "answer":
             actions.append({"id": oid, "name": obj.get("name"), "type": "ANSWER",
-                            "action": "delete", "new_edoc": None, "removed": [],
+                            "action": "delete", "new_edoc": None, "removed": [], "verify": {},
                             "detail": "deleted — an answer is a single visualisation, so there "
                                       "is nothing to strip"})
             continue
@@ -114,6 +115,10 @@ def plan_cascade(seeds, column_names, fetch_tml, fetch_deps, skip_ids=(), skip_n
             new_edoc, removed, remaining = strip_vizzes_from_tml(edoc, ids)
             actions.append({"id": oid, "name": obj.get("name"), "type": "LIVEBOARD",
                             "action": "remove_tiles", "new_edoc": new_edoc, "removed": list(ids),
+                            # NOT the tile ids: ThoughtSpot renumbers them on import, so the
+                            # survivor of a two-tile board comes back wearing the removed one's
+                            # id. What is checked is what actually matters and survives that.
+                            "verify": {"columns": sorted(want), "viz_count": remaining},
                             "detail": f"remove {removed} tile(s) ({', '.join(ids)}); "
                                       f"{remaining} left on the board"})
             continue
@@ -132,7 +137,7 @@ def plan_cascade(seeds, column_names, fetch_tml, fetch_deps, skip_ids=(), skip_n
             new_items, man = drop_columns([{"edoc": edoc}], scoped)
             actions.append({"id": oid, "name": obj.get("name"), "type": "LOGICAL_TABLE",
                             "action": "strip_columns", "new_edoc": new_items[0]["edoc"],
-                            "removed": sorted(scoped),
+                            "removed": sorted(scoped), "verify": {"columns": sorted(scoped)},
                             "detail": "remove " + ", ".join(sorted(scoped))
                                       + (f"; cascades {len(man.get('formulas') or [])} formula(s)"
                                          if man.get("formulas") else "")})

@@ -85,10 +85,16 @@ def test_dependency_types_map_to_the_v2_metadata_types():
     assert TSClient.metadata_type_for("answer") == "ANSWER"
 
 
+
 # ── the write half of a planned cascade: import, then RE-READ and check ──────────────────────
 #
 # Same rule as deletion, for the same reason. A 200 from the import API proved nothing: the
 # update-in-place notice read as success for weeks while the target never changed.
+#
+# What is checked matters as much as that it is checked. ps-internal 2026-09-23: removing Viz_1
+# from a two-tile board came back with ONE tile, correctly the survivor, wearing the id Viz_1 —
+# ThoughtSpot renumbers tiles on import. Verifying "Viz_1 is gone" therefore called a perfectly
+# good removal a failure and stopped the cascade. Tile ids are positions, not identities.
 
 import json as _json
 
@@ -111,38 +117,56 @@ class _FakeApply(TSClient):
 _OK = [{"status": "OK", "error": ""}]
 
 
-def test_tiles_that_are_really_gone_are_reported_as_applied():
-    f = _FakeApply(_OK, {"liveboard": {"visualizations": [{"id": "Viz_2"}]}})
-    ok, detail = f.apply_tml_verified("lb1", "edited", gone_vizzes=["Viz_1"])
-    assert ok is True and "verified" in detail
+def _board(tiles):
+    """A liveboard as the cluster hands it back: ids renumbered from 1, whatever was removed."""
+    return {"liveboard": {"visualizations": [
+        {"id": f"Viz_{i}", "answer": {"name": f"{c} tile", "search_query": f"[{c}]",
+                                      "answer_columns": [{"name": c}]}}
+        for i, c in enumerate(tiles, start=1)]}}
+
+
+def test_a_trimmed_board_passes_even_though_the_survivor_took_the_removed_tiles_id():
+    # The exact ps-internal result: Gender tile removed, City tile survives AS Viz_1.
+    f = _FakeApply(_OK, _board(["City"]))
+    ok, detail = f.apply_tml_verified("lb1", "edited", columns=["gender"], viz_count=1)
+    assert ok is True, detail
     assert f.imported == [("ALL_OR_NONE", ["edited"])]
 
 
-def test_a_tile_still_on_the_board_is_a_failure_however_happy_the_import_was():
-    f = _FakeApply(_OK, {"liveboard": {"visualizations": [{"id": "Viz_1"}, {"id": "Viz_2"}]}})
-    ok, detail = f.apply_tml_verified("lb1", "edited", gone_vizzes=["Viz_1"])
-    assert ok is False and "Viz_1" in detail and "nothing was removed" in detail
+def test_a_board_that_still_shows_the_dropped_column_is_a_failure():
+    f = _FakeApply(_OK, _board(["gender"]))
+    ok, detail = f.apply_tml_verified("lb1", "edited", columns=["gender"], viz_count=1)
+    assert ok is False and "gender" in detail
+
+
+def test_a_board_left_with_the_wrong_number_of_tiles_is_a_failure():
+    # Count is the guard against an import that was accepted but did not land as planned.
+    f = _FakeApply(_OK, _board(["City", "gender"]))
+    ok, detail = f.apply_tml_verified("lb1", "edited", columns=[], viz_count=1)
+    assert ok is False and "2 tile(s)" in detail and "1" in detail
 
 
 def test_a_column_still_on_the_model_is_a_failure():
-    f = _FakeApply(_OK, {"model": {"columns": [{"name": "gender", "column_id": "t::gender"}]}})
-    ok, detail = f.apply_tml_verified("m1", "edited", gone_columns=["t::gender"])
+    f = _FakeApply(_OK, {"model": {"columns": [{"name": "Gender",
+                                                "column_id": "sales_customers::gender"}]}})
+    ok, detail = f.apply_tml_verified("m1", "edited", columns=["sales_customers::gender"])
     assert ok is False and "gender" in detail
 
 
 def test_a_stripped_model_is_reported_as_applied():
-    f = _FakeApply(_OK, {"model": {"columns": [{"name": "city", "column_id": "t::city"}]}})
-    ok, _d = f.apply_tml_verified("m1", "edited", gone_columns=["t::gender"])
+    f = _FakeApply(_OK, {"model": {"columns": [{"name": "City",
+                                                "column_id": "sales_customers::city"}]}})
+    ok, _d = f.apply_tml_verified("m1", "edited", columns=["sales_customers::gender"])
     assert ok is True
 
 
 def test_a_rejected_import_never_re_reads_and_never_claims_success():
     f = _FakeApply([{"status": "ERROR", "error": "Deleted columns have dependents."}], None)
-    ok, detail = f.apply_tml_verified("m1", "edited", gone_columns=["t::gender"])
+    ok, detail = f.apply_tml_verified("m1", "edited", columns=["sales_customers::gender"])
     assert ok is False and "dependents" in detail
 
 
 def test_an_object_that_cannot_be_re_read_is_unconfirmed_not_successful():
     f = _FakeApply(_OK, None)
-    ok, detail = f.apply_tml_verified("m1", "edited", gone_columns=["t::gender"])
+    ok, detail = f.apply_tml_verified("m1", "edited", columns=["sales_customers::gender"])
     assert ok is False and "unconfirmed" in detail

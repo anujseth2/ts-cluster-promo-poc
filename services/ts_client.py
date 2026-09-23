@@ -619,17 +619,21 @@ class TSClient:
             return False, f"the target still has {', '.join(sorted(still))} — nothing was removed"
         return True, f"removed {removed} tile(s); {remaining} left on the board"
 
-    def apply_tml_verified(self, guid: str, new_edoc: str, gone_vizzes=(), gone_columns=()):
+    def apply_tml_verified(self, guid: str, new_edoc: str, columns=(), viz_count=None):
         """Import an edited TML over an object that ALREADY exists, then re-read and confirm.
 
         A 200 from the import API is not proof the target moved: the update-in-place notice read
-        as success for weeks while nothing changed on the other cluster. So whatever the edit was
-        meant to remove is looked for again on a fresh export, and anything still present is
-        reported as a failure rather than a success.
+        as success for weeks while nothing changed on the other cluster. So the object is read
+        back and checked.
 
-        This is the write half of a planned cascade (services/target_cascade), where the edoc was
-        built and validated up front — so the exact document that passed the dry run is the one
-        sent, instead of re-deriving it here and hoping the two agree.
+        What is checked is deliberately NOT the visualisation id. ThoughtSpot RENUMBERS a
+        liveboard's tiles on import — take Viz_1 off a two-tile board and the survivor comes back
+        as Viz_1 (verified on ps-internal 2026-09-23). Checking for the removed id would report a
+        perfectly good removal as a failure. So the checks are the ones that survive renumbering:
+        how many tiles are left, and whether anything still references the dropped column.
+
+        columns:    column names/ids that must no longer appear anywhere in the object
+        viz_count:  how many visualisations the liveboard should have left
 
         Returns (ok, detail).
         """
@@ -645,28 +649,42 @@ class TSClient:
         try:
             raw = self.export_tml([guid])
             items = raw if isinstance(raw, list) else raw.get("object", [])
-            doc = json.loads(items[0]["edoc"]) if items else {}
+            edoc = items[0]["edoc"] if items else ""
+            doc  = json.loads(edoc) if edoc else {}
         except Exception:
             return False, ("the import was accepted but the object could not be re-read, so the "
                            "change is unconfirmed")
-        left = set()
-        want_v = {str(v).strip() for v in (gone_vizzes or ()) if str(v).strip()}
-        if want_v:
-            have = {str(v.get("id") or v.get("viz_id") or "")
-                    for v in ((doc.get("liveboard") or {}).get("visualizations") or [])}
-            left |= (want_v & have)
-        want_c = {str(c).strip().lower() for c in (gone_columns or ()) if str(c).strip()}
-        if want_c:
-            node = doc.get("model") or doc.get("worksheet") or doc.get("table") or {}
-            for c in node.get("columns") or []:
-                nm  = (c.get("name") or "").strip()
-                cid = (c.get("column_id") or "").strip()
-                if (nm.lower() in want_c or cid.lower() in want_c
-                        or cid.split("::")[-1].strip().lower() in want_c):
-                    left.add(cid or nm)
-        if left:
-            return False, (f"the target still has {', '.join(sorted(left))} — "
-                           "the import was accepted but nothing was removed")
+        if not doc:
+            return False, ("the import was accepted but the object came back empty, so the "
+                           "change is unconfirmed")
+
+        if viz_count is not None:
+            have = len((doc.get("liveboard") or {}).get("visualizations") or [])
+            if have != viz_count:
+                return False, (f"the board has {have} tile(s), not the {viz_count} the plan "
+                               "expected — the import was accepted but did not land as planned")
+
+        want = {str(c).strip().lower() for c in (columns or ()) if str(c).strip()}
+        if want:
+            node = doc.get("model") or doc.get("worksheet") or doc.get("table")
+            if node is not None:
+                still = sorted({(c.get("column_id") or c.get("name") or "")
+                                for c in (node.get("columns") or [])
+                                if (c.get("name") or "").strip().lower() in want
+                                or (c.get("column_id") or "").strip().lower() in want
+                                or (c.get("column_id") or "").split("::")[-1].strip().lower()
+                                in want})
+                if still:
+                    return False, (f"the target still has {', '.join(still)} — the import was "
+                                   "accepted but the column was not removed")
+            else:
+                from services.import_diagnostics import dependents_using_columns
+                hits = dependents_using_columns(
+                    [{"id": guid, "name": "", "type": "", "tml": edoc}], want)
+                refs = (hits[0].get("columns") if hits else []) or []
+                if refs:
+                    return False, (f"{', '.join(sorted(refs))} is still referenced by this "
+                                   "object — the import was accepted but did not remove it")
         return True, "applied and verified on the target"
 
     def find_objects_by_name(self, names: List[str],

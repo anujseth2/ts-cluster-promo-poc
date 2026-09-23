@@ -3519,14 +3519,10 @@ elif step == 3:
                                                         _okb, _, _det = \
                                                             _tc.delete_metadata_verified(
                                                                 _a["type"], _a["id"])
-                                                    elif _a["action"] == "remove_tiles":
-                                                        _okb, _det = _tc.apply_tml_verified(
-                                                            _a["id"], _a["new_edoc"],
-                                                            gone_vizzes=_a.get("removed") or [])
                                                     else:
                                                         _okb, _det = _tc.apply_tml_verified(
                                                             _a["id"], _a["new_edoc"],
-                                                            gone_columns=_a.get("removed") or [])
+                                                            **(_a.get("verify") or {}))
                                                 except Exception as _e:
                                                     _okb, _det = False, str(_e)
                                                 _res_b[_a["id"]] = _det or ("ok" if _okb
