@@ -294,3 +294,97 @@ def test_plan_then_snapshot_then_dry_run_then_apply_leaves_first(tmp_path):
 
     # Written children-first, so the model loses the column only once nothing below it uses it.
     assert [a["id"] for a in apply_order(actions)] == ["a1", "lb1", "m_other"]
+
+
+# ── the forest: roots are the only sensible unit of selection ────────────────────────────────
+
+from services.target_cascade import plan_tree, subtree_actions, tree_lines   # noqa: E402
+
+
+def _scenario():
+    """The shape on prod: another team's model, its board and answer, plus two independents."""
+    tml = {"m":   _model("Regional Ops Model", ["gender", "city"]),
+           "lb":  _board("Regional Ops Board", [("Viz_1", "gender"), ("Viz_2", "city")]),
+           "a1":  _answer("Regional Ops Gender Split", "gender"),
+           "a2":  _answer("Customer Gender Mix", "gender"),
+           "lb2": _board("Test dev", [("Viz_1", "gender")])}
+    deps = {"m": [{"id": "lb", "name": "Regional Ops Board", "type": "PINBOARD_ANSWER_BOOK"},
+                  {"id": "a1", "name": "Regional Ops Gender Split",
+                   "type": "QUESTION_ANSWER_BOOK"}]}
+    return tml, deps
+
+
+def test_a_child_of_another_blocker_is_not_offered_as_its_own_row():
+    # The platform lists all five flat. Only three are decisions.
+    tml, deps = _scenario()
+    cands = [{"id": i, "name": n, "type": t} for i, n, t in [
+        ("a2", "Customer Gender Mix", "ANSWER"),
+        ("m", "Regional Ops Model", "LOGICAL_TABLE"),
+        ("lb", "Regional Ops Board", "LIVEBOARD"),
+        ("a1", "Regional Ops Gender Split", "ANSWER"),
+        ("lb2", "Test dev", "LIVEBOARD")]]
+    roots, nodes, blocked = plan_tree(cands, {"gender"}, tml.get, lambda i: deps.get(i, []))
+    assert blocked == []
+    assert roots == ["a2", "m", "lb2"], "the board and answer hang off the model"
+    assert sorted(nodes["m"]["children"]) == ["a1", "lb"]
+    assert nodes["a2"]["children"] == [] and nodes["lb2"]["children"] == []
+
+
+def test_a_child_ticked_before_its_parent_is_still_a_child():
+    # Order-dependence would be a real bug: the walk records the edge even when it reaches a
+    # child it has already processed, so a child listed first does not become its own root.
+    tml, deps = _scenario()
+    cands = [{"id": i, "name": i, "type": "x"} for i in ("lb", "a1", "m")]
+    roots, nodes, _b = plan_tree(cands, {"gender"}, tml.get, lambda i: deps.get(i, []))
+    assert roots == ["m"]
+    assert sorted(nodes["m"]["children"]) == ["a1", "lb"]
+
+
+def test_selecting_a_root_takes_its_whole_subtree():
+    tml, deps = _scenario()
+    cands = [{"id": i, "name": i, "type": "x"} for i in ("m", "a2", "lb2")]
+    _r, nodes, _b = plan_tree(cands, {"gender"}, tml.get, lambda i: deps.get(i, []))
+    picked = subtree_actions(nodes, ["m"])
+    assert [a["id"] for a in picked] == ["m", "lb", "a1"], "parents before children"
+    assert all("children" not in a for a in picked), "actions stay plain action dicts"
+    assert [a["id"] for a in subtree_actions(nodes, ["a2"])] == ["a2"]
+
+
+def test_selecting_nothing_plans_nothing():
+    tml, deps = _scenario()
+    _r, nodes, _b = plan_tree([{"id": "m", "name": "m", "type": "x"}], {"gender"},
+                              tml.get, lambda i: deps.get(i, []))
+    assert subtree_actions(nodes, []) == []
+
+
+def test_the_forest_renders_children_indented_and_untickable():
+    tml, deps = _scenario()
+    cands = [{"id": "m", "name": "Regional Ops Model", "type": "LOGICAL_TABLE"},
+             {"id": "lb2", "name": "Test dev", "type": "LIVEBOARD"}]
+    roots, nodes, _b = plan_tree(cands, {"gender"}, tml.get, lambda i: deps.get(i, []))
+    lines = tree_lines(roots, nodes)
+    assert [(l["id"], l["depth"], l["tickable"]) for l in lines] == [
+        ("m", 0, True), ("lb", 1, False), ("a1", 1, False), ("lb2", 0, True)]
+    assert "Regional Ops Model" in lines[0]["text"]
+
+
+def test_a_cycle_still_offers_something_to_tick():
+    # Every node having a parent would otherwise leave the operator an empty list and no way in.
+    tml = {"m1": _model("M1", ["gender"]), "m2": _model("M2", ["gender"])}
+    deps = {"m1": [{"id": "m2", "name": "M2", "type": "LOGICAL_TABLE"}],
+            "m2": [{"id": "m1", "name": "M1", "type": "LOGICAL_TABLE"}]}
+    roots, nodes, _b = plan_tree([{"id": "m1", "name": "M1", "type": "LOGICAL_TABLE"}],
+                                 {"gender"}, tml.get, lambda i: deps.get(i, []))
+    assert roots and set(roots) <= set(nodes)
+    assert len(subtree_actions(nodes, roots)) == len(nodes)
+
+
+def test_the_order_children_are_listed_in_is_stable():
+    # A set here made the rendered plan reorder itself between runs, so the confirmation an
+    # operator reads would not match the one they read a moment before. Platform order, kept.
+    tml, deps = _scenario()
+    cands = [{"id": "m", "name": "Regional Ops Model", "type": "LOGICAL_TABLE"}]
+    runs = {tuple(a["id"] for a in subtree_actions(
+        plan_tree(cands, {"gender"}, tml.get, lambda i: deps.get(i, []))[1], ["m"]))
+        for _ in range(5)}
+    assert runs == {("m", "lb", "a1")}, f"unstable ordering: {runs}"

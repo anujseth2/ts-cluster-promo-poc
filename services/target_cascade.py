@@ -63,12 +63,28 @@ def plan_cascade(seeds, column_names, fetch_tml, fetch_deps, skip_ids=(), skip_n
              Any entry here means the cascade must not be applied.
 
     Actions come back in walk order, parents before children. Applying runs the other way —
-    see apply_order().
+    see apply_order(). Use plan_tree() when the caller needs the SHAPE of the result rather than
+    a flat list.
+    """
+    return _walk(seeds, column_names, fetch_tml, fetch_deps, skip_ids, skip_names)[:2]
+
+
+def _walk(seeds, column_names, fetch_tml, fetch_deps, skip_ids=(), skip_names=()):
+    """The single walk behind plan_cascade and plan_tree.
+
+    Returns (actions, blocked, reached) where `reached` is {parent_id: [child_id, ...]} for every
+    dependency edge the walk OBSERVED, whether or not the child was new. Recording an edge to an
+    already-seen child matters: a child that the operator happened to tick before its parent
+    would otherwise look parentless and be offered as a root of its own.
+
+    Children keep the order the platform listed them in. A set here was wrong twice over: the
+    plan rendered in a different order on every run, and the confirmation the operator reads
+    would not match the one they read a moment earlier.
     """
     want = {str(c).strip().lower() for c in (column_names or ()) if str(c).strip()}
     skip = {str(i) for i in (skip_ids or ())}
     skipn = {str(n).strip().lower() for n in (skip_names or ()) if str(n).strip()}
-    actions, blocked, seen = [], [], set()
+    actions, blocked, seen, reached = [], [], set(), {}
     queue = list(seeds or [])
 
     while queue:
@@ -152,20 +168,104 @@ def plan_cascade(seeds, column_names, fetch_tml, fetch_deps, skip_ids=(), skip_n
                                          if man.get("formulas") else "")})
             # its own dependents now have to be walked too
             for d in (fetch_deps(oid) or []):
-                if str(d.get("id")) not in seen:
+                did = str(d.get("id") or "")
+                if not did:
+                    continue
+                kids = reached.setdefault(oid, [])
+                if did not in kids:
+                    kids.append(did)
+                if did not in seen:
                     queue.append(d)
             continue
 
         blocked.append({"id": oid, "name": obj.get("name"),
-                        "reason": f"unsupported object kind '{kind}' — resolve it by hand"})
+                        "reason": f"unsupported object kind \'{kind}\' — resolve it by hand"})
 
-    return actions, blocked
+    return actions, blocked, reached
 
 
 def plan_summary(actions, blocked):
     """One line per object, for the confirmation screen."""
     lines = [f"**{a['name'] or a['id']}** ({a['type'].lower()}) — {a['detail']}" for a in actions]
     lines += [f"**{b['name'] or b['id']}** — CANNOT PROCEED: {b['reason']}" for b in blocked]
+    return lines
+
+
+def plan_tree(candidates, column_names, fetch_tml, fetch_deps, skip_ids=(), skip_names=()):
+    """The same walk, kept in its TREE shape so the operator picks roots rather than rows.
+
+    ThoughtSpot's 14544 message lists every dependent flat, at every level, which reads as a set
+    of peers and is not one. A board and an answer hanging off a model are reached BY that model:
+    they are its consequences, not separate decisions. Offering all three as independent ticks
+    invites a selection that cannot work — tick the model but not its board and stripping the
+    model is blocked by the board it left behind — so the subtree is the only granularity that
+    can actually succeed, and the list should say so.
+
+    Returns (roots, nodes, blocked):
+      nodes   {id: <action dict> + "children": [id, ...]} for everything the walk decided on
+      roots   the node ids that NOTHING else in the walk reached, in candidate order — the rows
+              worth ticking. Everything else is shown underneath the root that reaches it.
+      blocked as plan_cascade
+
+    A dependency cycle would leave every node with a parent and so produce no roots at all; the
+    seeded candidates are used as roots in that case rather than showing an empty list.
+    """
+    actions, blocked, reached = _walk(candidates, column_names, fetch_tml, fetch_deps,
+                                      skip_ids, skip_names)
+    nodes = {a["id"]: dict(a, children=[]) for a in actions}
+    for parent, kids in reached.items():
+        if parent in nodes:
+            nodes[parent]["children"] = [k for k in kids if k in nodes]
+    has_parent = {k for p, kids in reached.items() if p in nodes
+                  for k in kids if k in nodes}
+    order = [str(c.get("id")) for c in (candidates or [])]
+    rank = {oid: i for i, oid in enumerate(order)}
+    roots = sorted((i for i in nodes if i not in has_parent),
+                   key=lambda i: rank.get(i, len(rank)))
+    if not roots and nodes:
+        roots = [i for i in order if i in nodes]
+    return roots, nodes, blocked
+
+
+def subtree_actions(nodes, selected_ids):
+    """Every action under the selected roots, parents before children, deduped.
+
+    Selecting a root means taking everything it reaches, because that is the only selection the
+    platform will accept: the parent cannot lose the column while a child still references it.
+    """
+    out, seen = [], set()
+    queue = [str(i) for i in (selected_ids or [])]
+    while queue:
+        oid = queue.pop(0)
+        if oid in seen or oid not in nodes:
+            continue
+        seen.add(oid)
+        node = nodes[oid]
+        out.append({k: v for k, v in node.items() if k != "children"})
+        queue.extend(node.get("children") or [])
+    return out
+
+
+def tree_lines(roots, nodes, indent="    "):
+    """The forest as display lines, each {"id", "depth", "text", "tickable"}.
+
+    Only a root is tickable. A child is shown so the blast radius is visible BEFORE anything is
+    ticked, rather than appearing for the first time in the confirmation.
+    """
+    lines, seen = [], set()
+
+    def _walk_out(oid, depth):
+        if oid in seen or oid not in nodes:
+            return
+        seen.add(oid)
+        n = nodes[oid]
+        lines.append({"id": oid, "depth": depth, "tickable": depth == 0,
+                      "text": f"**{n.get('name') or oid}** ({n['type'].lower()}) — {n['detail']}"})
+        for kid in n.get("children") or []:
+            _walk_out(kid, depth + 1)
+
+    for r in roots:
+        _walk_out(r, 0)
     return lines
 
 

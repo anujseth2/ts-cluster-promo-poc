@@ -12,8 +12,8 @@ this lays down one of each on Anuj Git Prod, all on the shared `sales_customers`
 
 and tags the two source objects on Anuj Git Dev so the picker shows two rows instead of forty.
 
-Already on prod and deliberately left alone: `Test dev`, whose ONLY tile uses gender. It makes
-the cascade refuse rather than hollow out a board, which is worth seeing once.
+Already on prod and deliberately left alone: `Test dev`, where EVERY tile uses gender. It is the
+whole-board delete case, the most destructive thing the cascade can do, and worth seeing once.
 
     python3 scripts/cascade_scenario.py --build     put it all back (safe to re-run)
     python3 scripts/cascade_scenario.py --status    what is there now, and what would block

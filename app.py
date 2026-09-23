@@ -34,7 +34,8 @@ from services.import_diagnostics import (
     blocking, warnings_only, is_blocking_result, drop_column_properties,
 )
 from services.target_cascade import (
-    plan_cascade, plan_summary, dry_run_plan, snapshot_plan, apply_order, planned_names,
+    plan_tree, subtree_actions, tree_lines, dry_run_plan, snapshot_plan, apply_order,
+    planned_names,
 )
 from services.table_matcher import column_signature
 from services.feedback_replace import feedback_preview, replace_prep, replace_finalize
@@ -3276,311 +3277,249 @@ elif step == 3:
                     (st.session_state.get("dropped_cascade_names") or set())
                     | {c for c in _col_deps if c})
                 if _blk_names:
-                    with st.spinner("Looking up the blocking object(s) on the target…"):
-                        _tgtc = target_client()
-                        _resolved = _tgtc.find_objects_by_name(_blk_names)
-                        # Read each one's TML so a LIVEBOARD can name the tile(s) actually using
-                        # the column. "Test dev is blocked" is not actionable; "Viz_1 of 2 tiles"
-                        # tells the operator how much of the board is really at stake.
-                        _cand = []
-                        for _n in _blk_names:
-                            _h2 = _resolved.get(_n.strip().lower())
-                            if not _h2:
-                                continue
-                            try:
-                                _raw2 = _tgtc.export_tml([_h2["id"]])
-                                _its2 = _raw2 if isinstance(_raw2, list) else _raw2.get("object", [])
-                                _tml2 = _its2[0].get("edoc") if _its2 else None
-                            except Exception:
-                                _tml2 = None
-                            _cand.append({**_h2, "tml": _tml2})
-                        _scan = {c["id"]: c for c in
-                                 dependents_using_columns(_cand, _blk_scan_names)}
-                    # The model being promoted is named as a blocker by the platform, because it
-                    # depends on its own table. It IS the promotion, so the import rewrites it and
-                    # there is nothing to remove. Without this it sits in the list looking
-                    # actionable, gets ticked, and then silently produces no plan line.
+                    _tgtc = target_client()
+
+                    def _c_tml(_i):
+                        try:
+                            _r = _tgtc.export_tml([_i])
+                            _it = _r if isinstance(_r, list) else _r.get("object", [])
+                            return _it[0].get("edoc") if _it else None
+                        except Exception:
+                            return None
+
+                    def _c_deps(_i):
+                        try:
+                            _m = _tgtc.list_dependents([_i]) or {}
+                        except Exception:
+                            return []
+                        _o = []
+                        for _v in _m.values():
+                            _o.extend(_v or [])
+                        return _o
+
+                    def _c_validate(_edoc):
+                        try:
+                            _r = _tgtc.import_tml([_edoc], policy="VALIDATE_ONLY")
+                        except Exception as _e:
+                            return False, str(_e)
+                        # WARNING is not a failure. Treating it as one is how the tool used to
+                        # refuse work the platform had actually accepted.
+                        _bad = [x for x in _r if (x.get("status") or "").upper()
+                                not in ("OK", "WARNING")]
+                        if _bad:
+                            return False, (_bad[0].get("error") or "the target rejected it")
+                        return True, ""
+
+                    # The model being promoted is named among the dependents, because it depends
+                    # on its own table. It IS the promotion, so the import rewrites it with the
+                    # column already gone and there is nothing here to remove.
                     _promo_names_b = {(_i.get("info", {}).get("name") or "").strip().lower()
                                       for _i in (filtered_items or [])}
                     _promo_names_b |= {(_n2 or "").strip().lower() for _n2 in
                                        (st.session_state.get("_promo_id2name") or {}).values()}
                     _promo_names_b.discard("")
-                    _rows_b = []
-                    for _n in _blk_names:
-                        _hit = _resolved.get(_n.strip().lower())
-                        _det = _scan.get((_hit or {}).get("id"), {})
-                        _vz = _det.get("vizzes") or []
-                        _tot = _det.get("viz_total") or 0
-                        _inp = _n.strip().lower() in _promo_names_b
-                        _vlabel = ("—" if not _tot else
-                                   ", ".join(f"{v['id']}" + (f" ({v['name']})" if v.get("name") else "")
-                                             for v in _vz) + f"  · of {_tot} tile(s)"
-                                   if _vz else f"(none of {_tot} tile(s) matched)")
-                        _rows_b.append({
-                            "Object": _n,
-                            "Type": (_hit or {}).get("type", "—"),
-                            "Author": (_hit or {}).get("author", "—"),
-                            "Tile(s) using the column": _vlabel,
-                            "Can this account delete it?": (
-                                "not needed — this promotion updates it" if _inp
-                                else "yes" if _hit else "not visible"),
-                            "_scoped": (_hit or {}).get("id") or f"__unresolved__{_n}",
-                            "_inpromo": _inp,
-                            "_deletable": bool(_hit) and not _inp})
-                    _bsel = st.session_state.setdefault("blk_del_selected", set())
-                    for _r in _rows_b:
-                        _r["Delete?"] = _r["_scoped"] in _bsel
-                    import pandas as pd
-                    _bdf = pd.DataFrame(_rows_b, columns=[
-                        "Object", "Type", "Author", "Tile(s) using the column",
-                        "Can this account delete it?", "Delete?",
-                        "_scoped", "_deletable", "_inpromo"]).drop(
-                            columns=["_deletable", "_inpromo"])
-                    _select_editor(
-                        _bdf, ["Delete?"], ["blk_del_selected"], "blkdel",
-                        column_config={
-                            "Object": st.column_config.TextColumn("Object", width="large"),
-                            "Type":   st.column_config.TextColumn("Type", width="small"),
-                            "Author": st.column_config.TextColumn("Author", width="medium"),
-                            "Tile(s) using the column": st.column_config.TextColumn(
-                                "Tile(s) using the column", width="large",
-                                help="For a liveboard, which visualisation(s) reference the "
-                                     "dropped column, and how many tiles the board has in total."),
-                            "Can this account delete it?": st.column_config.TextColumn(
-                                "Can this account delete it?", width="medium",
-                                help="'not visible' means the object exists but this account "
-                                     "cannot see it — its owner or an admin has to remove it."),
-                            "Delete?": st.column_config.CheckboxColumn("Delete?", width="small"),
-                        },
-                        disabled=["Object", "Type", "Author", "Tile(s) using the column",
-                                  "Can this account delete it?"])
-                    _pick_b = [r for r in _rows_b if r["_scoped"] in _bsel and r["_deletable"]]
-                    _pick_x = [r for r in _rows_b if r["_scoped"] in _bsel and not r["_deletable"]]
-                    _pick_p = [r for r in _pick_x if r.get("_inpromo")]
-                    _pick_x = [r for r in _pick_x if not r.get("_inpromo")]
-                    if _pick_p:
+
+                    # ── read the target ONCE, not on every tick ───────────────────────────────
+                    # Streamlit re-runs the whole script for each checkbox, and this used to
+                    # re-resolve every name and re-export every TML each time: eighteen round
+                    # trips per click for data that cannot have changed in between. Keyed and
+                    # cached, the same way the warehouse type read already works. The key covers
+                    # the scan names too, because dropping another column changes what counts as
+                    # a reference even when the blocking names stay the same.
+                    _walk_key = (tuple(sorted(_blk_names)), tuple(sorted(_blk_scan_names)))
+                    if st.session_state.get("_casc_key") != _walk_key:
+                        for _k in ("_casc_nodes", "_casc_roots", "_casc_blocked",
+                                   "_casc_authors", "_casc_unres", "_casc_inpromo"):
+                            st.session_state.pop(_k, None)
+                    if "_casc_nodes" not in st.session_state:
+                        with st.spinner("Reading the target and walking its dependency tree…"):
+                            _resolved = _tgtc.find_objects_by_name(_blk_names)
+                            _cands, _inpromo, _unres = [], [], []
+                            for _n in _blk_names:
+                                _h = _resolved.get(_n.strip().lower())
+                                if not _h:
+                                    _unres.append(_n)
+                                elif _n.strip().lower() in _promo_names_b:
+                                    _inpromo.append(_n)
+                                else:
+                                    _cands.append({"id": _h["id"], "name": _h["name"],
+                                                   "type": _h["type"],
+                                                   "author": _h.get("author", "")})
+                            _roots, _nodes, _cblk = plan_tree(
+                                _cands, _blk_scan_names, _c_tml, _c_deps,
+                                skip_names=_promo_names_b)
+                        st.session_state._casc_key     = _walk_key
+                        st.session_state._casc_roots   = _roots
+                        st.session_state._casc_nodes   = _nodes
+                        st.session_state._casc_blocked = _cblk
+                        st.session_state._casc_unres   = _unres
+                        st.session_state._casc_inpromo = _inpromo
+                        st.session_state._casc_authors = {c["id"]: c.get("author", "")
+                                                          for c in _cands}
+
+                    _roots   = st.session_state.get("_casc_roots") or []
+                    _nodes   = st.session_state.get("_casc_nodes") or {}
+                    _cblk    = st.session_state.get("_casc_blocked") or []
+                    _unres   = st.session_state.get("_casc_unres") or []
+                    _inpromo = st.session_state.get("_casc_inpromo") or []
+                    _authors = st.session_state.get("_casc_authors") or {}
+
+                    if _inpromo:
                         st.info("Nothing to do for "
-                                + ", ".join(f"**{r['Object']}**" for r in _pick_p)
+                                + ", ".join(f"**{n}**" for n in _inpromo)
                                 + ": this promotion is updating it, so the import rewrites it "
                                   "with the column already gone. Changing it here would undo the "
                                   "very thing being promoted.")
-                    if _pick_x:
+                    if _unres:
                         st.warning("Not visible to this account, so it can't be changed here: "
-                                   + ", ".join(f"**{r['Object']}**" for r in _pick_x)
+                                   + ", ".join(f"**{n}**" for n in _unres)
                                    + ". Ask its owner, or run the tool as an admin.")
-                    if _pick_b:
-                        # What is ticked above is only the FIRST layer. A model dependent is not a
-                        # leaf: strip the column out of it and its OWN answers and boards are next
-                        # in line, and theirs after that. So the whole tree is walked and planned
-                        # in full before anything is shown, let alone written — a cascade applied
-                        # halfway leaves the target inconsistent AND the import still blocked.
-                        _tc = target_client()
-                        _auth_by_id = {r["_scoped"]: r["Author"] for r in _rows_b}
 
-                        def _c_tml(_i):
-                            try:
-                                _r = _tc.export_tml([_i])
-                                _it = _r if isinstance(_r, list) else _r.get("object", [])
-                                return _it[0].get("edoc") if _it else None
-                            except Exception:
-                                return None
-
-                        def _c_deps(_i):
-                            try:
-                                _m = _tc.list_dependents([_i]) or {}
-                            except Exception:
-                                return []
-                            _o = []
-                            for _v in _m.values():
-                                _o.extend(_v or [])
-                            return _o
-
-                        def _c_validate(_edoc):
-                            try:
-                                _r = _tc.import_tml([_edoc], policy="VALIDATE_ONLY")
-                            except Exception as _e:
-                                return False, str(_e)
-                            # WARNING is not a failure. Treating it as one is how the tool used to
-                            # refuse work that the platform had actually accepted.
-                            _bad = [x for x in _r if (x.get("status") or "").upper()
-                                    not in ("OK", "WARNING")]
-                            if _bad:
-                                return False, (_bad[0].get("error") or "the target rejected it")
-                            return True, ""
-
-                        _ck = tuple(sorted(r["_scoped"] for r in _pick_b))
-                        if st.session_state.get("_casc_key") != _ck:
-                            st.session_state.pop("_casc_actions", None)
-                            st.session_state.pop("_casc_blocked", None)
-
-                        if "_casc_actions" not in st.session_state:
-                            st.caption("The ticked objects are starting points, not the whole "
-                                       "list. Planning follows each one down to its own "
-                                       "dependents so nothing is left half-fixed.")
-                            if st.button(f"Plan the cascade from {len(_pick_b)} object(s)",
-                                         key="casc_plan_go"):
-                                # The model being promoted depends on its own table, so it turns
-                                # up as a dependent of its own drop. It IS the promotion, not a
-                                # casualty of it — never plan anything against it.
-                                _promo_n = {(_i.get("info", {}).get("name") or "").strip().lower()
-                                            for _i in (filtered_items or [])}
-                                _promo_n |= {(_n or "").strip().lower() for _n in
-                                             (st.session_state.get("_promo_id2name") or {}).values()}
-                                _promo_n.discard("")
-                                with st.spinner("Walking the target's dependency tree…"):
-                                    try:
-                                        _acts, _blkc = plan_cascade(
-                                            [{"id": r["_scoped"], "name": r["Object"],
-                                              "type": r["Type"]} for r in _pick_b],
-                                            _blk_scan_names, _c_tml, _c_deps,
-                                            skip_names=_promo_n)
-                                    except Exception as _e:
-                                        _acts, _blkc = None, None
-                                        st.error(f"Couldn't plan the cascade: {_e}")
-                                if _acts is not None:
-                                    st.session_state._casc_key     = _ck
-                                    st.session_state._casc_actions = _acts
-                                    st.session_state._casc_blocked = _blkc
-                                    st.rerun()
-                        else:
-                            _acts = st.session_state.get("_casc_actions") or []
-                            _blkc = st.session_state.get("_casc_blocked") or []
-                            st.markdown("##### The full cascade")
-                            st.caption(f"{len(_pick_b)} object(s) ticked; {len(_acts)} object(s) "
-                                       f"in the plan once their own dependents are followed"
-                                       + (f", {len(_blkc)} that cannot be planned" if _blkc else "")
-                                       + ".")
-                            for _ln in plan_summary(_acts, []):
-                                st.markdown("- " + _ln)
-                            if st.button("Re-plan", key="casc_replan",
-                                         help="Walk the target again — use this if anything on "
-                                              "the target changed since the plan was built."):
-                                st.session_state.pop("_casc_actions", None)
-                                st.session_state.pop("_casc_blocked", None)
-                                st.rerun()
-                            if _blkc:
-                                # All-or-nothing, by design. Applying the reachable part would
-                                # destroy content on the target AND leave the import blocked by
-                                # whatever could not be reached — strictly worse than not starting.
-                                st.error(
-                                    f"**The cascade will not run.** {len(_blkc)} object(s) in the "
-                                    "tree cannot be planned, so applying the rest would change the "
-                                    "target and still leave the import blocked:\n\n"
-                                    + "\n".join(f"- **{b['name'] or b['id']}** — {b['reason']}"
-                                                for b in _blkc)
-                                    + "\n\nResolve these first, or have someone who can see them "
-                                      "do it, then re-plan.")
-                            elif not _acts:
-                                st.info("Nothing to change — none of the ticked objects actually "
-                                        "surfaces the dropped column on the target.")
+                    if _roots:
+                        st.markdown("##### What the target holds")
+                        st.caption("Tick what to clear. A model's own answers and boards are "
+                                   "listed underneath it and go with it — they are its "
+                                   "consequences, not separate decisions, and the platform will "
+                                   "not let a model drop the column while one of them still "
+                                   "uses it.")
+                        _picked_roots = []
+                        for _ln in tree_lines(_roots, _nodes):
+                            if _ln["tickable"]:
+                                if st.checkbox(_ln["text"], key=f"casc_pick_{_ln['id']}"):
+                                    _picked_roots.append(_ln["id"])
                             else:
-                                _ns = sum(1 for a in _acts if a["action"] == "strip_columns")
-                                _nt = sum(1 for a in _acts if a["action"] == "remove_tiles")
-                                _nd = sum(1 for a in _acts if a["action"] == "delete")
-                                st.error(
-                                    "**This will change `" + opt_env("TS_TARGET_HOST")
-                                    + "`.** Every object's current TML is saved first, and the "
-                                      "whole plan is validated against the target before a single "
-                                      "write. There is no undo: the saved TML is the way back. "
-                                      "Type **DELETE** to confirm.")
-                                _tb = st.text_input("Confirm", key="blk_del_confirm",
-                                                    label_visibility="collapsed",
-                                                    placeholder="type DELETE")
-                                if st.button(f"Apply the cascade — {_ns} model(s) stripped, "
-                                             f"{_nt} board(s) trimmed, {_nd} answer(s) deleted",
-                                             key="blk_del_go",
-                                             disabled=_tb.strip().upper() != "DELETE"):
-                                    import datetime as _dt
-                                    _snapdir = (Path(__file__).parent / "logs" / "snapshots"
-                                                / _dt.datetime.now().strftime("%Y%m%d-%H%M%S"))
+                                st.markdown(
+                                    f"<div style='margin-left:2.2rem;opacity:.75;"
+                                    f"font-size:.9em'>↳ {_ln['text']}</div>",
+                                    unsafe_allow_html=True)
+                        if st.button("Re-read the target", key="casc_reread",
+                                     help="Walk the target again. The list above is a snapshot "
+                                          "taken when this panel loaded, so use this if anything "
+                                          "on the target has changed since."):
+                            for _k in ("_casc_nodes", "_casc_roots", "_casc_blocked",
+                                       "_casc_authors", "_casc_unres", "_casc_inpromo"):
+                                st.session_state.pop(_k, None)
+                            st.rerun()
 
-                                    def _write_snap(_n, _t):
-                                        _snapdir.mkdir(parents=True, exist_ok=True)
-                                        _p = _snapdir / _n
-                                        _p.write_text(_t)
-                                        return str(_p)
+                        # Selecting a root takes its whole subtree. No cluster calls here: the
+                        # walk above already decided what happens to every object.
+                        _acts = subtree_actions(_nodes, _picked_roots)
 
-                                    _res_b, _okn, _go = {}, 0, True
-                                    with st.status("Changing the target…", expanded=True) as _bs:
-                                        # 1. Save what is there now. A snapshot that cannot be
-                                        #    taken is itself a reason to stop — without it there
-                                        #    is no way back from any of what follows.
-                                        try:
-                                            _bs.write("Saving each object's current TML…")
-                                            _paths = snapshot_plan(_acts, _c_tml, _write_snap)
-                                            _bs.write(f"✓ saved {len(_paths)} file(s) to "
-                                                      f"`{_snapdir}`")
-                                        except Exception as _e:
-                                            _bs.update(label=f"Stopped before changing anything: "
-                                                             f"{_e}", state="error")
+                        if _cblk:
+                            # All-or-nothing by design. Applying the reachable part would destroy
+                            # content on the target AND leave the import blocked by whatever could
+                            # not be reached, which is strictly worse than not starting.
+                            st.error(
+                                f"**The cascade will not run.** {len(_cblk)} object(s) in the "
+                                "tree cannot be planned, so applying the rest would change the "
+                                "target and still leave the import blocked:\n\n"
+                                + "\n".join(f"- **{b['name'] or b['id']}** — {b['reason']}"
+                                            for b in _cblk)
+                                + "\n\nResolve these first, or have someone who can see them do "
+                                  "it, then re-read the target.")
+                        elif _acts:
+                            _ns = sum(1 for a in _acts if a["action"] == "strip_columns")
+                            _nt = sum(1 for a in _acts if a["action"] == "remove_tiles")
+                            _nd = sum(1 for a in _acts if a["action"] == "delete")
+                            st.error(
+                                "**This will change `" + opt_env("TS_TARGET_HOST")
+                                + f"`: {len(_acts)} object(s).** Every one's current TML is saved "
+                                  "first, and the whole plan is validated against the target "
+                                  "before a single write. There is no undo: the saved TML is the "
+                                  "way back. Type **DELETE** to confirm.")
+                            _tb = st.text_input("Confirm", key="blk_del_confirm",
+                                                label_visibility="collapsed",
+                                                placeholder="type DELETE")
+                            if st.button(f"Apply — {_ns} model(s) stripped, {_nt} board(s) "
+                                         f"trimmed, {_nd} deleted", key="blk_del_go",
+                                         disabled=_tb.strip().upper() != "DELETE"):
+                                import datetime as _dt
+                                _snapdir = (Path(__file__).parent / "logs" / "snapshots"
+                                            / _dt.datetime.now().strftime("%Y%m%d-%H%M%S"))
+
+                                def _write_snap(_n, _t):
+                                    _snapdir.mkdir(parents=True, exist_ok=True)
+                                    (_snapdir / _n).write_text(_t)
+                                    return str(_snapdir / _n)
+
+                                _res_b, _okn, _go = {}, 0, True
+                                with st.status("Changing the target…", expanded=True) as _bs:
+                                    # 1. Save what is there now. A snapshot that cannot be taken
+                                    #    is itself a reason to stop: without it there is no way
+                                    #    back from any of what follows.
+                                    try:
+                                        _bs.write("Saving each object's current TML…")
+                                        _paths = snapshot_plan(_acts, _c_tml, _write_snap)
+                                        _bs.write(f"✓ saved {len(_paths)} file(s) to `{_snapdir}`")
+                                    except Exception as _e:
+                                        _bs.update(label=f"Stopped before changing anything: {_e}",
+                                                   state="error")
+                                        _go = False
+                                    # 2. Validate the WHOLE plan before writing any of it.
+                                    if _go:
+                                        _bs.write("Validating the whole plan against the target…")
+                                        _probs = dry_run_plan(_acts, _c_validate,
+                                                              planned_names(_acts))
+                                        for _p in _probs:
+                                            _bs.write(f"✗ {_p.get('name') or _p['id']}: "
+                                                      f"{_p['error']}")
+                                        if _probs:
+                                            _bs.update(label="The plan does not validate, so "
+                                                             "nothing was changed on the target.",
+                                                       state="error")
                                             _go = False
-                                        # 2. Validate the WHOLE plan before writing any of it.
-                                        if _go:
-                                            _bs.write("Validating the whole plan against the "
-                                                      "target…")
-                                            _probs = dry_run_plan(_acts, _c_validate,
-                                                                  planned_names(_acts))
-                                            for _p in _probs:
-                                                _bs.write(f"✗ {_p.get('name') or _p['id']}: "
-                                                          f"{_p['error']}")
-                                            if _probs:
-                                                _bs.update(
-                                                    label="The plan does not validate, so nothing "
-                                                          "was changed on the target.",
-                                                    state="error")
-                                                _go = False
-                                            else:
-                                                _bs.write("✓ the whole plan validates")
-                                        # 3. Write it, leaves first: a model can only lose the
-                                        #    column once nothing below it still references it.
-                                        if _go:
-                                            for _a in apply_order(_acts):
-                                                _nm = _a.get("name") or _a["id"]
-                                                try:
-                                                    if _a["action"] == "delete":
-                                                        _okb, _, _det = \
-                                                            _tc.delete_metadata_verified(
-                                                                _a["type"], _a["id"])
-                                                    else:
-                                                        _okb, _det = _tc.apply_tml_verified(
-                                                            _a["id"], _a["new_edoc"],
-                                                            **(_a.get("verify") or {}))
-                                                except Exception as _e:
-                                                    _okb, _det = False, str(_e)
-                                                _res_b[_a["id"]] = _det or ("ok" if _okb
-                                                                            else "failed")
-                                                _bs.write(("✓ " if _okb else "✗ ")
-                                                          + f"{_nm}: {_res_b[_a['id']]}")
-                                                if _okb:
-                                                    _okn += 1
+                                        else:
+                                            _bs.write("✓ the whole plan validates")
+                                    # 3. Write it, leaves first: a model can only lose the column
+                                    #    once nothing below it still references it.
+                                    if _go:
+                                        for _a in apply_order(_acts):
+                                            _nm = _a.get("name") or _a["id"]
+                                            try:
+                                                if _a["action"] == "delete":
+                                                    _okb, _, _det = \
+                                                        _tgtc.delete_metadata_verified(
+                                                            _a["type"], _a["id"])
                                                 else:
-                                                    # Stop rather than carry on: the rest of the
-                                                    # plan assumes this one succeeded.
-                                                    _bs.write(
-                                                        "Stopping here. What was already applied "
-                                                        "stays applied — re-import the TML in "
-                                                        f"`{_snapdir}` to put it back.")
-                                                    break
-                                        _log_target_delete(
-                                            opt_env("TS_TARGET_HOST"), team_name,
-                                            [{"id": a["id"], "name": a.get("name"),
-                                              "type": a["type"], "action": a["action"],
-                                              "author": _auth_by_id.get(a["id"], ""),
-                                              "columns": a.get("removed") or []}
-                                             for a in _acts], _res_b)
-                                        if _go:
-                                            _bs.update(
-                                                label=(f"Applied {_okn} of {len(_acts)} "
-                                                       "(logged to logs/target_deletes.jsonl)"),
-                                                state="complete" if _okn == len(_acts) else "error")
-                                    if _go and _okn == len(_acts):
-                                        _bsel.clear()
-                                        for _k in ("blk_del_confirm", "_casc_key", "_casc_actions",
-                                                   "_casc_blocked", "validation_errors",
-                                                   "validation_ok", "discovered_findings",
-                                                   "discovered_meta"):
-                                            st.session_state.pop(_k, None)
-                                        st.rerun()
+                                                    _okb, _det = _tgtc.apply_tml_verified(
+                                                        _a["id"], _a["new_edoc"],
+                                                        **(_a.get("verify") or {}))
+                                            except Exception as _e:
+                                                _okb, _det = False, str(_e)
+                                            _res_b[_a["id"]] = _det or ("ok" if _okb else "failed")
+                                            _bs.write(("✓ " if _okb else "✗ ")
+                                                      + f"{_nm}: {_res_b[_a['id']]}")
+                                            if _okb:
+                                                _okn += 1
+                                            else:
+                                                # Stop rather than carry on: the rest of the plan
+                                                # assumes this one succeeded.
+                                                _bs.write("Stopping here. What was already "
+                                                          "applied stays applied — re-import the "
+                                                          f"TML in `{_snapdir}` to put it back.")
+                                                break
+                                    _log_target_delete(
+                                        opt_env("TS_TARGET_HOST"), team_name,
+                                        [{"id": a["id"], "name": a.get("name"), "type": a["type"],
+                                          "action": a["action"],
+                                          "author": _authors.get(a["id"], ""),
+                                          "columns": a.get("removed") or []}
+                                         for a in _acts], _res_b)
+                                    if _go:
+                                        _bs.update(
+                                            label=(f"Applied {_okn} of {len(_acts)} "
+                                                   "(logged to logs/target_deletes.jsonl)"),
+                                            state="complete" if _okn == len(_acts) else "error")
+                                if _go and _okn == len(_acts):
+                                    for _k in ("blk_del_confirm", "_casc_key", "_casc_nodes",
+                                               "_casc_roots", "_casc_blocked", "_casc_authors",
+                                               "_casc_unres", "_casc_inpromo",
+                                               "validation_errors", "validation_ok",
+                                               "discovered_findings", "discovered_meta"):
+                                        st.session_state.pop(_k, None)
+                                    for _r in _roots:
+                                        st.session_state.pop(f"casc_pick_{_r}", None)
+                                    st.rerun()
 
             # ── type drift: column exists on both sides, types differ ──
             if type_mismatch:
