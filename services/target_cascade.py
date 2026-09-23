@@ -324,6 +324,33 @@ def _only_blocked_by(msg, planned):
     return bool(named) and named <= planned
 
 
+# Which client method each action needs to reach the target.
+CAPABILITY_FOR = {"delete":        "delete_metadata_verified",
+                  "remove_tiles":  "apply_tml_verified",
+                  "strip_columns": "apply_tml_verified"}
+
+
+def missing_capabilities(actions, client):
+    """Methods this plan needs that the client does not have. Checked BEFORE the first write.
+
+    The dry run proves the TARGET will accept the TML. It says nothing about the machinery that
+    sends it, and that gap is not theoretical: Streamlit caches the client with
+    @st.cache_resource, so a long-running session holds an instance built from whatever the
+    module looked like when it started. Deploy a new method, and the cached client still does not
+    have it however many times the script re-runs.
+
+    Found live 2026-09-24. Snapshots taken, whole plan validated clean, first delete succeeded,
+    and the second action died on "'TSClient' object has no attribute 'apply_tml_verified'" —
+    leaving exactly the half-applied target the all-or-nothing gates exist to prevent. Every gate
+    had passed, because every gate was pointed at the data rather than at the code.
+
+    Returns the sorted method names that are missing; empty means the plan can be carried out.
+    """
+    need = {CAPABILITY_FOR[a["action"]] for a in (actions or [])
+            if a.get("action") in CAPABILITY_FOR}
+    return sorted(n for n in need if not callable(getattr(client, n, None)))
+
+
 def dry_run_plan(actions, validate, planned=None):
     """VALIDATE_ONLY every edited object BEFORE anything is written.
 

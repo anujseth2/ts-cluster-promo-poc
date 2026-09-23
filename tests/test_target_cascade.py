@@ -444,3 +444,44 @@ def test_a_named_board_with_no_matching_tile_is_disputed_too():
     _r, _n, _b, disputed = plan_tree([{"id": "lb", "name": "Untouched Board", "type": "LIVEBOARD"}],
                                      {"gender"}, tml.get, lambda i: [])
     assert [(d["id"], d["kind"]) for d in disputed] == [("lb", "liveboard")]
+
+
+# ── the gate that was missing: check the machinery, not just the data ────────────────────────
+
+from services.target_cascade import missing_capabilities        # noqa: E402
+
+
+class _OldClient:
+    """A client from before apply_tml_verified existed — what @st.cache_resource kept holding."""
+    def delete_metadata_verified(self, *_a, **_k):
+        return True, 204, "deleted"
+
+
+class _CurrentClient(_OldClient):
+    def apply_tml_verified(self, *_a, **_k):
+        return True, "applied and verified on the target"
+
+
+def test_a_stale_client_is_caught_before_the_first_write():
+    # Live 2026-09-24: snapshots taken, plan validated clean, first delete done, then the second
+    # action died on a missing method and left the target half applied. Every gate had passed,
+    # because every gate was pointed at the data rather than at the code.
+    actions = [{"action": "delete"}, {"action": "remove_tiles"}, {"action": "strip_columns"}]
+    assert missing_capabilities(actions, _OldClient()) == ["apply_tml_verified"]
+    assert missing_capabilities(actions, _CurrentClient()) == []
+
+
+def test_only_the_capabilities_this_plan_actually_needs_are_required():
+    # A plan of pure deletes must not be refused by a client that cannot edit TML.
+    assert missing_capabilities([{"action": "delete"}], _OldClient()) == []
+
+
+def test_an_empty_plan_needs_nothing():
+    assert missing_capabilities([], object()) == []
+    assert missing_capabilities(None, object()) == []
+
+
+def test_an_attribute_that_is_not_callable_does_not_count_as_the_method():
+    class _Decoy:
+        delete_metadata_verified = "not a method"
+    assert missing_capabilities([{"action": "delete"}], _Decoy()) == ["delete_metadata_verified"]

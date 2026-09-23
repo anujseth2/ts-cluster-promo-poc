@@ -35,7 +35,7 @@ from services.import_diagnostics import (
 )
 from services.target_cascade import (
     plan_tree, subtree_actions, tree_lines, dry_run_plan, snapshot_plan, apply_order,
-    planned_names,
+    planned_names, missing_capabilities,
 )
 from services.table_matcher import column_signature
 from services.feedback_replace import feedback_preview, replace_prep, replace_finalize
@@ -3487,13 +3487,32 @@ elif step == 3:
 
                                 _res_b, _okn, _go = {}, 0, True
                                 with st.status("Changing the target…", expanded=True) as _bs:
+                                    # 0. Check the MACHINERY, not just the data. Everything below
+                                    #    proves the target will accept the TML; none of it proves
+                                    #    this process can send it. Streamlit caches the client
+                                    #    with @st.cache_resource, so a long-running session holds
+                                    #    one built when it started and a newly deployed method is
+                                    #    simply absent from it. That failed mid-cascade on
+                                    #    2026-09-24 with one object already deleted.
+                                    _miss = missing_capabilities(_acts, _tgtc)
+                                    if _miss:
+                                        _bs.update(
+                                            label="Stopped before changing anything: this session "
+                                                  "is running an out-of-date client, missing "
+                                                  + ", ".join(f"`{m}`" for m in _miss)
+                                                  + ". Restart the app (the client is cached for "
+                                                    "the life of the process) and try again.",
+                                            state="error")
+                                        _go = False
                                     # 1. Save what is there now. A snapshot that cannot be taken
                                     #    is itself a reason to stop: without it there is no way
                                     #    back from any of what follows.
                                     try:
-                                        _bs.write("Saving each object's current TML…")
-                                        _paths = snapshot_plan(_acts, _c_tml, _write_snap)
-                                        _bs.write(f"✓ saved {len(_paths)} file(s) to `{_snapdir}`")
+                                        if _go:
+                                            _bs.write("Saving each object's current TML…")
+                                            _paths = snapshot_plan(_acts, _c_tml, _write_snap)
+                                            _bs.write(f"✓ saved {len(_paths)} file(s) to "
+                                                      f"`{_snapdir}`")
                                     except Exception as _e:
                                         _bs.update(label=f"Stopped before changing anything: {_e}",
                                                    state="error")
