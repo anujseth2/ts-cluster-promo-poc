@@ -198,6 +198,8 @@ def _report_gaps():
                                           "status": rec.get("status") or "ERROR",
                                           "error": rec["error"]}]):
             k = f["kind"]
+            # A hint only counts when it is proven; an unverified rule is suppressed for the
+            # operator, so for this report it does not exist either.
             has = friendly_error(rec["error"])[0] is not None
             e = by_kind.setdefault(k, {"n": 0, "friendly": False, "sample": rec["error"]})
             e["n"] += 1
@@ -281,7 +283,7 @@ def main():
         if args.all:
             head = friendly_error(rec["error"])[0]
             print(f"[handled: {found[0]['kind']}] {rec['error'][:70]!r}")
-            print(f"          says: {head[:100] if head else '(no plain-language rule yet)'}")
+            print(f"          says: {head[:100] if head else '(raw text shown — no PROVEN hint)'}")
 
     print(f"\n{len(recs)} message(s) in, {already} already handled, "
           f"{len(unhandled)} unhandled.\n")

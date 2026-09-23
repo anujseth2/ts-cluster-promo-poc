@@ -29,6 +29,7 @@ from services.import_diagnostics import (
     column_drop_cascade, finding_key, dangling_reference_findings, table_cleanup_findings,
     realign_column_types, warehouse_type_to_ts, warehouse_type_findings, type_family, type_class,
     recase_columns, model_tables_without_columns, prune_tables_whole, prune_stale_realignments,
+    friendly_error_with_evidence,
     restore_unneeded_type_changes, promotion_plan, scan_names_for_drops,
     dependents_using_columns,
     blocking, warnings_only, is_blocking_result, drop_column_properties,
@@ -190,7 +191,7 @@ def _safe_validate(items, step=None):
         st.session_state._last_validate = {
             "ts": "(request failed)", "files": [],
             "results": [{"name": "(validation request)", "status": "ERROR",
-                         "error": _msg[:1500]}]}
+                         "error": _msg}]}
         if _is_github_error(_e):
             st.error("**The GitHub step failed** (commit / pull request), not the target cluster. "
                      + _git_error_hint(_e))
@@ -272,6 +273,28 @@ def _gap_label(promoted_n, modeled_n):
     return "match"
 
 
+def _show_errors_verbatim(rows, key, title="Full error text (verbatim, copyable)"):
+    """Render each row's error IN FULL, wrapped and copyable, under whatever table showed it.
+
+    st.dataframe clips a long cell and does not wrap, so a platform message shown only in a table
+    is a message the operator cannot read or paste. Since we cannot reliably interpret every error
+    ThoughtSpot emits, the least we owe is its exact words — losing the tail of the one string
+    that explains a failure is the worst possible place to save space.
+
+    rows: iterable of dicts with at least an "error"; "name"/"object" and "status" are used as the
+    heading when present."""
+    items = [r for r in (rows or []) if str(r.get("error") or "").strip()]
+    if not items:
+        return
+    with st.expander(f"{title} — {len(items)} message(s)", expanded=False):
+        for i, r in enumerate(items, 1):
+            who = r.get("name") or r.get("object") or r.get("Object") or "(object not named)"
+            st_ = r.get("status") or r.get("Status") or ""
+            st.markdown(f"**{i}. {who}**" + (f" · `{st_}`" if st_ else ""))
+            # st.code wraps, keeps every character, and gives a copy button.
+            st.code(str(r.get("error")), language=None)
+
+
 def _select_editor(view, checkbox_cols, sel_keys, editor_base, column_config, disabled,
                    exclusive=False):
     """Render a data_editor whose checkbox column(s) persist in session sets, with SINGLE-CLICK
@@ -346,7 +369,7 @@ def _log_validate(files, results):
         "ts": datetime.datetime.now().isoformat(timespec="seconds"),
         "files": sorted(files.keys()),
         "results": [{"name": r.get("name"), "type": r.get("type", ""),
-                     "status": r.get("status"), "error": (r.get("error") or "")[:1500]}
+                     "status": r.get("status"), "error": (r.get("error") or "")}
                     for r in results],
     }
     try:
@@ -2520,9 +2543,9 @@ elif step == 3:
                     if bad:
                         failures.append({"name": nm, "type": "table",
                                          "status": bad[0].get("status") or "ERROR",
-                                         "error": (bad[0].get("error") or "")[:800]})
+                                         "error": (bad[0].get("error") or "")})
                 except Exception as e:
-                    failures.append({"name": nm, "type": "table", "error": f"request failed: {str(e)[:200]}"})
+                    failures.append({"name": nm, "type": "table", "error": f"request failed: {e}"})
             # Only isolate models once tables are clean, so a table fault isn't misattributed.
             if not failures:
                 for it in models:
@@ -2536,9 +2559,9 @@ elif step == 3:
                         if bad:
                             failures.append({"name": nm, "type": "model",
                                              "status": bad[0].get("status") or "ERROR",
-                                             "error": (bad[0].get("error") or "")[:800]})
+                                             "error": (bad[0].get("error") or "")})
                     except Exception as e:
-                        failures.append({"name": nm, "type": "model", "error": f"request failed: {str(e)[:200]}"})
+                        failures.append({"name": nm, "type": "model", "error": f"request failed: {e}"})
             return failures
 
         def _run_discover(items, status_ctx):
@@ -2593,7 +2616,7 @@ elif step == 3:
                 st.session_state._last_validate = {
                     "ts": "(request failed)", "files": [],
                     "results": [{"name": "(validation request)", "status": "ERROR",
-                                 "error": _msg[:1500]}]}
+                                 "error": _msg}]}
                 _h, _a, _ = friendly_error(_msg)
                 st.error("Validation couldn't reach the target — " + (_h or "the connection failed."))
                 st.caption("→ " + (_a or "Try again; the client auto-retries transient resets."))
@@ -2849,6 +2872,7 @@ elif step == 3:
                 import pandas as pd
                 st.dataframe(_sno(pd.DataFrame(_lv["results"])[["name", "status", "error"]]),
                              use_container_width=True, hide_index=True)
+                _show_errors_verbatim(_lv["results"], "runlog")
 
         # ── Stage 2: Column drop (if validation failed) ────────────────────
         val_errors = st.session_state.get("validation_errors", [])
@@ -3739,18 +3763,17 @@ elif step == 3:
                 st.markdown("#### Other validation errors")
                 for f in other:
                     st.markdown(f"**{f['object']}**")
-                    headline, action, raw = friendly_error(f["error"])
+                    headline, action, raw, evidence = friendly_error_with_evidence(f["error"])
+                    # The platform's own words are ALWAYS shown, in full and copyable. A hint is
+                    # additional and only appears when its remedy was actually confirmed on a
+                    # cluster — an unproven guess is worse than the raw text, because people act
+                    # on it.
                     if headline:
                         st.markdown(f"- {headline}")
                         if action:
-                            st.caption(f"→ {action}")
-                        with st.expander("Raw error"):
-                            st.code(raw)
-                    else:
-                        for line in raw.split("\n"):
-                            line = line.strip()
-                            if line:
-                                st.markdown(f"- {line}")
+                            st.caption(action)
+                        st.caption(f"_{evidence}_")
+                    st.code(raw, language=None)
 
                 # These errors are often unattributed (name "unknown"). Validate each file on its
                 # own to name the culprit AND itemize its real error — a missing column becomes a
@@ -4897,5 +4920,6 @@ elif step == 5:
                 "name": "Object", "type": "Type", "detail": "Shape",
                 "status": "Status", "error": "Error"})
             st.dataframe(_sno(_fail), use_container_width=True, hide_index=True)
+            _show_errors_verbatim(failed.to_dict("records"), "importfail")
 
     _nav(5)

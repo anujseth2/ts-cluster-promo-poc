@@ -175,6 +175,15 @@ def _dep_block_detail(text):
     return col, deps
 
 
+# Each rule is (pattern, fn, EVIDENCE). EVIDENCE is where the remedy was actually confirmed —
+# a cluster and a date. A rule with an empty EVIDENCE is a GUESS, and friendly_error will not
+# show it: the operator sees the platform's own words instead.
+#
+# This is deliberate and was learned the hard way. Hints written from a single observed string
+# were wrong twice in one week (a `calendar` property is not a schema-version gap; a 204 from
+# metadata/delete is not a successful delete), and a confident wrong action line is worse than
+# raw platform text because people act on it. If you cannot point at a run that proves the
+# remedy, leave EVIDENCE empty and let the raw message speak.
 _ERROR_RULES = [
     # VERIFIED on ps-internal 2026-09-22: removing a column an answer uses fails the import, at
     # VALIDATE_ONLY as well as on the real one, and deleting the dependent then lets it through.
@@ -247,16 +256,55 @@ _ERROR_RULES = [
 ]
 
 
-def friendly_error(msg: str):
-    """Translate a raw TS error into (headline, action, raw_clean). headline/action are None when
-    no rule matches — the caller then just shows the cleaned raw text."""
+# Where each rule's remedy was actually confirmed. A pattern absent from this map is UNVERIFIED
+# and its hint is suppressed — see the note above _ERROR_RULES.
+_RULE_EVIDENCE = {
+    "Deleted columns have dependents":
+        "verified on ps-internal, 2026-09-23 — the drop was blocked at VALIDATE_ONLY and on "
+        "import, and deleting the dependent let it straight through",
+    "Existing guid.*will be used":
+        "verified on ps-internal, 2026-09-23 — this notice is appended to real errors too, so on "
+        "its own it only means the object was matched for update",
+}
+
+
+def rule_evidence(pattern) -> str:
+    """The provenance string for a rule, or "" when nobody has proven its remedy."""
+    return _RULE_EVIDENCE.get(getattr(pattern, "pattern", str(pattern)), "")
+
+
+def friendly_error(msg: str, include_unverified: bool = False):
+    """Translate a raw TS error into (headline, action, raw_clean).
+
+    headline/action are None when no rule matches OR when the matching rule has no EVIDENCE —
+    an unproven hint is not shown, because the operator acts on it. The cleaned raw text is
+    always returned, so the caller can always show the platform's own words.
+
+    `include_unverified=True` is for tooling that wants to see what a rule WOULD say (the gaps
+    report), never for the operator-facing path."""
     raw = _clean(msg)
     for pat, fn in _ERROR_RULES:
         m = pat.search(raw)
         if m:
+            if not rule_evidence(pat) and not include_unverified:
+                return None, None, raw
             headline, action = fn(m)
             return headline, action, raw
     return None, None, raw
+
+
+def friendly_error_with_evidence(msg: str):
+    """(headline, action, raw, evidence). evidence is "" for an unmatched or unproven message."""
+    raw = _clean(msg)
+    for pat, fn in _ERROR_RULES:
+        m = pat.search(raw)
+        if m:
+            ev = rule_evidence(pat)
+            if not ev:
+                return None, None, raw, ""
+            headline, action = fn(m)
+            return headline, action, raw, ev
+    return None, None, raw, ""
 
 
 def classify_import_errors(results):

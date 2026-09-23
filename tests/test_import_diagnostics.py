@@ -459,7 +459,19 @@ def test_warning_status_is_not_an_issue_to_resolve():
     assert all(f["object"] and f["object"] != "unknown" for f in warns)
 
 
-def test_authorization_failure_names_the_object_not_the_connection():
+def test_authorization_failure_hint_is_suppressed_until_its_remedy_is_proven():
+    # We can PARSE this payload reliably (it names the objects), but nobody has confirmed that
+    # sharing the named object actually clears it. Until someone does, show the raw message.
+    from services.import_diagnostics import friendly_error_with_evidence
+    msg = ('Unable to save worksheet. Error Code: AUTHORIZATION_FAILURE Incident Id: 8f74b135 '
+           'Error Message: No permission to update objects: {   "LOGICAL_TABLE": [     '
+           '"7c4f181a-1b69-4de2-a73b-766aa0ff9a11"   ] } or to read child securable objects')
+    h, a, raw, ev = friendly_error_with_evidence(msg)
+    assert h is None and ev == ""
+    assert "7c4f181a-1b69-4de2-a73b-766aa0ff9a11" in raw, "the guid must survive into the raw text"
+
+
+def _unused_authorization_failure_names_the_object_not_the_connection():
     # The hint used to send the operator to check the CONNECTION, which is not what the payload
     # says. It names a pre-existing target LOGICAL_TABLE, and checking connection sharing finds
     # nothing wrong — which is how this error survived two GSK sessions.
@@ -791,15 +803,30 @@ def test_source_absent_flags_only_out_of_sync_column_case_insensitively():
 
 # ── friendly_error (humanised messages) ─────────────────────────────────────────
 
-def test_friendly_error_suspended_warehouse():
-    h, a, _ = friendly_error("Failed to initialize pool: Your free trial has ended and all of "
-                             "your virtual warehouses have been suspended.")
-    assert h and "warehouse" in h.lower() and a
-
-
-def test_friendly_error_permission():
-    h, _, _ = friendly_error("Error code 10086: not authorized")
+def test_an_unverified_hint_is_not_shown_to_the_operator():
+    # A hint whose remedy nobody has confirmed on a cluster is a guess, and a confident wrong
+    # action line is worse than the platform's own words because people act on it. These two
+    # rules have no evidence entry, so the operator sees the raw message instead.
+    from services.import_diagnostics import friendly_error_with_evidence
+    for msg in ("Failed to initialize pool: Your free trial has ended and all of your virtual "
+                "warehouses have been suspended.",
+                "Error code 10086: not authorized"):
+        h, a, raw, ev = friendly_error_with_evidence(msg)
+        assert h is None and a is None and ev == "", f"unproven hint leaked for: {msg[:40]}"
+        assert raw, "the raw text is always returned"
+    # the rule text still EXISTS, so it can be proven later without rewriting it
+    h, a, _raw = friendly_error("Error code 10086: not authorized", include_unverified=True)
     assert h and "permission" in h.lower()
+
+
+def test_a_verified_hint_is_shown_with_its_provenance():
+    from services.import_diagnostics import friendly_error_with_evidence
+    h, a, raw, ev = friendly_error_with_evidence(
+        "Deleted columns have dependents.<br/>- <b>customerID</b></br><ul><li>Test dev</li></ul>")
+    assert h and a, "this one was confirmed live, so it may speak"
+    assert "ps-internal" in ev and "2026-09-23" in ev
+    assert "customerID" in h and "Test dev" in h
+    assert raw, "and the raw text is still available alongside it"
 
 
 def test_friendly_error_unknown_returns_none_headline():

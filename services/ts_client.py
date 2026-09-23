@@ -671,7 +671,7 @@ class TSClient:
             elif status == 403:
                 detail = "the account lacks rights to delete it; its owner or an admin must."
             else:
-                detail = f"HTTP {status}: {body[:200]}"
+                detail = f"HTTP {status}: {body}"
             return False, status, detail
         if self.object_exists(mtype, identifier):
             return False, status, ("the server accepted the request but the object is still "
@@ -852,7 +852,7 @@ class TSClient:
                     "you are pointed at.")
         if resp.status_code == 403:
             return "the account lacks DATAMANAGEMENT or ADMINISTRATION."
-        return f"HTTP {resp.status_code}: {body[:300]}"
+        return f"HTTP {resp.status_code}: {body}"
 
     def _explain_obj_id_failure(self, resp, wanted_obj_id: str) -> str:
         """The reason, plus WHO is holding the obj_id when that is the reason.
