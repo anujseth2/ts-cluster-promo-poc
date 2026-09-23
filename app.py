@@ -3345,7 +3345,9 @@ elif step == 3:
                             _ids = [x["id"] for x in _v.get("vizzes") or []]
                             _rem = (_v.get("viz_total") or 0) - len(_ids)
                             _plan.append(f"**{r['Object']}** — remove {len(_ids)} tile(s) "
-                                         f"({', '.join(_ids)}); {_rem} left on the board")
+                                         f"({', '.join(_ids)}); {_rem} left on the board. The "
+                                         "empty slot is LEFT IN PLACE so the board's owner can "
+                                         "see something was removed.")
                         for r in _del_rows:
                             _plan.append(f"**{r['Object']}** — DELETE the whole "
                                          f"{str(r.get('Type','object')).lower()}")

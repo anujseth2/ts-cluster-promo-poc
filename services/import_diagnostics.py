@@ -1316,8 +1316,17 @@ def scan_names_for_drops(drop_set, cascade_names=None):
     return {s for s in out if s}
 
 
-def strip_vizzes_from_tml(edoc, viz_ids):
+def strip_vizzes_from_tml(edoc, viz_ids, keep_layout_hole=True):
     """Remove named visualisations from ONE exported liveboard TML.
+
+    `keep_layout_hole=True` (the default) leaves the layout tile behind, pointing at a
+    visualisation that is gone. That is DELIBERATE: the board's owner did not ask for this change
+    and is not in the room when it happens, so the board should carry a visible sign that
+    something was taken out rather than quietly reflowing as if it had always been that shape.
+    ThoughtSpot accepts the orphaned tile — verified against a real board on ps-internal
+    2026-09-23, VALIDATE_ONLY returns OK with the tile kept and with it pruned.
+
+    Pass False to prune the tile as well, which leaves a tidy board and no trace.
 
     Returns (new_edoc, removed, remaining). `remaining` is how many tiles the board still has, so
     the caller can refuse to leave an empty liveboard behind rather than discovering it after the
@@ -1326,16 +1335,28 @@ def strip_vizzes_from_tml(edoc, viz_ids):
     An ANSWER has no tiles to strip — it IS a single visualisation — so removing its column means
     deleting the answer. Only a liveboard gets this surgical treatment.
     """
-    item = {"edoc": edoc}
-    doc = _parse_edoc(item)
+    doc = _parse_edoc({"edoc": edoc})
     lb = doc.get("liveboard") if isinstance(doc, dict) else None
     if not lb or lb.get("visualizations") is None:
         return edoc, 0, 0
+    targets = {str(v).strip() for v in (viz_ids or []) if str(v).strip()}
     before = len(lb["visualizations"])
-    out_items, removed = drop_vizzes([item], viz_ids)
-    new_doc = _parse_edoc(out_items[0])
-    remaining = len((new_doc.get("liveboard") or {}).get("visualizations") or [])
-    return out_items[0]["edoc"], before - remaining, remaining
+    lb["visualizations"] = [v for v in lb["visualizations"]
+                            if str(v.get("id") or v.get("viz_id") or "") not in targets]
+    remaining = len(lb["visualizations"])
+    if not keep_layout_hole:
+        layout = lb.get("layout") or {}
+
+        def _prune(tiles):
+            return [t for t in tiles
+                    if str(t.get("visualization_id", "")) not in targets]
+
+        if isinstance(layout.get("tiles"), list):
+            layout["tiles"] = _prune(layout["tiles"])
+        for tab in (layout.get("tabs") or []):
+            if isinstance(tab.get("tiles"), list):
+                tab["tiles"] = _prune(tab["tiles"])
+    return json.dumps(doc), before - remaining, remaining
 
 
 def dependents_using_columns(dependents, dropped_names):

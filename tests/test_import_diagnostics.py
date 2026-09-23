@@ -980,8 +980,15 @@ def test_stripping_tiles_keeps_the_rest_of_the_board():
     doc = json.loads(new)["liveboard"]
     assert (removed, remaining) == (1, 1)
     assert [v["id"] for v in doc["visualizations"]] == ["Viz_2"]
-    assert [t["visualization_id"] for t in doc["layout"]["tiles"]] == ["Viz_2"], \
-        "the orphaned layout tile must go too, or the board imports with a hole"
+    # The layout tile is KEPT on purpose. The board's owner did not ask for this change and is not
+    # in the room when it happens, so the board should show that something was taken out rather
+    # than silently reflowing. ThoughtSpot accepts the orphan (ps-internal 2026-09-23).
+    assert [t["visualization_id"] for t in doc["layout"]["tiles"]] == ["Viz_1", "Viz_2"], \
+        "the hole is the signal to the owner"
+    # and it can still be pruned when a tidy board is wanted
+    tidy, _r, _l = strip_vizzes_from_tml(lb, ["Viz_1"], keep_layout_hole=False)
+    assert [t["visualization_id"] for t in json.loads(tidy)["liveboard"]["layout"]["tiles"]] \
+        == ["Viz_2"]
 
 
 def test_an_answer_tml_is_left_alone_by_tile_stripping():
