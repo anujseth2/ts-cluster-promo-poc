@@ -72,7 +72,7 @@ def plan_cascade(seeds, column_names, fetch_tml, fetch_deps, skip_ids=(), skip_n
 def _walk(seeds, column_names, fetch_tml, fetch_deps, skip_ids=(), skip_names=()):
     """The single walk behind plan_cascade and plan_tree.
 
-    Returns (actions, blocked, reached) where `reached` is {parent_id: [child_id, ...]} for every
+    Returns (actions, blocked, reached, no_ref). `reached` is {parent_id: [child_id, ...]} for every
     dependency edge the walk OBSERVED, whether or not the child was new. Recording an edge to an
     already-seen child matters: a child that the operator happened to tick before its parent
     would otherwise look parentless and be offered as a root of its own.
@@ -80,11 +80,16 @@ def _walk(seeds, column_names, fetch_tml, fetch_deps, skip_ids=(), skip_names=()
     Children keep the order the platform listed them in. A set here was wrong twice over: the
     plan rendered in a different order on every run, and the confirmation the operator reads
     would not match the one they read a moment earlier.
+
+    `no_ref` holds everything read cleanly whose TML shows NO reference to the column. For an
+    object found by recursion that is ordinary and means leave it alone. For one ThoughtSpot
+    NAMED as blocking it is a disagreement with the platform, and the caller should say so
+    rather than let it vanish from the plan.
     """
     want = {str(c).strip().lower() for c in (column_names or ()) if str(c).strip()}
     skip = {str(i) for i in (skip_ids or ())}
     skipn = {str(n).strip().lower() for n in (skip_names or ()) if str(n).strip()}
-    actions, blocked, seen, reached = [], [], set(), {}
+    actions, blocked, seen, reached, no_ref = [], [], set(), {}, []
     queue = list(seeds or [])
 
     while queue:
@@ -112,6 +117,15 @@ def _walk(seeds, column_names, fetch_tml, fetch_deps, skip_ids=(), skip_names=()
         kind = _kind_of(doc)
 
         if kind == "answer":
+            # Check FIRST, like the other two branches do. This used to delete any answer the
+            # walk reached, so stripping a model took out every answer hanging off it including
+            # ones built on completely different columns. "An answer is a single visualisation"
+            # justifies deleting it WHOLE once it is implicated; it never justified implicating
+            # it in the first place.
+            if not dependents_using_columns(
+                    [{"id": oid, "name": obj.get("name"), "type": "ANSWER", "tml": edoc}], want):
+                no_ref.append({"id": oid, "name": obj.get("name"), "kind": "answer"})
+                continue
             actions.append({"id": oid, "name": obj.get("name"), "type": "ANSWER",
                             "action": "delete", "new_edoc": None, "removed": [], "verify": {},
                             "detail": "deleted — an answer is a single visualisation, so every "
@@ -124,6 +138,7 @@ def _walk(seeds, column_names, fetch_tml, fetch_deps, skip_ids=(), skip_names=()
             vz = (hits[0].get("vizzes") if hits else []) or []
             total = (hits[0].get("viz_total") if hits else 0) or 0
             if not vz:
+                no_ref.append({"id": oid, "name": obj.get("name"), "kind": "liveboard"})
                 continue                      # nothing on this board uses the column after all
             if len(vz) >= total:
                 # One rule, not two: delete the object when EVERY visualisation in it is
@@ -158,6 +173,7 @@ def _walk(seeds, column_names, fetch_tml, fetch_deps, skip_ids=(), skip_names=()
                 if cid.split("::")[-1].strip().lower() in want or nm.lower() in want:
                     scoped.add(cid or nm)
             if not scoped:
+                no_ref.append({"id": oid, "name": obj.get("name"), "kind": "model"})
                 continue                      # this model does not surface the column
             new_items, man = drop_columns([{"edoc": edoc}], scoped)
             actions.append({"id": oid, "name": obj.get("name"), "type": "LOGICAL_TABLE",
@@ -181,7 +197,7 @@ def _walk(seeds, column_names, fetch_tml, fetch_deps, skip_ids=(), skip_names=()
         blocked.append({"id": oid, "name": obj.get("name"),
                         "reason": f"unsupported object kind \'{kind}\' — resolve it by hand"})
 
-    return actions, blocked, reached
+    return actions, blocked, reached, no_ref
 
 
 def plan_summary(actions, blocked):
@@ -201,17 +217,24 @@ def plan_tree(candidates, column_names, fetch_tml, fetch_deps, skip_ids=(), skip
     model is blocked by the board it left behind — so the subtree is the only granularity that
     can actually succeed, and the list should say so.
 
-    Returns (roots, nodes, blocked):
-      nodes   {id: <action dict> + "children": [id, ...]} for everything the walk decided on
-      roots   the node ids that NOTHING else in the walk reached, in candidate order — the rows
-              worth ticking. Everything else is shown underneath the root that reaches it.
-      blocked as plan_cascade
+    Returns (roots, nodes, blocked, disputed):
+      nodes    {id: <action dict> + "children": [id, ...]} for everything the walk decided on
+      roots    the node ids that NOTHING else in the walk reached, in candidate order — the rows
+               worth ticking. Everything else is shown underneath the root that reaches it.
+      blocked  as plan_cascade
+      disputed candidates ThoughtSpot NAMED as blocking whose TML shows no reference to the
+               column. One side is wrong and it is likelier to be our scan than the platform,
+               so these are reported rather than quietly dropped from the plan. An object found
+               by RECURSION with no reference is not disputed, just untouched — nobody claimed
+               it was blocking.
 
     A dependency cycle would leave every node with a parent and so produce no roots at all; the
     seeded candidates are used as roots in that case rather than showing an empty list.
     """
-    actions, blocked, reached = _walk(candidates, column_names, fetch_tml, fetch_deps,
-                                      skip_ids, skip_names)
+    actions, blocked, reached, no_ref = _walk(candidates, column_names, fetch_tml, fetch_deps,
+                                              skip_ids, skip_names)
+    named = {str(c.get("id")) for c in (candidates or [])}
+    disputed = [n for n in no_ref if n["id"] in named]
     nodes = {a["id"]: dict(a, children=[]) for a in actions}
     for parent, kids in reached.items():
         if parent in nodes:
@@ -224,7 +247,7 @@ def plan_tree(candidates, column_names, fetch_tml, fetch_deps, skip_ids=(), skip
                    key=lambda i: rank.get(i, len(rank)))
     if not roots and nodes:
         roots = [i for i in order if i in nodes]
-    return roots, nodes, blocked
+    return roots, nodes, blocked, disputed
 
 
 def subtree_actions(nodes, selected_ids):

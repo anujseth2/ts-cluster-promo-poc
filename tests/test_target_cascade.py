@@ -323,7 +323,8 @@ def test_a_child_of_another_blocker_is_not_offered_as_its_own_row():
         ("lb", "Regional Ops Board", "LIVEBOARD"),
         ("a1", "Regional Ops Gender Split", "ANSWER"),
         ("lb2", "Test dev", "LIVEBOARD")]]
-    roots, nodes, blocked = plan_tree(cands, {"gender"}, tml.get, lambda i: deps.get(i, []))
+    roots, nodes, blocked, disputed = plan_tree(cands, {"gender"}, tml.get,
+                                               lambda i: deps.get(i, []))
     assert blocked == []
     assert roots == ["a2", "m", "lb2"], "the board and answer hang off the model"
     assert sorted(nodes["m"]["children"]) == ["a1", "lb"]
@@ -335,7 +336,7 @@ def test_a_child_ticked_before_its_parent_is_still_a_child():
     # child it has already processed, so a child listed first does not become its own root.
     tml, deps = _scenario()
     cands = [{"id": i, "name": i, "type": "x"} for i in ("lb", "a1", "m")]
-    roots, nodes, _b = plan_tree(cands, {"gender"}, tml.get, lambda i: deps.get(i, []))
+    roots, nodes, _b, _d = plan_tree(cands, {"gender"}, tml.get, lambda i: deps.get(i, []))
     assert roots == ["m"]
     assert sorted(nodes["m"]["children"]) == ["a1", "lb"]
 
@@ -343,7 +344,7 @@ def test_a_child_ticked_before_its_parent_is_still_a_child():
 def test_selecting_a_root_takes_its_whole_subtree():
     tml, deps = _scenario()
     cands = [{"id": i, "name": i, "type": "x"} for i in ("m", "a2", "lb2")]
-    _r, nodes, _b = plan_tree(cands, {"gender"}, tml.get, lambda i: deps.get(i, []))
+    _r, nodes, _b, _d = plan_tree(cands, {"gender"}, tml.get, lambda i: deps.get(i, []))
     picked = subtree_actions(nodes, ["m"])
     assert [a["id"] for a in picked] == ["m", "lb", "a1"], "parents before children"
     assert all("children" not in a for a in picked), "actions stay plain action dicts"
@@ -352,8 +353,8 @@ def test_selecting_a_root_takes_its_whole_subtree():
 
 def test_selecting_nothing_plans_nothing():
     tml, deps = _scenario()
-    _r, nodes, _b = plan_tree([{"id": "m", "name": "m", "type": "x"}], {"gender"},
-                              tml.get, lambda i: deps.get(i, []))
+    _r, nodes, _b, _d = plan_tree([{"id": "m", "name": "m", "type": "x"}], {"gender"},
+                                  tml.get, lambda i: deps.get(i, []))
     assert subtree_actions(nodes, []) == []
 
 
@@ -361,7 +362,7 @@ def test_the_forest_renders_children_indented_and_untickable():
     tml, deps = _scenario()
     cands = [{"id": "m", "name": "Regional Ops Model", "type": "LOGICAL_TABLE"},
              {"id": "lb2", "name": "Test dev", "type": "LIVEBOARD"}]
-    roots, nodes, _b = plan_tree(cands, {"gender"}, tml.get, lambda i: deps.get(i, []))
+    roots, nodes, _b, _d = plan_tree(cands, {"gender"}, tml.get, lambda i: deps.get(i, []))
     lines = tree_lines(roots, nodes)
     assert [(l["id"], l["depth"], l["tickable"]) for l in lines] == [
         ("m", 0, True), ("lb", 1, False), ("a1", 1, False), ("lb2", 0, True)]
@@ -373,8 +374,8 @@ def test_a_cycle_still_offers_something_to_tick():
     tml = {"m1": _model("M1", ["gender"]), "m2": _model("M2", ["gender"])}
     deps = {"m1": [{"id": "m2", "name": "M2", "type": "LOGICAL_TABLE"}],
             "m2": [{"id": "m1", "name": "M1", "type": "LOGICAL_TABLE"}]}
-    roots, nodes, _b = plan_tree([{"id": "m1", "name": "M1", "type": "LOGICAL_TABLE"}],
-                                 {"gender"}, tml.get, lambda i: deps.get(i, []))
+    roots, nodes, _b, _d = plan_tree([{"id": "m1", "name": "M1", "type": "LOGICAL_TABLE"}],
+                                     {"gender"}, tml.get, lambda i: deps.get(i, []))
     assert roots and set(roots) <= set(nodes)
     assert len(subtree_actions(nodes, roots)) == len(nodes)
 
@@ -388,3 +389,58 @@ def test_the_order_children_are_listed_in_is_stable():
         plan_tree(cands, {"gender"}, tml.get, lambda i: deps.get(i, []))[1], ["m"]))
         for _ in range(5)}
     assert runs == {("m", "lb", "a1")}, f"unstable ordering: {runs}"
+
+
+# ── an answer has to EARN its deletion, and a disagreement has to be said out loud ───────────
+
+def test_an_answer_reached_by_the_walk_is_not_deleted_unless_it_uses_the_column():
+    # The bug this pins: the answer branch deleted anything the walk reached, so stripping a
+    # model took out every answer hanging off it, including ones built on other columns
+    # entirely. The other two branches always checked; this one did not.
+    tml = {"m":  _model("Regional Ops Model", ["gender", "city"]),
+           "a1": _answer("Gender Split", "gender"),
+           "a2": _answer("City Report", "city")}
+    deps = {"m": [{"id": "a1", "name": "Gender Split", "type": "QUESTION_ANSWER_BOOK"},
+                  {"id": "a2", "name": "City Report", "type": "QUESTION_ANSWER_BOOK"}]}
+    actions, blocked = plan_cascade(
+        [{"id": "m", "name": "Regional Ops Model", "type": "LOGICAL_TABLE"}],
+        {"gender"}, tml.get, lambda i: deps.get(i, []))
+    assert blocked == []
+    assert [a["id"] for a in actions] == ["m", "a1"], "City Report never mentions gender"
+
+
+def test_an_answer_the_platform_named_is_still_deleted():
+    # The check must not swing the other way: a named answer that does use the column goes.
+    tml = {"a1": _answer("Gender Split", "gender")}
+    actions, _b = plan_cascade([{"id": "a1", "name": "Gender Split", "type": "ANSWER"}],
+                               {"gender"}, tml.get, lambda i: [])
+    assert [(a["id"], a["action"]) for a in actions] == [("a1", "delete")]
+
+
+def test_a_named_blocker_we_find_no_reference_in_is_reported_not_dropped():
+    # ThoughtSpot says it blocks; our scan of its TML disagrees. One of us is wrong and it is
+    # likelier to be us, so it must not silently vanish from the plan.
+    tml = {"a2": _answer("City Report", "city")}
+    roots, nodes, blocked, disputed = plan_tree(
+        [{"id": "a2", "name": "City Report", "type": "ANSWER"}],
+        {"gender"}, tml.get, lambda i: [])
+    assert roots == [] and nodes == {} and blocked == []
+    assert [(d["id"], d["kind"]) for d in disputed] == [("a2", "answer")]
+
+
+def test_an_object_found_by_recursion_with_no_reference_is_not_a_disagreement():
+    # Nobody claimed it was blocking, so leaving it alone is the correct, silent outcome.
+    tml = {"m":  _model("Regional Ops Model", ["gender"]),
+           "a2": _answer("City Report", "city")}
+    deps = {"m": [{"id": "a2", "name": "City Report", "type": "QUESTION_ANSWER_BOOK"}]}
+    _r, _n, _b, disputed = plan_tree(
+        [{"id": "m", "name": "Regional Ops Model", "type": "LOGICAL_TABLE"}],
+        {"gender"}, tml.get, lambda i: deps.get(i, []))
+    assert disputed == []
+
+
+def test_a_named_board_with_no_matching_tile_is_disputed_too():
+    tml = {"lb": _board("Untouched Board", [("Viz_1", "city"), ("Viz_2", "state")])}
+    _r, _n, _b, disputed = plan_tree([{"id": "lb", "name": "Untouched Board", "type": "LIVEBOARD"}],
+                                     {"gender"}, tml.get, lambda i: [])
+    assert [(d["id"], d["kind"]) for d in disputed] == [("lb", "liveboard")]

@@ -3328,7 +3328,7 @@ elif step == 3:
                     # a reference even when the blocking names stay the same.
                     _walk_key = (tuple(sorted(_blk_names)), tuple(sorted(_blk_scan_names)))
                     if st.session_state.get("_casc_key") != _walk_key:
-                        for _k in ("_casc_nodes", "_casc_roots", "_casc_blocked",
+                        for _k in ("_casc_nodes", "_casc_roots", "_casc_blocked", "_casc_disp",
                                    "_casc_authors", "_casc_unres", "_casc_inpromo"):
                             st.session_state.pop(_k, None)
                     if "_casc_nodes" not in st.session_state:
@@ -3345,13 +3345,14 @@ elif step == 3:
                                     _cands.append({"id": _h["id"], "name": _h["name"],
                                                    "type": _h["type"],
                                                    "author": _h.get("author", "")})
-                            _roots, _nodes, _cblk = plan_tree(
+                            _roots, _nodes, _cblk, _disp = plan_tree(
                                 _cands, _blk_scan_names, _c_tml, _c_deps,
                                 skip_names=_promo_names_b)
                         st.session_state._casc_key     = _walk_key
                         st.session_state._casc_roots   = _roots
                         st.session_state._casc_nodes   = _nodes
                         st.session_state._casc_blocked = _cblk
+                        st.session_state._casc_disp    = _disp
                         st.session_state._casc_unres   = _unres
                         st.session_state._casc_inpromo = _inpromo
                         st.session_state._casc_authors = {c["id"]: c.get("author", "")
@@ -3360,6 +3361,7 @@ elif step == 3:
                     _roots   = st.session_state.get("_casc_roots") or []
                     _nodes   = st.session_state.get("_casc_nodes") or {}
                     _cblk    = st.session_state.get("_casc_blocked") or []
+                    _disp    = st.session_state.get("_casc_disp") or []
                     _unres   = st.session_state.get("_casc_unres") or []
                     _inpromo = st.session_state.get("_casc_inpromo") or []
                     _authors = st.session_state.get("_casc_authors") or {}
@@ -3374,6 +3376,20 @@ elif step == 3:
                         st.warning("Not visible to this account, so it can't be changed here: "
                                    + ", ".join(f"**{n}**" for n in _unres)
                                    + ". Ask its owner, or run the tool as an admin.")
+                    if _disp:
+                        # ThoughtSpot says these block; reading their TML we find no reference to
+                        # the column. One side is wrong and it is likelier to be our scan than the
+                        # platform, so this is said out loud rather than letting them disappear
+                        # from the plan with no explanation.
+                        st.warning(
+                            "**ThoughtSpot and this tool disagree about "
+                            + ", ".join(f"**{d['name'] or d['id']}**" for d in _disp)
+                            + ".** The platform names it as blocking the drop, but reading its "
+                              "TML finds no reference to the column, so there is nothing here to "
+                              "plan against it. It is more likely that this tool's scan is "
+                              "missing a reference than that the platform is wrong, so expect "
+                              "the import to still be blocked by it and open it on the target to "
+                              "see what it really uses.")
 
                     if _roots:
                         st.markdown("##### What the target holds")
@@ -3397,7 +3413,8 @@ elif step == 3:
                                           "taken when this panel loaded, so use this if anything "
                                           "on the target has changed since."):
                             for _k in ("_casc_nodes", "_casc_roots", "_casc_blocked",
-                                       "_casc_authors", "_casc_unres", "_casc_inpromo"):
+                                       "_casc_disp", "_casc_authors", "_casc_unres",
+                                       "_casc_inpromo"):
                                 st.session_state.pop(_k, None)
                             st.rerun()
 
@@ -3513,7 +3530,7 @@ elif step == 3:
                                 if _go and _okn == len(_acts):
                                     for _k in ("blk_del_confirm", "_casc_key", "_casc_nodes",
                                                "_casc_roots", "_casc_blocked", "_casc_authors",
-                                               "_casc_unres", "_casc_inpromo",
+                                               "_casc_unres", "_casc_inpromo", "_casc_disp",
                                                "validation_errors", "validation_ok",
                                                "discovered_findings", "discovered_meta"):
                                         st.session_state.pop(_k, None)
