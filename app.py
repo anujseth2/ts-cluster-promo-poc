@@ -182,6 +182,32 @@ def _git_error_hint(exc) -> str:
     return str(exc)[:200]
 
 
+def _revalidate_target_only(items):
+    """Ask the TARGET whether the import is clear now, without touching git.
+
+    Used after a cascade has changed the target. The bundle itself has not changed, only what is
+    standing in its way, so committing the same files again and re-opening the pull request would
+    add nothing and produce the "nothing new to commit" that makes the git page confusing to read.
+
+    This matters because "Applied 5 of 5" and "the import will now go through" are different
+    claims, and only the platform can make the second one. A cascade can succeed completely and
+    leave the promotion blocked by something nobody ticked, or by something this account cannot
+    see. Rather than predicting that, ask.
+
+    Returns (errors, ok) in the same shape as _run_validation, so the page renders the answer the
+    way it renders any other validation result.
+    """
+    files = items_to_files(items)
+    val_strings = ([c for p, c in files.items() if p.startswith("tables/")]
+                   + [c for p, c in files.items() if p.startswith("models/")])
+    if not val_strings:
+        return [], []
+    results = target_client().import_tml(val_strings, policy="VALIDATE_ONLY")
+    st.session_state._last_validate = _log_validate(files, results)
+    return ([r for r in results if is_blocking_result(r)],
+            [r for r in results if r["status"] == "OK"])
+
+
 def _safe_validate(items, step=None):
     """_run_validation, but a hard failure becomes a friendly message + a logged run, not a raw
     traceback. Distinguishes a GITHUB failure (commit / PR, usually a bad GITHUB_TOKEN) from a
@@ -3528,14 +3554,56 @@ elif step == 3:
                                                    "(logged to logs/target_deletes.jsonl)"),
                                             state="complete" if _okn == len(_acts) else "error")
                                 if _go and _okn == len(_acts):
+                                    # "Applied 5 of 5" says the cascade worked. It says nothing
+                                    # about whether the import is clear now, and those are
+                                    # different claims — a cascade can succeed completely and
+                                    # leave the promotion blocked by a root nobody ticked, or by
+                                    # something this account cannot see. Only the platform can
+                                    # answer the second one, so ask it rather than predict it.
+                                    _ff2 = [i for i in
+                                            (st.session_state.get("transformed_items") or [])
+                                            if i.get("info", {}).get("name") not in skip_objects]
+                                    _perr = _pok = None
+                                    with st.status("Asking the target whether the import is "
+                                                   "clear now…", expanded=True) as _vs:
+                                        try:
+                                            _perr, _pok = _revalidate_target_only(_ff2)
+                                        except Exception as _e:
+                                            _vs.update(
+                                                label="The cascade applied, but re-checking the "
+                                                      f"target failed: {_e}. Re-run validation "
+                                                      "to see where the import stands.",
+                                                state="error")
+                                        else:
+                                            if _perr:
+                                                _vs.write(f"The target still objects to "
+                                                          f"{len(_perr)} file(s).")
+                                                _vs.update(
+                                                    label=f"Cascade applied, but the import is "
+                                                          f"STILL BLOCKED — {len(_perr)} "
+                                                          "file(s) rejected. The blockers are "
+                                                          "listed again below.",
+                                                    state="error")
+                                            else:
+                                                _vs.update(
+                                                    label="Cascade applied, and the target now "
+                                                          "accepts the import.",
+                                                    state="complete")
                                     for _k in ("blk_del_confirm", "_casc_key", "_casc_nodes",
                                                "_casc_roots", "_casc_blocked", "_casc_authors",
                                                "_casc_unres", "_casc_inpromo", "_casc_disp",
-                                               "validation_errors", "validation_ok",
                                                "discovered_findings", "discovered_meta"):
                                         st.session_state.pop(_k, None)
                                     for _r in _roots:
                                         st.session_state.pop(f"casc_pick_{_r}", None)
+                                    if _perr is None:
+                                        # the re-check itself failed; do not leave a stale
+                                        # "passed" or a stale blocker list standing
+                                        st.session_state.pop("validation_errors", None)
+                                        st.session_state.pop("validation_ok", None)
+                                    else:
+                                        st.session_state.validation_errors = _perr
+                                        st.session_state.validation_ok     = _pok
                                     st.rerun()
 
             # ── type drift: column exists on both sides, types differ ──
