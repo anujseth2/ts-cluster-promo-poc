@@ -3296,12 +3296,22 @@ elif step == 3:
                             _cand.append({**_h2, "tml": _tml2})
                         _scan = {c["id"]: c for c in
                                  dependents_using_columns(_cand, _blk_scan_names)}
+                    # The model being promoted is named as a blocker by the platform, because it
+                    # depends on its own table. It IS the promotion, so the import rewrites it and
+                    # there is nothing to remove. Without this it sits in the list looking
+                    # actionable, gets ticked, and then silently produces no plan line.
+                    _promo_names_b = {(_i.get("info", {}).get("name") or "").strip().lower()
+                                      for _i in (filtered_items or [])}
+                    _promo_names_b |= {(_n2 or "").strip().lower() for _n2 in
+                                       (st.session_state.get("_promo_id2name") or {}).values()}
+                    _promo_names_b.discard("")
                     _rows_b = []
                     for _n in _blk_names:
                         _hit = _resolved.get(_n.strip().lower())
                         _det = _scan.get((_hit or {}).get("id"), {})
                         _vz = _det.get("vizzes") or []
                         _tot = _det.get("viz_total") or 0
+                        _inp = _n.strip().lower() in _promo_names_b
                         _vlabel = ("—" if not _tot else
                                    ", ".join(f"{v['id']}" + (f" ({v['name']})" if v.get("name") else "")
                                              for v in _vz) + f"  · of {_tot} tile(s)"
@@ -3311,9 +3321,12 @@ elif step == 3:
                             "Type": (_hit or {}).get("type", "—"),
                             "Author": (_hit or {}).get("author", "—"),
                             "Tile(s) using the column": _vlabel,
-                            "Can this account delete it?": "yes" if _hit else "not visible",
+                            "Can this account delete it?": (
+                                "not needed — this promotion updates it" if _inp
+                                else "yes" if _hit else "not visible"),
                             "_scoped": (_hit or {}).get("id") or f"__unresolved__{_n}",
-                            "_deletable": bool(_hit)})
+                            "_inpromo": _inp,
+                            "_deletable": bool(_hit) and not _inp})
                     _bsel = st.session_state.setdefault("blk_del_selected", set())
                     for _r in _rows_b:
                         _r["Delete?"] = _r["_scoped"] in _bsel
@@ -3321,7 +3334,8 @@ elif step == 3:
                     _bdf = pd.DataFrame(_rows_b, columns=[
                         "Object", "Type", "Author", "Tile(s) using the column",
                         "Can this account delete it?", "Delete?",
-                        "_scoped", "_deletable"]).drop(columns=["_deletable"])
+                        "_scoped", "_deletable", "_inpromo"]).drop(
+                            columns=["_deletable", "_inpromo"])
                     _select_editor(
                         _bdf, ["Delete?"], ["blk_del_selected"], "blkdel",
                         column_config={
@@ -3342,6 +3356,14 @@ elif step == 3:
                                   "Can this account delete it?"])
                     _pick_b = [r for r in _rows_b if r["_scoped"] in _bsel and r["_deletable"]]
                     _pick_x = [r for r in _rows_b if r["_scoped"] in _bsel and not r["_deletable"]]
+                    _pick_p = [r for r in _pick_x if r.get("_inpromo")]
+                    _pick_x = [r for r in _pick_x if not r.get("_inpromo")]
+                    if _pick_p:
+                        st.info("Nothing to do for "
+                                + ", ".join(f"**{r['Object']}**" for r in _pick_p)
+                                + ": this promotion is updating it, so the import rewrites it "
+                                  "with the column already gone. Changing it here would undo the "
+                                  "very thing being promoted.")
                     if _pick_x:
                         st.warning("Not visible to this account, so it can't be changed here: "
                                    + ", ".join(f"**{r['Object']}**" for r in _pick_x)

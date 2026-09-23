@@ -21,5 +21,14 @@
     "target_connection": "DB Prod",
     "db_map": {},
     "schema_map": {}
+  },
+  "CascadeTest": {
+    "tags": [
+      "cascade-test"
+    ],
+    "source_connection": "DB Dev",
+    "target_connection": "DB Prod",
+    "db_map": {},
+    "schema_map": {}
   }
 }
