@@ -3261,6 +3261,14 @@ elif step == 3:
                 # Operations, so the operator read "blocked by X" on this page and had to go
                 # looking for the way to act on it.
                 _blk_names = sorted({d for ds in _col_deps.values() for d in ds if d})
+                # Names to look for inside each dependent. On THIS page the authority is the
+                # platform's own message — it already told us which columns are blocked — plus
+                # whatever has been dropped so far this run. (_scan_names lives in the Git
+                # Operations block and is not in scope here; using it was a NameError.)
+                _blk_scan_names = scan_names_for_drops(
+                    st.session_state.get("dropped_col_names") or set(),
+                    (st.session_state.get("dropped_cascade_names") or set())
+                    | {c for c in _col_deps if c})
                 if _blk_names:
                     with st.spinner("Looking up the blocking object(s) on the target…"):
                         _tgtc = target_client()
@@ -3281,7 +3289,7 @@ elif step == 3:
                                 _tml2 = None
                             _cand.append({**_h2, "tml": _tml2})
                         _scan = {c["id"]: c for c in
-                                 dependents_using_columns(_cand, _scan_names)}
+                                 dependents_using_columns(_cand, _blk_scan_names)}
                     _rows_b = []
                     for _n in _blk_names:
                         _hit = _resolved.get(_n.strip().lower())
