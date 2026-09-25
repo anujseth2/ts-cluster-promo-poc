@@ -717,8 +717,17 @@ class TSClient:
         The API answers 204 whether or not it removed anything, so a caller that trusts the status
         reports a deletion that did not happen — and in this tool that would tell the operator a
         blocking dependent was cleared when it is still there, sending them into an import that
-        fails for the reason they thought they had fixed."""
+        fails for the reason they thought they had fixed.
+
+        The check LOOKS FIRST, because object_exists cannot tell "gone" from "never visible to
+        me" — its own docstring says so. Without the pre-check, an account with no rights on an
+        object deletes nothing, cannot see it afterwards either, and is told it succeeded. That is
+        the original bug moved one step along, and it lands on exactly the accounts most likely to
+        lack rights. VERIFIED on ps-internal 2026-09-25: a non-admin "deleted" an answer that was
+        never shared with it, got 204, and this returned "deleted" while the answer was untouched.
+        """
         mtype = self.metadata_type_for(obj_type)
+        seen_before = self.object_exists(mtype, identifier)
         resp = self._delete_once(mtype, identifier)
         status = resp.status_code
         if status not in (200, 204):
@@ -744,6 +753,11 @@ class TSClient:
         if self.object_exists(mtype, identifier):
             return False, status, ("the server accepted the request but the object is still "
                                    "there — the account most likely lacks rights on it.")
+        if not seen_before:
+            return False, status, ("this account could not see the object before the request "
+                                   "either, so its absence now proves nothing and the deletion is "
+                                   "UNCONFIRMED. Have someone who can see it check, or run as an "
+                                   "account the object is shared with.")
         return True, status, "deleted"
 
     def export_feedback_entries(self, model_guid: str) -> List[Dict]:

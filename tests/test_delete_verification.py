@@ -9,8 +9,13 @@ class _R:
 
 
 class _Fake(TSClient):
-    def __init__(self, status, survives):
-        self._status, self._survives = status, survives
+    """`survives` is what the object does; `visible` is whether this account can see it at all.
+
+    Both are needed. A real deletion is visible-then-gone, and gone-all-along is an account that
+    could never see it — those look identical if you only check afterwards, which was the bug.
+    """
+    def __init__(self, status, survives, visible=True):
+        self._status, self._survives, self._visible = status, survives, visible
         self.calls = []
 
     def _delete_once(self, metadata_type, identifier):
@@ -19,7 +24,9 @@ class _Fake(TSClient):
 
     def object_exists(self, obj_type, identifier):
         self.calls.append(("check", obj_type, identifier))
-        return self._survives
+        if not self._visible:
+            return False                     # invisible reads as absent, before AND after
+        return self._survives if self.calls.count(("delete", obj_type, identifier)) else True
 
 
 def test_204_that_deleted_nothing_is_reported_as_failure():
@@ -30,18 +37,22 @@ def test_204_that_deleted_nothing_is_reported_as_failure():
 
 
 def test_real_deletion_is_reported_as_success():
-    f = _Fake(204, survives=False)
+    # Visible first, gone after. That pair is the only evidence a deletion actually happened.
+    f = _Fake(204, survives=False, visible=True)
     ok, _s, detail = f.delete_metadata_verified("ANSWER", "g1")
     assert ok is True and detail == "deleted"
-    assert f.calls == [("delete", "ANSWER", "g1"), ("check", "ANSWER", "g1")]
+    assert f.calls == [("check", "ANSWER", "g1"), ("delete", "ANSWER", "g1"),
+                       ("check", "ANSWER", "g1")]
 
 
-def test_http_error_never_checks_and_never_claims_success():
-    f = _Fake(403, survives=False)
+def test_http_error_never_verifies_afterwards_and_never_claims_success():
+    f = _Fake(403, survives=False, visible=True)
     ok, status, detail = f.delete_metadata_verified("ANSWER", "g1")
     assert ok is False and status == 403
     assert "rights" in detail and "admin" in detail
-    assert ("check", "ANSWER", "g1") not in f.calls
+    # One check, the one BEFORE the delete. Nothing is verified after a hard failure, because
+    # there is nothing to verify: the request never got as far as changing anything.
+    assert f.calls == [("check", "ANSWER", "g1"), ("delete", "ANSWER", "g1")]
 
 
 class _BodyResp:
@@ -59,23 +70,32 @@ def test_a_rejected_metadata_type_is_called_a_bug_not_a_permission_problem():
             self.seen.append(metadata_type)
             return _BodyResp(400, {"error": {"message": {"debug":
                              'Variable "$metadata" got invalid value "QUESTION_ANSWER_BOOK"'}}})
-        def object_exists(self, *a): raise AssertionError("must not check after a hard failure")
+        def __post_init__(self): pass
+        def object_exists(self, *a):
+            self.seen.append("check")
+            return True
     c = _C()
     ok, status, detail = c.delete_metadata_verified("QUESTION_ANSWER_BOOK", "g1")
     assert ok is False and status == 400
     assert "bug in this tool" in detail and "not a permission problem" in detail
-    assert c.seen == ["ANSWER"], "the dependency type must be normalised before the call"
+    assert [x for x in c.seen if x != "check"] == ["ANSWER"], \
+        "the dependency type must be normalised before the call"
+    assert c.seen.count("check") == 1, "no verification after a hard failure; only the pre-check"
 
 
 def test_object_not_found_is_not_reported_as_a_rights_problem():
     class _C(TSClient):
-        def __init__(self): pass
+        def __init__(self): self.checks = 0
         def _delete_once(self, metadata_type, identifier):
             return _BodyResp(400, {"error": {"message": {"debug": {"code": 13003}}}})
-        def object_exists(self, *a): raise AssertionError("must not check")
-    ok, _s, detail = _C().delete_metadata_verified("ANSWER", "gone")
+        def object_exists(self, *a):
+            self.checks += 1
+            return True
+    c = _C()
+    ok, _s, detail = c.delete_metadata_verified("ANSWER", "gone")
     assert ok is False
     assert "no such object" in detail and "rights" not in detail
+    assert c.checks == 1, "no verification after a hard failure; only the pre-check"
 
 
 def test_dependency_types_map_to_the_v2_metadata_types():
@@ -170,3 +190,38 @@ def test_an_object_that_cannot_be_re_read_is_unconfirmed_not_successful():
     f = _FakeApply(_OK, None)
     ok, detail = f.apply_tml_verified("m1", "edited", columns=["sales_customers::gender"])
     assert ok is False and "unconfirmed" in detail
+
+
+# ── "not found" is not "deleted" when you could never see it ─────────────────────────────────
+#
+# ps-internal 2026-09-25: a non-admin issued a delete against an answer that was never shared
+# with it. The API returned 204, the object was untouched, and the post-delete existence check
+# said "not found" because that account could never see it in the first place. So the guard
+# against a lying 204 reported success — on exactly the accounts most likely to lack rights.
+
+class _FakeInvisible(TSClient):
+    """An object this account cannot see, before or after; the delete changes nothing."""
+    def __init__(self, visible):
+        self._visible = visible
+        self.calls = []
+
+    def _delete_once(self, metadata_type, identifier):
+        self.calls.append("delete")
+        return _R(204)
+
+    def object_exists(self, obj_type, identifier):
+        self.calls.append("check")
+        return self._visible
+
+
+def test_a_delete_of_something_never_visible_is_unconfirmed_not_success():
+    ok, status, detail = _FakeInvisible(visible=False).delete_metadata_verified("ANSWER", "g1")
+    assert ok is False and status == 204
+    assert "UNCONFIRMED" in detail and "could not see" in detail
+
+
+def test_the_object_is_looked_for_before_the_delete_not_only_after():
+    f = _FakeInvisible(visible=False)
+    f.delete_metadata_verified("ANSWER", "g1")
+    assert f.calls[0] == "check", "the pre-check is what makes the post-check mean anything"
+    assert f.calls == ["check", "delete", "check"]
