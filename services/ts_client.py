@@ -166,14 +166,31 @@ class TSClient:
         return results
 
     def _resolve_names_to_ids(self, names, obj_type: str = "LOGICAL_TABLE") -> Dict[str, str]:
-        """Map object names to GUIDs via metadata search (exact-name match)."""
+        """Map object names to GUIDs via metadata search. Absent names are simply missing.
+
+        `identifier` is an EXACT, CASE-SENSITIVE match (verified on-cluster): a name that does
+        not exist comes back as HTTP 200 with zero rows, never as an error. So an HTTPError here
+        is never "not found" — it is the cluster refusing us, most often an expired token, and it
+        applies to every name rather than one of them.
+
+        That distinction is the whole point. This used to swallow HTTPError and carry on, so an
+        expired token produced an empty result that the caller could not tell apart from "none of
+        these exist on the target", and the operator was told 31 objects were missing when the
+        truth was that nothing had been checked. Systemic failures now raise.
+        """
         out = {}
         for name in names:
             payload = {"metadata": [{"type": obj_type, "identifier": name}], "record_size": 5}
             try:
                 data = self._post("/api/rest/2.0/metadata/search", payload)
-            except requests.HTTPError:
-                continue
+            except requests.HTTPError as e:
+                code = getattr(getattr(e, "response", None), "status_code", "?")
+                hint = (" The target token has most likely expired."
+                        if code in (401, 403) else "")
+                raise RuntimeError(
+                    f"the target refused a metadata lookup (HTTP {code}) while checking whether "
+                    f"'{name}' exists.{hint} Nothing was checked, so no conclusion can be drawn "
+                    f"about what is or is not on the target.") from e
             items = data if isinstance(data, list) else data.get("metadata", [])
             for it in items:
                 if it.get("metadata_name") == name:

@@ -225,3 +225,55 @@ def test_the_object_is_looked_for_before_the_delete_not_only_after():
     f.delete_metadata_verified("ANSWER", "g1")
     assert f.calls[0] == "check", "the pre-check is what makes the post-check mean anything"
     assert f.calls == ["check", "delete", "check"]
+
+
+# ── a lookup that could not run is not a lookup that found nothing ───────────────────────────
+#
+# GSK 2026-09-30: the asset picker reported "0 already on target, 31 not on target" while all 31
+# were plainly present on the target cluster. _resolve_names_to_ids swallowed the per-name
+# HTTPError and returned {}, which the caller could not tell apart from a genuine empty result.
+# `identifier` is an exact, case-sensitive match and a missing name returns HTTP 200 with zero
+# rows (verified on-cluster), so an HTTPError there is never "not found" — it is systemic.
+
+import requests as _requests
+
+
+class _FakeResolve(TSClient):
+    def __init__(self, raise_status=None, rows=None):
+        self._raise, self._rows = raise_status, rows or []
+
+    def _post(self, path, payload):
+        if self._raise is not None:
+            resp = _requests.Response()
+            resp.status_code = self._raise
+            raise _requests.HTTPError(f"{self._raise} error", response=resp)
+        return {"metadata": self._rows}
+
+
+def test_a_refused_lookup_raises_instead_of_looking_like_an_empty_result():
+    for code in (401, 403, 500):
+        try:
+            _FakeResolve(raise_status=code)._resolve_names_to_ids(["orders"])
+        except RuntimeError as e:
+            assert "nothing was checked" in str(e).lower()
+            assert str(code) in str(e)
+        else:
+            raise AssertionError(f"HTTP {code} was swallowed and reported as 'not found'")
+
+
+def test_an_expired_token_says_so():
+    try:
+        _FakeResolve(raise_status=401)._resolve_names_to_ids(["orders"])
+    except RuntimeError as e:
+        assert "expired" in str(e).lower()
+
+
+def test_a_name_that_genuinely_does_not_exist_is_simply_absent():
+    # Zero rows with HTTP 200 is the real "not found", and must stay quiet.
+    assert _FakeResolve(rows=[])._resolve_names_to_ids(["nope"]) == {}
+
+
+def test_a_name_that_exists_resolves():
+    got = _FakeResolve(rows=[{"metadata_name": "orders", "metadata_id": "g1"}]
+                       )._resolve_names_to_ids(["orders"])
+    assert got == {"orders": "g1"}

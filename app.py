@@ -1174,15 +1174,19 @@ if step == 0:
             # Target presence by name (cross-cluster names are preserved) — guards exclusion.
             mt_names = sorted({id2name.get(i, "") for i in dep["model_ids"] + dep["table_ids"]
                                if id2name.get(i)})
-            present = set()
+            # A FAILED check is not an empty result. Swallowing the error here reported every
+            # object as missing from the target when in truth nothing had been looked at, which
+            # is how a stale token read on screen as "31 not on target".
+            present, present_err = set(), None
             if mt_names:
                 try:
                     present = set(target_client()._resolve_names_to_ids(mt_names, "LOGICAL_TABLE").keys())
-                except Exception:
-                    present = set()
+                except Exception as _e:
+                    present, present_err = set(), str(_e)
             st.session_state.dep_info        = dep
             st.session_state._promo_id2name  = id2name
             st.session_state._promo_present  = present
+            st.session_state._promo_present_err = present_err
             st.session_state._promo_items    = (dep.get("model_items") or []) + (dep.get("leaf_items") or [])
             st.session_state._resolved_key   = sel_key
             st.session_state.pop("excluded", None)
@@ -1203,6 +1207,7 @@ if step == 0:
         if dep:
             id2name     = st.session_state.get("_promo_id2name", {})
             present     = st.session_state.get("_promo_present", set())
+            present_err = st.session_state.get("_promo_present_err")
             promo_items = st.session_state.get("_promo_items", [])
             excluded    = st.session_state.setdefault("excluded", set())
             prune       = st.session_state.setdefault("prune_tables", set())
@@ -1417,7 +1422,11 @@ if step == 0:
                 for i in _ids:
                     nm = id2name.get(i, i)
                     on_tgt = nm in present
-                    if _kind == "model":
+                    if present_err:
+                        # The check itself failed, so "not on target" would be a claim we cannot
+                        # make. Say unknown rather than assert absence.
+                        _out = "unknown — the target could not be checked"
+                    elif _kind == "model":
                         _out = ("binds to the target's copy" if on_tgt
                                 else "⚠ can't be left out — not on target")
                     else:
@@ -1427,15 +1436,21 @@ if step == 0:
                         "#": len(_rows_ps) + 1,
                         "Object": nm,
                         "Kind": _kind,
-                        "On target": "🟢 yes" if on_tgt else "🔴 no",
+                        "On target": ("⚪ unknown" if present_err
+                                      else "🟢 yes" if on_tgt else "🔴 no"),
                         "Promote?": i in _psel,
                         "If left out": _out,
                         "_scoped": i})
             _psdf = pd.DataFrame(_rows_ps, columns=["#", "Object", "Kind", "On target",
                                                     "Promote?", "If left out", "_scoped"])
             _n_on  = sum(1 for r in _rows_ps if r["On target"].endswith("yes"))
-            st.markdown(f"**{len(_rows_ps)} object(s)** · 🟢 **{_n_on}** already on target · "
-                        f"🔴 **{len(_rows_ps) - _n_on}** not on target")
+            if present_err:
+                st.error(f"**The target could not be checked, so none of the rows below say "
+                         f"anything about what is already there.** {present_err}")
+                st.markdown(f"**{len(_rows_ps)} object(s)** · ⚪ target status unknown")
+            else:
+                st.markdown(f"**{len(_rows_ps)} object(s)** · 🟢 **{_n_on}** already on target · "
+                            f"🔴 **{len(_rows_ps) - _n_on}** not on target")
             _pq = st.text_input("Filter promotion set", key="promoset_search",
                                 label_visibility="collapsed",
                                 placeholder="🔎 Filter by name").strip().lower()
