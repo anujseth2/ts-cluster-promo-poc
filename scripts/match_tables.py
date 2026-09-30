@@ -47,7 +47,11 @@ def _parse(edoc):
 
 
 def load_team():
-    teams = json.loads(open(os.path.join(REPO, "config", "teams.json")).read())
+    # Same split as the app: the live config is the gitignored local file when it exists.
+    _cfg = os.path.join(REPO, "config", "teams.local.json")
+    if not os.path.exists(_cfg):
+        _cfg = os.path.join(REPO, "config", "teams.json")
+    teams = json.loads(open(_cfg).read())
     name = os.environ.get("TEAM") or next(iter(teams))
     return name, teams[name]
 

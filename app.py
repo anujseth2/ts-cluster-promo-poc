@@ -47,7 +47,13 @@ load_dotenv(Path(__file__).parent / ".env")
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-TEAMS_FILE = Path(__file__).parent / "config" / "teams.json"
+# config/teams.json is TRACKED and holds the shipped defaults. The live config is
+# config/teams.local.json, which is gitignored. Keeping them apart is not tidiness: the moment
+# anyone edits their teams against a real cluster, a tracked config file diverges from the repo
+# and every subsequent `git pull` refuses to merge. That is exactly what stalled the GSK box
+# repeatedly, and no sequence of git commands fixes it while the file stays tracked.
+TEAMS_FILE  = Path(__file__).parent / "config" / "teams.json"
+TEAMS_LOCAL = Path(__file__).parent / "config" / "teams.local.json"
 
 STEPS = [
     "1 · Select Assets",
@@ -59,12 +65,24 @@ STEPS = [
 ]
 
 
+def teams_path() -> Path:
+    """The file this environment's team config actually lives in.
+
+    Seeded once from the tracked defaults, then owned entirely by this machine. git never sees
+    it again, so pulling a new version of the tool can never collide with how it is configured.
+    """
+    if not TEAMS_LOCAL.exists():
+        TEAMS_LOCAL.parent.mkdir(parents=True, exist_ok=True)
+        TEAMS_LOCAL.write_text(TEAMS_FILE.read_text() if TEAMS_FILE.exists() else "{}")
+    return TEAMS_LOCAL
+
+
 def load_teams() -> dict:
-    return json.loads(TEAMS_FILE.read_text())
+    return json.loads(teams_path().read_text())
 
 
 def save_teams(teams: dict):
-    TEAMS_FILE.write_text(json.dumps(teams, indent=2))
+    teams_path().write_text(json.dumps(teams, indent=2))
 
 
 def get_env(key: str) -> str:
