@@ -277,3 +277,65 @@ def test_a_name_that_exists_resolves():
     got = _FakeResolve(rows=[{"metadata_name": "orders", "metadata_id": "g1"}]
                        )._resolve_names_to_ids(["orders"])
     assert got == {"orders": "g1"}
+
+
+# ── resolving a blocker by name: an exact search is not the last word ────────────────────────
+#
+# GSK 2026-10-01: the panel said "Not visible to this account" about a model the operator owned
+# and could see in the UI. metadata/search `identifier` is an EXACT, case-sensitive match, and
+# the name being searched comes out of ThoughtSpot's own 14544 HTML, which pads its list items.
+# One stray space and the search misses an object sitting in plain view.
+
+class _FakeFind(TSClient):
+    def __init__(self, exact_rows=None, listing=None, raise_status=None):
+        self._exact = exact_rows or []
+        self._listing = listing or {}
+        self._raise = raise_status
+        self.listed = []
+
+    def _post(self, path, payload):
+        if self._raise is not None:
+            resp = _requests.Response(); resp.status_code = self._raise
+            raise _requests.HTTPError("nope", response=resp)
+        ident = payload["metadata"][0]["identifier"]
+        return {"metadata": [r for r in self._exact if r["metadata_name"] == ident]}
+
+    def list_metadata(self, obj_type):
+        self.listed.append(obj_type)
+        return self._listing.get(obj_type, [])
+
+
+def test_a_name_that_differs_only_by_padding_still_resolves():
+    # The stored name is clean; the name in the error carries a trailing space and a double space.
+    f = _FakeFind(listing={"LOGICAL_TABLE": [
+        {"id": "g1", "name": "OE test - Respbio Subnational Performance",
+         "type": "LOGICAL_TABLE", "author": "anuj.seth"}]})
+    got = f.find_objects_by_name(["OE test -  Respbio Subnational Performance "])
+    assert list(got.values())[0]["id"] == "g1"
+
+
+def test_a_typographic_dash_does_not_defeat_the_match():
+    f = _FakeFind(listing={"LOGICAL_TABLE": [
+        {"id": "g2", "name": "OE test - Respbio", "type": "LOGICAL_TABLE", "author": "a"}]})
+    assert list(f.find_objects_by_name(["OE test – Respbio"]).values())[0]["id"] == "g2"
+
+
+def test_the_exact_search_is_still_tried_first_and_avoids_the_listing():
+    f = _FakeFind(exact_rows=[{"metadata_name": "Clean Name", "metadata_id": "g3",
+                               "metadata_type": "ANSWER", "metadata_header": {}}])
+    got = f.find_objects_by_name(["Clean Name"])
+    assert got["clean name"]["id"] == "g3"
+    assert f.listed == [], "no listing scan when the exact search already resolved it"
+
+
+def test_a_name_that_genuinely_is_not_there_stays_unresolved():
+    assert _FakeFind().find_objects_by_name(["Nothing Like This"]) == {}
+
+
+def test_a_refused_search_raises_rather_than_looking_like_invisibility():
+    try:
+        _FakeFind(raise_status=401).find_objects_by_name(["Anything"])
+    except RuntimeError as e:
+        assert "expired" in str(e).lower() and "no conclusion" in str(e).lower()
+    else:
+        raise AssertionError("a 401 was reported as 'not visible to this account'")

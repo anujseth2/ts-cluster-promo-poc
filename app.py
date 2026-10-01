@@ -3388,11 +3388,16 @@ elif step == 3:
                     _walk_key = (tuple(sorted(_blk_names)), tuple(sorted(_blk_scan_names)))
                     if st.session_state.get("_casc_key") != _walk_key:
                         for _k in ("_casc_nodes", "_casc_roots", "_casc_blocked", "_casc_disp",
-                                   "_casc_authors", "_casc_unres", "_casc_inpromo"):
+                                   "_casc_authors", "_casc_unres", "_casc_inpromo",
+                                   "_casc_res_err"):
                             st.session_state.pop(_k, None)
                     if "_casc_nodes" not in st.session_state:
                         with st.spinner("Reading the target and walking its dependency tree…"):
-                            _resolved = _tgtc.find_objects_by_name(_blk_names)
+                            try:
+                                _resolved, _res_err = _tgtc.find_objects_by_name(_blk_names), None
+                            except Exception as _e:
+                                # A refused lookup is not a verdict on what this account can see.
+                                _resolved, _res_err = {}, str(_e)
                             _cands, _inpromo, _unres = [], [], []
                             for _n in _blk_names:
                                 _h = _resolved.get(_n.strip().lower())
@@ -3413,6 +3418,7 @@ elif step == 3:
                         st.session_state._casc_blocked = _cblk
                         st.session_state._casc_disp    = _disp
                         st.session_state._casc_unres   = _unres
+                        st.session_state._casc_res_err = _res_err
                         st.session_state._casc_inpromo = _inpromo
                         st.session_state._casc_authors = {c["id"]: c.get("author", "")
                                                           for c in _cands}
@@ -3422,6 +3428,7 @@ elif step == 3:
                     _cblk    = st.session_state.get("_casc_blocked") or []
                     _disp    = st.session_state.get("_casc_disp") or []
                     _unres   = st.session_state.get("_casc_unres") or []
+                    _res_err = st.session_state.get("_casc_res_err")
                     _inpromo = st.session_state.get("_casc_inpromo") or []
                     _authors = st.session_state.get("_casc_authors") or {}
 
@@ -3431,10 +3438,20 @@ elif step == 3:
                                 + ": this promotion is updating it, so the import rewrites it "
                                   "with the column already gone. Changing it here would undo the "
                                   "very thing being promoted.")
-                    if _unres:
-                        st.warning("Not visible to this account, so it can't be changed here: "
-                                   + ", ".join(f"**{n}**" for n in _unres)
-                                   + ". Ask its owner, or run the tool as an admin.")
+                    if _res_err:
+                        st.error("**The target could not be searched, so nothing below says "
+                                 f"anything about what you can or cannot act on.** {_res_err}")
+                    elif _unres:
+                        # Say what was actually done, not what it might mean. The exact-name
+                        # search plus a normalised scan of the target both came back empty, and
+                        # that has two quite different explanations.
+                        st.warning(
+                            "Searched the target for these by name and found nothing: "
+                            + ", ".join(f"**{n}**" for n in _unres)
+                            + ". Either they are not visible to this account, in which case ask "
+                              "the owner or run as an admin, or the name in ThoughtSpot's error "
+                              "does not match the object's stored name. If you can see the object "
+                              "yourself, it is the second one — tell me and I'll fix the match.")
                     if _disp:
                         # ThoughtSpot says these block; reading their TML we find no reference to
                         # the column. One side is wrong and it is likelier to be our scan than the
@@ -3473,7 +3490,7 @@ elif step == 3:
                                           "on the target has changed since."):
                             for _k in ("_casc_nodes", "_casc_roots", "_casc_blocked",
                                        "_casc_disp", "_casc_authors", "_casc_unres",
-                                       "_casc_inpromo"):
+                                       "_casc_inpromo", "_casc_res_err"):
                                 st.session_state.pop(_k, None)
                             st.rerun()
 
@@ -3643,7 +3660,7 @@ elif step == 3:
                                                     state="complete")
                                     for _k in ("blk_del_confirm", "_casc_key", "_casc_nodes",
                                                "_casc_roots", "_casc_blocked", "_casc_authors",
-                                               "_casc_unres", "_casc_inpromo", "_casc_disp",
+                                               "_casc_unres", "_casc_inpromo", "_casc_disp", "_casc_res_err",
                                                "discovered_findings", "discovered_meta"):
                                         st.session_state.pop(_k, None)
                                     for _r in _roots:

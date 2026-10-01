@@ -9,6 +9,7 @@ client, each with its own host + credentials.
 import json
 import re
 import time
+import unicodedata
 import yaml
 from datetime import datetime
 
@@ -653,44 +654,89 @@ class TSClient:
                                    "object — the import was accepted but did not remove it")
         return True, "applied and verified on the target"
 
+    @staticmethod
+    def _norm_name(value: str) -> str:
+        """Fold a name to something two spellings of the same object agree on.
+
+        ThoughtSpot's 14544 message renders the blocking objects as HTML list items, and those
+        carry padding the object's stored name does not. Case, runs of whitespace and the several
+        unicode dashes people type into names are all noise for the purpose of "is this the same
+        object", and all three have made an exact search miss something sitting in plain sight.
+        """
+        txt = unicodedata.normalize("NFKC", value or "")
+        for dash in ("\u2010", "\u2011", "\u2012", "\u2013", "\u2014", "\u2015", "\u2212"):
+            txt = txt.replace(dash, "-")
+        return " ".join(txt.split()).casefold()
+
     def find_objects_by_name(self, names: List[str],
                              types: Optional[List[str]] = None) -> Dict[str, Dict]:
         """Resolve object NAMES to {id, type, name, author} across several metadata types.
 
         A "Deleted columns have dependents" error names the blocking objects but gives no guid and
-        no type, and deleting one needs both. Returns {name_lower: {...}} for those found; a name
-        that resolves to nothing is simply absent, which is itself the signal that the object is
-        not visible to this account.
+        no type, and acting on one needs both. Returns {name_lower: {...}} for those found.
 
-        The search `identifier` is CASE-SENSITIVE, so the original spelling is sent and the match
-        is compared case-insensitively — lowercasing the query returns zero rows."""
+        An absent name used to be read as "not visible to this account". It is not: the search
+        `identifier` is an EXACT, case-sensitive match, so a name that differs by a trailing space,
+        a doubled space or a typographic dash misses entirely, and the operator was told they
+        could not see an object they owned (GSK 2026-10-01). So a miss on the exact search now
+        falls back to listing the type and matching on a normalised name, and a REFUSED search
+        raises instead of looking like a miss.
+        """
         out: Dict[str, Dict] = {}
         originals = [n.strip() for n in (names or []) if (n or "").strip()]
         if not originals:
             return out
-        for obj_type in (types or ["ANSWER", "LIVEBOARD", "LOGICAL_TABLE"]):
+        want = {self._norm_name(o): o for o in originals}
+        kinds = types or ["ANSWER", "LIVEBOARD", "LOGICAL_TABLE"]
+
+        def _record(norm, mid, mtype, found, author):
+            out[want[norm].lower()] = {"id": mid, "type": mtype, "name": found, "author": author}
+
+        for obj_type in kinds:
             for original in originals:
-                key = original.lower()
-                if key in out:
+                if original.lower() in out:
                     continue
                 try:
                     data = self._post("/api/rest/2.0/metadata/search",
                                       {"metadata": [{"type": obj_type, "identifier": original}],
                                        "record_size": 10})
-                except Exception:
-                    continue
+                except requests.HTTPError as e:
+                    code = getattr(getattr(e, "response", None), "status_code", "?")
+                    hint = (" The target token has most likely expired."
+                            if code in (401, 403) else "")
+                    raise RuntimeError(
+                        f"the target refused a metadata lookup (HTTP {code}) while resolving "
+                        f"'{original}'.{hint} Nothing was resolved, so no conclusion can be drawn "
+                        f"about what this account can or cannot see.") from e
                 items = data if isinstance(data, list) else data.get("metadata", [])
                 for it in items:
                     hdr = it.get("metadata_header") or {}
                     found = (it.get("metadata_name") or hdr.get("name") or "").strip()
-                    if found.lower() != key:
+                    if self._norm_name(found) != self._norm_name(original):
                         continue
-                    out[key] = {"id": it.get("metadata_id"),
-                                "type": it.get("metadata_type") or obj_type,
-                                "name": found,
-                                "author": hdr.get("authorDisplayName")
-                                or hdr.get("authorName", "")}
+                    _record(self._norm_name(original), it.get("metadata_id"),
+                            it.get("metadata_type") or obj_type, found,
+                            hdr.get("authorDisplayName") or hdr.get("authorName", ""))
                     break
+
+        # Anything the exact search missed: list the type and match on the normalised name. Only
+        # runs for names that are still unresolved, which is normally none of them.
+        missing = [o for o in originals if o.lower() not in out]
+        if missing:
+            want_norm = {self._norm_name(o) for o in missing}
+            for obj_type in kinds:
+                if not want_norm:
+                    break
+                try:
+                    rows = self.list_metadata(obj_type)
+                except Exception:
+                    continue              # a listing we cannot read simply adds nothing
+                for r in rows:
+                    norm = self._norm_name(r.get("name") or "")
+                    if norm in want_norm:
+                        _record(norm, r.get("id"), r.get("type") or obj_type,
+                                r.get("name"), r.get("author", ""))
+                        want_norm.discard(norm)
         return out
 
     def real_dependents(self, model_guid: str) -> List[Dict]:
