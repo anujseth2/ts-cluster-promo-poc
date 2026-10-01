@@ -270,8 +270,14 @@ class TSClient:
             payload = {"metadata": [{"type": obj_type, "identifier": name}], "record_size": 5}
             try:
                 data = self._post("/api/rest/2.0/metadata/search", payload)
-            except requests.HTTPError:
-                continue
+            except requests.HTTPError as e:
+                # A name that does not exist comes back 200 with zero rows, so an error here is
+                # systemic and applies to every name, not a verdict on this one.
+                code = getattr(getattr(e, "response", None), "status_code", "?")
+                raise RuntimeError(
+                    f"the cluster refused a metadata lookup (HTTP {code}) while reading obj_ids "
+                    f"for '{name}'. Nothing was read, so no conclusion can be drawn about which "
+                    "objects have an obj_id.") from e
             items = data if isinstance(data, list) else data.get("metadata", [])
             for it in items:
                 if it.get("metadata_name") == name:
@@ -842,8 +848,16 @@ class TSClient:
         try:
             d = self._post("/api/rest/2.0/ai/instructions/get",
                            {"data_source_identifier": data_source_identifier})
-        except requests.HTTPError:
-            return []
+        except requests.HTTPError as e:
+            # VERIFIED on ps-internal 2026-10-01: a model with no instructions answers HTTP 200
+            # with an empty list, and only a bad identifier 404s. So an error here is NEVER "none"
+            # — and returning [] for one was actively destructive, because `set` is a full replace:
+            # a refused read made MERGE behave as REPLACE and wiped the target's coaching text.
+            code = getattr(getattr(e, "response", None), "status_code", "?")
+            raise RuntimeError(
+                f"could not read NL instructions for '{data_source_identifier}' (HTTP {code}). "
+                "A model with none returns an empty list, so this is a real failure and the "
+                "target's existing instructions must not be treated as absent.") from e
         return [b for b in (d.get("nl_instructions_info") or []) if isinstance(b, dict)]
 
     def get_nl_instructions(self, data_source_identifier: str, scope: str = "GLOBAL") -> List[str]:

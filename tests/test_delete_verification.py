@@ -339,3 +339,61 @@ def test_a_refused_search_raises_rather_than_looking_like_invisibility():
         assert "expired" in str(e).lower() and "no conclusion" in str(e).lower()
     else:
         raise AssertionError("a 401 was reported as 'not visible to this account'")
+
+
+# ── the sweep: a refusal is never an empty result ────────────────────────────────────────────
+
+class _FakeNL(TSClient):
+    def __init__(self, status): self._status = status
+
+    def _post(self, path, payload):
+        resp = _requests.Response(); resp.status_code = self._status
+        raise _requests.HTTPError("refused", response=resp)
+
+
+def test_unreadable_nl_instructions_raise_rather_than_reading_as_none():
+    # VERIFIED on-cluster: a model with no instructions answers HTTP 200 with an empty list, so an
+    # error is never "none". Returning [] here was destructive: `set` is a FULL REPLACE, so a
+    # refused read turned MERGE into REPLACE and wiped the target's coaching text.
+    for code in (401, 403, 500):
+        try:
+            _FakeNL(code).get_nl_instruction_blocks("some-model")
+        except RuntimeError as e:
+            assert "must not be treated as absent" in str(e)
+        else:
+            raise AssertionError(f"HTTP {code} was reported as 'no instructions'")
+
+
+def test_a_model_whose_instructions_cannot_be_read_is_skipped_not_overwritten():
+    from services import nl_instructions
+
+    class _Tgt:
+        def __init__(self): self.written = []
+        def find_by_obj_id(self, obj_id, obj_type="LOGICAL_TABLE"): return "tgt-guid"
+        def get_nl_instruction_blocks(self, guid): raise RuntimeError("refused (HTTP 403)")
+        def set_nl_instruction_blocks(self, guid, blocks):
+            self.written.append(blocks); return True
+
+    class _Src:
+        def get_nl_instructions(self, guid): return ["always answer in GBP"]
+
+    tgt = _Tgt()
+    report = nl_instructions.promote(_Src(), tgt,
+                                     [{"name": "M", "obj_id": "m", "source_guid": "s"}],
+                                     mode="merge")
+    assert tgt.written == [], "a model with an unreadable target must never be written to"
+    assert "skipped" in report[0]["status"] and "403" in report[0]["status"]
+
+
+def test_obj_id_search_refusal_raises_instead_of_reporting_no_obj_id():
+    class _F(TSClient):
+        def __init__(self): pass
+        def _post(self, path, payload):
+            resp = _requests.Response(); resp.status_code = 403
+            raise _requests.HTTPError("refused", response=resp)
+    try:
+        _F().search_obj_ids(["Orders"])
+    except RuntimeError as e:
+        assert "no conclusion" in str(e).lower()
+    else:
+        raise AssertionError("a refused obj_id lookup looked like 'this object has no obj_id'")

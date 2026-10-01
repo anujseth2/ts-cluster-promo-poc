@@ -58,7 +58,17 @@ def promote(source_client, target_client, models: List[Dict], mode: str = "merge
         # Split the target's blocks: GLOBAL is what we edit; anything else is passed back as-is.
         tgt: List[str] = []
         other_blocks: List[Dict] = []
-        for b in target_client.get_nl_instruction_blocks(tgt_guid):
+        try:
+            _blocks = target_client.get_nl_instruction_blocks(tgt_guid)
+        except Exception as e:
+            # `set` is a FULL REPLACE. If the target's current instructions cannot be read, a
+            # merge would compute union(source, nothing) and silently destroy them. Skip the
+            # model and say so; never write on a guess about what is already there.
+            report.append({"model": m["name"],
+                           "status": f"skipped — could not read the target's instructions: {e}",
+                           "added": [], "kept": [], "dropped": [], "count": 0})
+            continue
+        for b in _blocks:
             if (b.get("scope") or "GLOBAL") == "GLOBAL":
                 tgt.extend(b.get("instructions") or [])
             else:

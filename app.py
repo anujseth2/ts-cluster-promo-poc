@@ -108,11 +108,12 @@ def _target_name_index(client, types) -> dict:
     DUPLICATE (a new guid appearing for a name that already existed)."""
     idx = {}
     for t in types:
-        try:
-            resp = client._post("/api/rest/2.0/metadata/search",
-                                 {"metadata": [{"type": t}], "record_size": 5000})
-        except Exception:
-            continue
+        # Not caught. This snapshot is what the results page diffs against to tell Created from
+        # Updated-in-place from DUPLICATE. A type that could not be read used to drop out
+        # silently, and every object of that type then looked new — so an update was reported as
+        # a creation and a duplicate was not reported at all.
+        resp = client._post("/api/rest/2.0/metadata/search",
+                            {"metadata": [{"type": t}], "record_size": 5000})
         rows = resp if isinstance(resp, list) else resp.get("metadata", [])
         for o in rows:
             nm = o.get("metadata_name")
@@ -1050,7 +1051,7 @@ if step == 0:
                         "_resolved_key", "excluded",
                         "_promo_id2name", "_promo_present", "obj_id_status",
                         "table_alignment", "transformed_items", "import_results", "recon_report",
-                        "pre_import_index", "dropped_col_names", "dropped_cols_count",
+                        "pre_import_index", "pre_import_index_err", "dropped_col_names", "dropped_cols_count",
                         "_landed_col_map", "dropped_cascade_names",
                         "dropped_vizs_count", "prune_summary",
                         "_fb_previews", "feedback_mode", "ack_replace", "fb_replace_report",
@@ -3347,10 +3348,12 @@ elif step == 3:
                             return None
 
                     def _c_deps(_i):
-                        try:
-                            _m = _tgtc.list_dependents([_i]) or {}
-                        except Exception:
-                            return []
+                        # NOT caught. An unreadable dependents call used to return [], which the
+                        # planner read as "this model has nothing hanging off it" — so the cascade
+                        # would apply, destroy what it did find, and leave the real dependents in
+                        # place still blocking the import. That is the half-applied target every
+                        # other gate exists to prevent, arriving through a swallowed exception.
+                        _m = _tgtc.list_dependents([_i]) or {}
                         _o = []
                         for _v in _m.values():
                             _o.extend(_v or [])
@@ -4765,7 +4768,20 @@ elif step == 4:
                             promo_types.add("LIVEBOARD")
                         if "answer" in _d:
                             promo_types.add("ANSWER")
-                    st.session_state.pre_import_index = _target_name_index(target_client(), promo_types)
+                    # Snapshot the target's names before importing. If it fails, the import can
+                    # still proceed — but the results page must not then claim it knows whether
+                    # each object was created or updated in place, so the failure is recorded and
+                    # surfaced there rather than quietly degrading into "everything looks new".
+                    try:
+                        st.session_state.pre_import_index = _target_name_index(target_client(),
+                                                                               promo_types)
+                        st.session_state.pop("pre_import_index_err", None)
+                    except Exception as _e:
+                        st.session_state.pre_import_index = {}
+                        st.session_state.pre_import_index_err = str(_e)
+                        st.warning("Couldn't read the target's existing objects before importing, "
+                                   "so the results page will not be able to tell a newly created "
+                                   f"object from one updated in place. {_e}")
 
                     with st.spinner("Importing tables & models, then validating liveboards/answers…"):
                         # Import ONLY this run's files. The team folder accumulates TML across
@@ -4917,6 +4933,10 @@ elif step == 5:
             return _RAW.get(raw, raw)
 
         pre_index = st.session_state.get("pre_import_index", {})
+        pre_index_err = st.session_state.get("pre_import_index_err")
+        if pre_index_err:
+            st.warning("**Created vs updated is unknown for this run.** The target could not be "
+                       f"read before the import, so that comparison has no baseline. {pre_index_err}")
         # Models rebuilt by feedback Replace get a NEW guid on purpose (old one deleted), so the
         # snapshot-based duplicate check would false-flag them — treat them as rebuilt, not dupes.
         _replaced = {r["model"] for r in (st.session_state.get("fb_replace_report") or [])
@@ -4931,6 +4951,8 @@ elif step == 5:
             # present). Only a real failure has no landing to describe.
             if is_blocking_result(row):
                 return ""
+            if pre_index_err:
+                return "landed (created vs updated unknown)"
             if row["type"] == "Feedback":
                 return "synced"
             if row["name"] in real_dupes:
