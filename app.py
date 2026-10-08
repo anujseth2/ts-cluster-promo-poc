@@ -35,7 +35,7 @@ from services.import_diagnostics import (
 )
 from services.target_cascade import (
     plan_tree, subtree_actions, tree_lines, dry_run_plan, snapshot_plan, apply_order,
-    planned_names, missing_capabilities,
+    planned_names, missing_capabilities, stale_after_apply,
 )
 from services.table_matcher import column_signature
 from services.feedback_replace import feedback_preview, replace_prep, replace_finalize
@@ -3441,11 +3441,22 @@ elif step == 3:
                     _authors = st.session_state.get("_casc_authors") or {}
 
                     if _inpromo:
-                        st.info("Nothing to do for "
+                        # Not a blocker and never actionable: the import rewrites it. Saying
+                        # "nothing to do" left the operator with no next step when it was the only
+                        # thing left, which happens often because the platform's dependency state
+                        # lags a write and keeps naming it for up to a minute after the cascade.
+                        _only_promo = not _roots and not _unres and not _cblk and not _disp
+                        _msg = ("ThoughtSpot also lists "
                                 + ", ".join(f"**{n}**" for n in _inpromo)
-                                + ": this promotion is updating it, so the import rewrites it "
-                                  "with the column already gone. Changing it here would undo the "
-                                  "very thing being promoted.")
+                                + ", which is what this promotion is updating. The import rewrites "
+                                  "it with the column already gone, so there is nothing to clear.")
+                        if _only_promo:
+                            st.success(_msg + " **That is the only thing still listed, so run "
+                                              "validation again.** The target's dependency state "
+                                              "lags a write by up to a minute, which is usually "
+                                              "all this is.")
+                        else:
+                            st.info(_msg)
                     if _res_err:
                         st.error("**The target could not be searched, so nothing below says "
                                  f"anything about what you can or cannot act on.** {_res_err}")
@@ -3652,7 +3663,24 @@ elif step == 3:
                                                       "to see where the import stands.",
                                                 state="error")
                                         else:
-                                            if _perr:
+                                            if _perr and stale_after_apply(
+                                                    [{"error": e.get("error")} for e in _perr],
+                                                    planned_names(_acts)):
+                                                # Everything still named is something this cascade
+                                                # just removed, so the target has not caught up.
+                                                # Reporting that as a failure says the cascade did
+                                                # not work when it did.
+                                                _vs.write("The only objects still named are ones "
+                                                          "this cascade removed.")
+                                                _vs.update(
+                                                    label="Cascade applied. The target is still "
+                                                          "reporting objects that were just "
+                                                          "removed, which means its dependency "
+                                                          "state has not caught up yet. Wait a "
+                                                          "minute and run validation again.",
+                                                    state="complete")
+                                                _perr = []
+                                            elif _perr:
                                                 _vs.write(f"The target still objects to "
                                                           f"{len(_perr)} file(s).")
                                                 _vs.update(

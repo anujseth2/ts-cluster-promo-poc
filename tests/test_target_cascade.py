@@ -485,3 +485,47 @@ def test_an_attribute_that_is_not_callable_does_not_count_as_the_method():
     class _Decoy:
         delete_metadata_verified = "not a method"
     assert missing_capabilities([{"action": "delete"}], _Decoy()) == ["delete_metadata_verified"]
+
+
+# ── the platform lags a write, and that is not a failed cascade ──────────────────────────────
+#
+# GSK 2026-10-08: the cascade stripped a column from a blocking model at 22:43:40. The validate at
+# 22:44 still failed, naming a dependent that was already gone. The validate at 22:45 passed, with
+# a byte-identical bundle and nothing changed in between. Reporting the 22:44 result as "still
+# blocked" tells the operator their cascade failed when it worked.
+
+from services.target_cascade import stale_after_apply      # noqa: E402
+
+_ERR = ("Deleted columns have dependents.<br/>- <b>CITY</b></br><ul>"
+        "<li>Respbio Subnational Performance with Komodo </li></ul><br/>")
+
+
+def test_a_complaint_naming_only_what_we_removed_is_the_target_lagging():
+    actions = [{"name": "Respbio Subnational Performance with Komodo"}]
+    assert stale_after_apply([{"error": _ERR}], planned_names(actions)) is True
+
+
+def test_a_complaint_naming_something_else_is_a_real_block():
+    actions = [{"name": "Some Other Model"}]
+    assert stale_after_apply([{"error": _ERR}], planned_names(actions)) is False
+
+
+def test_a_mix_is_a_real_block_not_lag():
+    # One stale, one genuine. The genuine one decides it.
+    other = ("Deleted columns have dependents.<br/>- <b>CITY</b></br><ul>"
+             "<li>Somebody Elses Board</li></ul><br/>")
+    actions = [{"name": "Respbio Subnational Performance with Komodo"}]
+    assert stale_after_apply([{"error": _ERR}, {"error": other}],
+                             planned_names(actions)) is False
+
+
+def test_no_problems_at_all_is_success_not_lag():
+    # Must not report "the target is lagging" when the target is simply happy.
+    assert stale_after_apply([], planned_names([{"name": "Anything"}])) is False
+
+
+def test_a_different_kind_of_error_is_never_lag():
+    actions = [{"name": "Respbio Subnational Performance with Komodo"}]
+    assert stale_after_apply(
+        [{"error": "DataType mismatch for column <b>PATIENT_AGE</b>."}],
+        planned_names(actions)) is False

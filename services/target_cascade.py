@@ -351,6 +351,25 @@ def missing_capabilities(actions, client):
     return sorted(n for n in need if not callable(getattr(client, n, None)))
 
 
+def stale_after_apply(problems, planned):
+    """True when every remaining complaint names only objects this plan already removed.
+
+    ThoughtSpot's dependency state lags a write. GSK 2026-10-08: a cascade stripped a column from
+    a blocking model at 22:43:40, the validate at 22:44 still failed naming a dependent that was
+    already gone, and the validate at 22:45 passed — byte-identical bundle, nothing changed in
+    between. So a re-check fired immediately after an apply can report a blocker that no longer
+    exists, and reporting that as "still blocked" tells the operator their cascade failed when it
+    worked.
+
+    `problems` are {"error": ...} entries; `planned` is planned_names(actions). An empty list of
+    problems is not stale, it is success, so this returns False for it.
+    """
+    forgive = {str(n).strip().lower() for n in (planned or ()) if str(n).strip()}
+    if not problems or not forgive:
+        return False
+    return all(_only_blocked_by(p.get("error") or "", forgive) for p in problems)
+
+
 def dry_run_plan(actions, validate, planned=None):
     """VALIDATE_ONLY every edited object BEFORE anything is written.
 
