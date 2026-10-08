@@ -3375,10 +3375,15 @@ elif step == 3:
                     # The model being promoted is named among the dependents, because it depends
                     # on its own table. It IS the promotion, so the import rewrites it with the
                     # column already gone and there is nothing here to remove.
+                    # ONLY what is actually in this bundle. _promo_id2name starts life as
+                    # name_by_id, which is EVERY asset listed from the source, so unioning it in
+                    # marked any object that merely exists on the source as "being promoted".
+                    # GSK 2026-10-08: the bundle was one model plus 30 tables, the blocker was a
+                    # DIFFERENT model the operator owns, and the panel told him there was nothing
+                    # to do about it. It was never in the promotion, so nothing rewrote it, and he
+                    # was left with no way to act on the only thing standing in his way.
                     _promo_names_b = {(_i.get("info", {}).get("name") or "").strip().lower()
                                       for _i in (filtered_items or [])}
-                    _promo_names_b |= {(_n2 or "").strip().lower() for _n2 in
-                                       (st.session_state.get("_promo_id2name") or {}).values()}
                     _promo_names_b.discard("")
 
                     # ── read the target ONCE, not on every tick ───────────────────────────────
@@ -4574,10 +4579,11 @@ elif step == 4:
                                     # deleting it would remove the very thing being updated plus
                                     # everything hanging off it, most of which never touched the
                                     # dropped column. Mark those in-promotion and never offer them.
+                                    # Only this bundle — see the note on _promo_names_b. Unioning
+                                    # _promo_id2name in marks every asset on the source as being
+                                    # promoted, which hides real blockers behind "nothing to do".
                                     _promo_names = {(_i.get("info", {}).get("name") or "").strip().lower()
                                                     for _i in (filtered_items or [])}
-                                    _promo_names |= {(_n or "").strip().lower() for _n in
-                                                     (st.session_state.get("_promo_id2name") or {}).values()}
                                     _promo_names.discard("")
                                     for _h in _hits:
                                         _src = next((x for x in _uniq if x["id"] == _h["id"]), {})
