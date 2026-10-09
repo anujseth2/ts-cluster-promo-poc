@@ -3417,9 +3417,16 @@ elif step == 3:
                                     _cands.append({"id": _h["id"], "name": _h["name"],
                                                    "type": _h["type"],
                                                    "author": _h.get("author", "")})
+                            # The qualified truth about what was dropped, so a model column is
+                            # matched on `table::COL` and not on a bare name that happens to exist
+                            # on another table too.
+                            _qual = {str(x) for x in
+                                     ((st.session_state.get("dropped_col_names") or set())
+                                      | (st.session_state.get("dropped_cascade_names") or set()))
+                                     if "::" in str(x)}
                             _roots, _nodes, _cblk, _disp = plan_tree(
                                 _cands, _blk_scan_names, _c_tml, _c_deps,
-                                skip_names=_promo_names_b)
+                                skip_names=_promo_names_b, qualified=_qual)
                         st.session_state._casc_key     = _walk_key
                         st.session_state._casc_roots   = _roots
                         st.session_state._casc_nodes   = _nodes

@@ -38,7 +38,8 @@ def _kind_of(doc):
     return "?"
 
 
-def plan_cascade(seeds, column_names, fetch_tml, fetch_deps, skip_ids=(), skip_names=()):
+def plan_cascade(seeds, column_names, fetch_tml, fetch_deps, skip_ids=(), skip_names=(),
+                 named=(), qualified=()):
     """Walk the dependency tree and decide what happens to each object.
 
     seeds:        [{"id", "name", "type"}] objects already known to reference the column
@@ -66,10 +67,12 @@ def plan_cascade(seeds, column_names, fetch_tml, fetch_deps, skip_ids=(), skip_n
     see apply_order(). Use plan_tree() when the caller needs the SHAPE of the result rather than
     a flat list.
     """
-    return _walk(seeds, column_names, fetch_tml, fetch_deps, skip_ids, skip_names)[:2]
+    return _walk(seeds, column_names, fetch_tml, fetch_deps, skip_ids, skip_names,
+                 named, qualified)[:2]
 
 
-def _walk(seeds, column_names, fetch_tml, fetch_deps, skip_ids=(), skip_names=()):
+def _walk(seeds, column_names, fetch_tml, fetch_deps, skip_ids=(), skip_names=(),
+          named=(), qualified=()):
     """The single walk behind plan_cascade and plan_tree.
 
     Returns (actions, blocked, reached, no_ref). `reached` is {parent_id: [child_id, ...]} for every
@@ -89,7 +92,21 @@ def _walk(seeds, column_names, fetch_tml, fetch_deps, skip_ids=(), skip_names=()
     want = {str(c).strip().lower() for c in (column_names or ()) if str(c).strip()}
     skip = {str(i) for i in (skip_ids or ())}
     skipn = {str(n).strip().lower() for n in (skip_names or ()) if str(n).strip()}
+    # The names ThoughtSpot itself called out as blocking. Walking a model's dependents returns
+    # EVERYTHING hanging off it, most of which has nothing to do with the dropped column, so this
+    # is how an unreadable BLOCKER is told apart from an unreadable bystander.
+    namedn = {str(n).strip().lower() for n in (named or ()) if str(n).strip()}
+    # Columns dropped with their table, as `table::COL`. A model column carries a qualified
+    # column_id, so matching it against a BARE name hits every same-named column on every other
+    # table. GSK 2026-10-09: dropping dim_customer_guidance_respbio_br::SEGMENT planned a strip of
+    # dim_air_customer_guidance_respbio_br::SEGMENT, which the operator never asked to touch.
+    qual = {str(q).strip().lower() for q in (qualified or ()) if str(q).strip() and "::" in str(q)}
+    # A bare name is only safe to match unqualified when nothing told us which table it came from
+    # — e.g. ThoughtSpot's own error text, which names the column but not its table.
+    bare_only = {w for w in want
+                 if "::" not in w and not any(q.split("::")[-1] == w for q in qual)}
     actions, blocked, seen, reached, no_ref = [], [], set(), {}, []
+    bystanders = []
     queue = list(seeds or [])
 
     while queue:
@@ -103,9 +120,16 @@ def _walk(seeds, column_names, fetch_tml, fetch_deps, skip_ids=(), skip_names=()
 
         edoc = fetch_tml(oid)
         if not edoc:
+            # GSK 2026-10-09: an answer the walk found hanging off the model, which ThoughtSpot
+            # never named as blocking, could not be read — and that refused the whole cascade.
+            # The platform's own 14544 list is authoritative about what blocks, so an unreadable
+            # object it did NOT name is a bystander: leave it alone rather than stopping over it.
+            if namedn and (obj.get("name") or "").strip().lower() not in namedn:
+                bystanders.append({"id": oid, "name": obj.get("name")})
+                continue
             blocked.append({"id": oid, "name": obj.get("name"),
-                            "reason": "its TML could not be read from the target — the account "
-                                      "probably cannot see it"})
+                            "reason": "its TML could not be read from the target, and ThoughtSpot "
+                                      "named it as blocking the drop, so it cannot be left alone"})
             continue
         try:
             doc = _parse_edoc({"edoc": edoc})
@@ -170,7 +194,12 @@ def _walk(seeds, column_names, fetch_tml, fetch_deps, skip_ids=(), skip_names=()
             for c in node.get("columns") or []:
                 cid = (c.get("column_id") or "").strip()
                 nm = (c.get("name") or "").strip()
-                if cid.split("::")[-1].strip().lower() in want or nm.lower() in want:
+                cid_l = cid.lower()
+                if "::" in cid:
+                    hit = cid_l in qual or cid_l.split("::")[-1] in bare_only
+                else:
+                    hit = cid_l in want or nm.lower() in want
+                if hit:
                     scoped.add(cid or nm)
             if not scoped:
                 no_ref.append({"id": oid, "name": obj.get("name"), "kind": "model"})
@@ -197,7 +226,7 @@ def _walk(seeds, column_names, fetch_tml, fetch_deps, skip_ids=(), skip_names=()
         blocked.append({"id": oid, "name": obj.get("name"),
                         "reason": f"unsupported object kind \'{kind}\' — resolve it by hand"})
 
-    return actions, blocked, reached, no_ref
+    return actions, blocked, reached, no_ref, bystanders
 
 
 def plan_summary(actions, blocked):
@@ -207,7 +236,8 @@ def plan_summary(actions, blocked):
     return lines
 
 
-def plan_tree(candidates, column_names, fetch_tml, fetch_deps, skip_ids=(), skip_names=()):
+def plan_tree(candidates, column_names, fetch_tml, fetch_deps, skip_ids=(), skip_names=(),
+              qualified=()):
     """The same walk, kept in its TREE shape so the operator picks roots rather than rows.
 
     ThoughtSpot's 14544 message lists every dependent flat, at every level, which reads as a set
@@ -231,8 +261,11 @@ def plan_tree(candidates, column_names, fetch_tml, fetch_deps, skip_ids=(), skip
     A dependency cycle would leave every node with a parent and so produce no roots at all; the
     seeded candidates are used as roots in that case rather than showing an empty list.
     """
-    actions, blocked, reached, no_ref = _walk(candidates, column_names, fetch_tml, fetch_deps,
-                                              skip_ids, skip_names)
+    # The candidate names ARE what ThoughtSpot called out as blocking, so they decide
+    # whether an unreadable object found by recursion is a real blocker or a bystander.
+    actions, blocked, reached, no_ref, _bys = _walk(
+        candidates, column_names, fetch_tml, fetch_deps, skip_ids, skip_names,
+        named=[c.get("name") for c in (candidates or [])], qualified=qualified)
     named = {str(c.get("id")) for c in (candidates or [])}
     disputed = [n for n in no_ref if n["id"] in named]
     nodes = {a["id"]: dict(a, children=[]) for a in actions}

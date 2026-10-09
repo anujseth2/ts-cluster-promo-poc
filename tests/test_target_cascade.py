@@ -58,7 +58,7 @@ def test_an_object_that_cannot_be_read_blocks_the_whole_cascade():
         [{"id": "hidden", "name": "Someone Else's Model", "type": "LOGICAL_TABLE"}],
         {"gender"}, lambda i: None, lambda i: [])
     assert actions == []
-    assert blocked and "cannot see it" in blocked[0]["reason"]
+    assert blocked and "could not be read" in blocked[0]["reason"]
 
 
 def test_a_board_whose_every_tile_uses_the_column_is_deleted_whole():
@@ -529,3 +529,64 @@ def test_a_different_kind_of_error_is_never_lag():
     assert stale_after_apply(
         [{"error": "DataType mismatch for column <b>PATIENT_AGE</b>."}],
         planned_names(actions)) is False
+
+
+# ── two things the GSK run of 2026-10-09 got wrong ───────────────────────────────────────────
+
+def test_an_unreadable_bystander_does_not_refuse_the_whole_cascade():
+    """ThoughtSpot's 14544 list is authoritative about what blocks.
+
+    Walking a model's dependents returns everything hanging off it, most of which has nothing to
+    do with the dropped column. One of those was unreadable and refused the entire cascade, while
+    the platform had never named it as blocking anything.
+    """
+    tml = {"m":  _model("Regional Ops Model", ["gender"]),
+           "a1": _answer("Gender Split", "gender")}
+    deps = {"m": [{"id": "a1", "name": "Gender Split", "type": "QUESTION_ANSWER_BOOK"},
+                  {"id": "x", "name": "Unique Count by Something Else",
+                   "type": "QUESTION_ANSWER_BOOK"}]}          # unreadable, never named
+    roots, nodes, blocked, _d = plan_tree(
+        [{"id": "m", "name": "Regional Ops Model", "type": "LOGICAL_TABLE"},
+         {"id": "a1", "name": "Gender Split", "type": "ANSWER"}],
+        {"gender"}, tml.get, lambda i: deps.get(i, []))
+    assert blocked == [], f"a bystander stopped the cascade: {blocked}"
+    assert sorted(nodes) == ["a1", "m"]
+
+
+def test_an_unreadable_object_the_platform_DID_name_still_blocks():
+    # The gate has to keep working for the case it was built for.
+    roots, nodes, blocked, _d = plan_tree(
+        [{"id": "hidden", "name": "Someone Else's Model", "type": "LOGICAL_TABLE"}],
+        {"gender"}, lambda i: None, lambda i: [])
+    assert nodes == {} and blocked
+    assert "named it as blocking" in blocked[0]["reason"]
+
+
+def test_a_same_named_column_on_another_table_is_not_stripped():
+    """GSK 2026-10-09: dropping dim_customer_guidance::SEGMENT planned a strip of
+    dim_air_customer_guidance::SEGMENT, a different table the operator never touched."""
+    doc = {"model": {"name": "M", "model_tables": [{"name": "t"}], "columns": [
+        {"name": "Segment",     "column_id": "dim_customer_guidance_respbio_br::SEGMENT"},
+        {"name": "Air Segment", "column_id": "dim_air_customer_guidance_respbio_br::SEGMENT"},
+        {"name": "Brand",       "column_id": "fact_subnational_respbio_br::ddd_brand_status"}]}}
+    import json as _j
+    actions, _b = plan_cascade(
+        [{"id": "m", "name": "M", "type": "LOGICAL_TABLE"}],
+        # the bare spellings scan_names_for_drops produces, plus the qualified truth
+        {"segment", "dim_customer_guidance_respbio_br::segment", "ddd_brand_status"},
+        lambda i: _j.dumps(doc), lambda i: [],
+        qualified={"dim_customer_guidance_respbio_br::SEGMENT"})
+    assert actions[0]["removed"] == ["dim_customer_guidance_respbio_br::SEGMENT",
+                                     "fact_subnational_respbio_br::ddd_brand_status"], \
+        "the AIR table's SEGMENT must not be touched"
+
+
+def test_a_bare_column_with_no_table_known_still_matches():
+    # ThoughtSpot's error names a column without its table, and that must still work.
+    doc = {"model": {"name": "M", "model_tables": [{"name": "t"}], "columns": [
+        {"name": "Brand", "column_id": "fact_subnational_respbio_br::ddd_brand_status"}]}}
+    import json as _j
+    actions, _b = plan_cascade([{"id": "m", "name": "M", "type": "LOGICAL_TABLE"}],
+                               {"ddd_brand_status"}, lambda i: _j.dumps(doc), lambda i: [],
+                               qualified=set())
+    assert actions[0]["removed"] == ["fact_subnational_respbio_br::ddd_brand_status"]
