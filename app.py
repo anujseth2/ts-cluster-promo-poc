@@ -32,13 +32,14 @@ from services.import_diagnostics import (
     restore_unneeded_type_changes, promotion_plan, scan_names_for_drops,
     dependents_using_columns,
     blocking, warnings_only, is_blocking_result, drop_column_properties,
+    all_or_none_outcome, NOT_IMPORTED,
 )
 from services.target_cascade import (
     plan_tree, subtree_actions, tree_lines, dry_run_plan, snapshot_plan, apply_order,
     planned_names, missing_capabilities, stale_after_apply,
 )
 from services.table_matcher import column_signature
-from services.feedback_replace import feedback_preview, replace_prep, replace_finalize
+from services.feedback_replace import feedback_preview, replace_prep, replace_finalize, replace_undo
 from services.reconcile import reconcile
 from services.nl_instructions import preview as nl_preview, promote as nl_promote
 from ui_feedback import render_feedback_panel, render_nl_panel
@@ -155,7 +156,8 @@ def _run_validation(items, step=None):
     step: optional callable(str) to report progress to the UI."""
     _tick = step or (lambda _m: None)
     # Any re-export invalidates a partial import in progress — reset the import phase.
-    for _k in ("import_phase", "import_core_results", "import_leaf_files", "import_leaf_errors"):
+    for _k in ("import_phase", "import_core_results", "import_leaf_files", "import_leaf_errors",
+               "import_core_failed", "merge_failed"):
         st.session_state.pop(_k, None)
     _tick("① Writing TML files to the dev branch…")
     files  = items_to_files(items)
@@ -832,7 +834,7 @@ def _prepare_bundle():
         if "transformed_items" in st.session_state:
             for _k in ("pr_url", "validation_errors", "validation_ok", "import_phase",
                        "import_core_results", "import_leaf_files", "import_leaf_errors",
-                       "silent_drops", "_fb_previews", "_nl_previews", "nl_report",
+                       "import_core_failed", "merge_failed", "silent_drops", "_fb_previews", "_nl_previews", "nl_report",
                        "fb_replace_report", "_casing_diag"):
                 st.session_state.pop(_k, None)
         with st.status("Preparing the promotion bundle…", expanded=True) as _exp_status:
@@ -2407,7 +2409,8 @@ elif step == 3:
             step: optional callable(str) to report progress to the UI."""
             _tick = step or (lambda _m: None)
             # Any re-export invalidates a partial import in progress — reset the import phase.
-            for _k in ("import_phase", "import_core_results", "import_leaf_files", "import_leaf_errors"):
+            for _k in ("import_phase", "import_core_results", "import_leaf_files", "import_leaf_errors",
+                       "import_core_failed", "merge_failed"):
                 st.session_state.pop(_k, None)
             files  = items_to_files(items)
             # Validate ONLY this run's files (not the whole team folder — the repo accumulates TML
@@ -4449,8 +4452,42 @@ elif step == 4:
             st.divider()
             import_phase = st.session_state.get("import_phase")
 
+            if st.session_state.get("merge_failed") and import_phase in ("complete", "leaves_pending"):
+                st.warning("Tables and models are imported, but the pull request could not be "
+                           "merged, so `main` does not yet match what is on the target. Merge it on "
+                           f"GitHub: {st.session_state.get('pr_url', '(no PR link recorded)')}")
+
             if import_phase == "complete":
                 st.success("Import complete.")
+
+            elif import_phase == "core_failed":
+                _cf = st.session_state.get("import_core_failed") or {}
+                st.error("**Nothing was imported.** Tables and models go in as one all-or-nothing "
+                         "batch, and ThoughtSpot refused part of it, so it applied none of them. "
+                         "Spotter feedback, Spotter instructions, liveboards and answers were not "
+                         "attempted"
+                         + (", and `main` in Git was not changed." if not _cf.get("nochange")
+                            else "."))
+                st.markdown("**What ThoughtSpot refused:**")
+                for _r in _cf.get("results", []):
+                    if _r.get("status") != NOT_IMPORTED:
+                        st.markdown(f"- **{_r.get('name') or 'unknown'}** ({_r.get('status')})")
+                        st.code(_r.get("error") or "(no message)", language=None)
+                _held = [r.get("name") for r in _cf.get("results", []) if r.get("status") == NOT_IMPORTED]
+                if _held:
+                    st.caption("Not imported either, although ThoughtSpot listed them as OK: "
+                               + ", ".join(f"`{n}`" for n in _held))
+                for _u in _cf.get("replace", []):
+                    if _u["restored"]:
+                        st.caption(f"Feedback Replace undone: **{_u['model']}** has its obj_id back.")
+                    else:
+                        st.error(f"Feedback Replace could NOT be undone for **{_u['model']}**: its "
+                                 "obj_id is still parked under the `__replaced` suffix on the "
+                                 f"target. Rename it back before the next run. {_u['detail']}")
+                if st.button("Back to Merge & Import", key="core_failed_back"):
+                    for _k in ("import_phase", "import_core_failed"):
+                        st.session_state.pop(_k, None)
+                    st.rerun()
 
             elif import_phase == "leaves_pending":
                 # Phase 2: tables + models are imported; liveboards/answers were VALIDATE_ONLY'd
@@ -4485,6 +4522,9 @@ elif step == 4:
                     if drop_ids:
                         leaf_items, dropped_v = drop_vizzes(leaf_items, drop_ids)
                     leaf_strings = [it["edoc"] for it in leaf_items]
+                    # Left PARTIAL on purpose: the operator has just been told that an unticked viz
+                    # imports with the platform skipping it, and chose that. How ALL_OR_NONE treats
+                    # a skipped viz has not been tested, so this path keeps the behaviour they agreed to.
                     with st.spinner("Importing liveboards / answers to the target cluster…"):
                         leaf_results = target_client().import_tml(leaf_strings) if leaf_strings else []
                     st.session_state.import_results = st.session_state.get("import_core_results", []) + leaf_results
@@ -4756,32 +4796,36 @@ elif step == 4:
                 if st.button("Merge & Import to Target", type="primary",
                              disabled=not (proceed and replace_ack and nl_ack)):
                     gc = git_client()
+                    _nochange = bool(st.session_state.get("_git_nochange"))
 
-                    if st.session_state.get("_git_nochange"):
+                    # main moves only AFTER the import lands. Merging first meant a failed import
+                    # left main claiming a deployment that never happened, so the import reads this
+                    # run's TML from the PR's own branch and the PR is merged once tables + models
+                    # are in.
+                    if _nochange:
                         # main already holds this exact TML — there is nothing to merge. Skip the
                         # merge (and don't manufacture an empty PR just to merge it) and import
                         # straight from what main already has.
                         st.info("No Git changes to merge — `main` already has this exact TML. "
                                 "Importing from it directly.")
-                    else:
-                        with st.spinner("Merging PR…"):
-                            merged = gc.merge_pr()
-                            if not merged:
-                                # PR was already merged — re-commit and open a fresh PR
-                                _res = _safe_validate(filtered_items)
-                                if not _res:
-                                    st.stop()
-                                pr_url, err, ok = _res
-                                st.session_state.pr_url = pr_url
-                                if err:
-                                    st.session_state.validation_errors = err
-                                    st.session_state.validation_ok = ok
-                                    st.session_state.pop("silent_drops", None)
-                                    st.rerun()
-                                merged = gc.merge_pr()
-                            if not merged:
-                                st.error("Could not find or create a PR to merge.")
-                                st.stop()
+                    elif not gc.get_open_pr():
+                        # PR was already merged or closed — re-commit and open a fresh PR
+                        _res = _safe_validate(filtered_items)
+                        if not _res:
+                            st.stop()
+                        pr_url, err, ok = _res
+                        st.session_state.pr_url = pr_url
+                        if err:
+                            st.session_state.validation_errors = err
+                            st.session_state.validation_ok = ok
+                            st.session_state.pop("silent_drops", None)
+                            st.rerun()
+                        if not gc.get_open_pr():
+                            st.error("Could not find or create a PR to merge.")
+                            st.stop()
+                    _import_branch = gc.MAIN_BRANCH if _nochange else gc.DEV_BRANCH
+                    for _k in ("import_results", "import_core_failed", "merge_failed"):
+                        st.session_state.pop(_k, None)
 
                     # Feedback REPLACE (opt-in): free each existing target model's obj_id BEFORE import
                     # so the import creates a fresh model (clean feedback). Deps are re-pointed and the
@@ -4829,14 +4873,33 @@ elif step == 4:
                         # promotions; without this filter the import would re-import unrelated
                         # tables/models from earlier runs (the "10 tables for a 3-table model" bug).
                         cur_paths = set(items_to_files(filtered_items).keys())
-                        tml_files = {p: c for p, c in gc.get_tml_files(team_name).items() if p in cur_paths}
+                        tml_files = {p: c for p, c in gc.get_tml_files(team_name, branch=_import_branch).items()
+                                     if p in cur_paths}
                         core     = {p: c for p, c in tml_files.items()
                                     if p.startswith(("tables/", "models/"))}
                         feedback = {p: c for p, c in tml_files.items()
                                     if p.startswith("feedback/")}
                         leaves   = {p: c for p, c in tml_files.items()
                                     if not p.startswith(("tables/", "models/", "feedback/"))}
-                        core_results = target_client().import_tml(files_to_tml_strings(core)) if core else []
+                        # Tables + models go in as ONE all-or-nothing batch, and a failure there
+                        # stops the run. Under PARTIAL a model that failed here let the run carry on
+                        # into feedback, instructions and the leaves, and import liveboards over a
+                        # model that never landed, with nobody asked. Validation ran first, so this
+                        # only catches what it could not predict, which is exactly when to stop.
+                        core_results = (target_client().import_tml(files_to_tml_strings(core),
+                                                                   policy="ALL_OR_NONE")
+                                        if core else [])
+                        core_landed, core_results = all_or_none_outcome(core_results)
+                        if not core_landed:
+                            st.session_state.import_core_failed = {
+                                "results":  core_results,
+                                "replace":  replace_undo(target_client(), fb_prepped) if fb_prepped else [],
+                                "nochange": _nochange,
+                            }
+                            st.session_state.import_phase = "core_failed"
+                            st.rerun()
+                        if not _nochange and not gc.merge_pr():
+                            st.session_state.merge_failed = True
                         # Feedback imports in a SEPARATE call AFTER tables+models commit. A first-time
                         # model+feedback in ONE batch fails (error 14500: feedback can't resolve the
                         # not-yet-committed model by obj_id) — and under ALL_OR_NONE that rolls the
@@ -4868,8 +4931,13 @@ elif step == 4:
                         st.session_state.import_phase = "leaves_pending"
                         st.rerun()
                     else:
+                        # They validated clean, so they go in all-or-nothing too: anything that fails
+                        # now is unforeseen, and nobody agreed to a board landing without it.
                         with st.spinner("Importing liveboards / answers…"):
-                            leaf_results = target_client().import_tml(list(leaves.values())) if leaves else []
+                            leaf_results = (target_client().import_tml(list(leaves.values()),
+                                                                       policy="ALL_OR_NONE")
+                                            if leaves else [])
+                            _, leaf_results = all_or_none_outcome(leaf_results)
                         st.session_state.import_results = core_results + leaf_results
                         st.session_state.pop("recon_report", None)   # re-verify against target for this run
                         st.session_state.import_phase = "complete"

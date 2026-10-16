@@ -86,6 +86,24 @@ def replace_prep(target_client, models: List[Dict]) -> List[Dict]:
     return prepped
 
 
+def replace_undo(target_client, prepped: List[Dict]) -> List[Dict]:
+    """When the import that should have created the fresh models FAILED: give each old model its
+    obj_id back, so the target is left as it was and the next run aligns to it again rather than
+    creating a duplicate beside a model still parked under the __replaced suffix. Reads each one
+    back instead of trusting the rename call. Returns [{model, restored, detail}]."""
+    report = []
+    for p in prepped:
+        obj_id, old_guid = p["obj_id"], p["old_guid"]
+        try:
+            target_client.update_obj_ids([{"identifier": old_guid, "new_obj_id": obj_id}])
+            ok = target_client.find_by_obj_id(obj_id) == old_guid
+            detail = "" if ok else f"rename sent, but {obj_id!r} does not resolve to the old model"
+        except Exception as e:
+            ok, detail = False, str(e)[:200]
+        report.append({"model": p["name"], "restored": ok, "detail": detail})
+    return report
+
+
 def replace_finalize(target_client, prepped: List[Dict]) -> List[Dict]:
     """AFTER import (the fresh model + source feedback now hold the aligned obj_id): re-point the
     old model's real dependents onto the fresh model, then delete the old model IFF no real

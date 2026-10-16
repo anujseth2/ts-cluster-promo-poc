@@ -36,6 +36,7 @@ Grounded in the exact messages observed live (ps-internal, 2026-06-25):
 
 import json
 import re
+from typing import Dict, List, Tuple
 
 from services.table_matcher import column_signature, compare_columns
 
@@ -1862,3 +1863,31 @@ def drop_tables(items, table_names):
                         tab["tiles"] = _prune(tab["tiles"])
         out.append({**item, "edoc": json.dumps(doc)})
     return out, summary
+
+
+NOT_IMPORTED = "NOT_IMPORTED"
+
+
+def all_or_none_outcome(results: List[Dict]) -> Tuple[bool, List[Dict]]:
+    """Read an ALL_OR_NONE import as the platform APPLIED it, not as it REPORTED it.
+
+    When one object in an ALL_OR_NONE batch fails, ThoughtSpot applies none of them but still
+    reports the valid ones as OK, GUID and all. Verified on ps-internal 2026-10-16: a model whose
+    description changed, batched with a table carrying a column absent from the warehouse, came
+    back OK, yet the description was unchanged a minute later; the same batch under PARTIAL
+    landed it. Taken at face value those OK rows tell the operator an object was imported when it
+    was not. Returns (landed, rows) with every OK/WARNING row of a failed batch restated as
+    NOT_IMPORTED, so nothing downstream can count it as a success.
+    """
+    def _ok(r):
+        return (r.get("status") or "").upper() in ("OK", "WARNING")
+
+    if all(_ok(r) for r in results):
+        return True, list(results)
+    return False, [
+        {**r, "status": NOT_IMPORTED,
+         "error": "Not imported: another object in the same all-or-nothing batch failed, "
+                  "so ThoughtSpot applied none of them."}
+        if _ok(r) else r
+        for r in results
+    ]
