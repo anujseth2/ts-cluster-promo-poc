@@ -39,6 +39,7 @@ from services.target_cascade import (
     planned_names, missing_capabilities, stale_after_apply,
 )
 from services.table_matcher import column_signature
+from services.version_info import version_info, version_label
 from services.connection_map import (
     connections_in, saved_map, effective_map, unmapped as unmapped_connections, target_for,
 )
@@ -742,6 +743,15 @@ st.set_page_config(
 )
 
 st.title("ThoughtSpot Cross-Cluster Promotion")
+
+
+@st.cache_data(ttl=30)
+def _running_version() -> str:
+    return version_label(version_info(Path(__file__).parent))
+
+
+# Which build this is, under the title so any screenshot shows it.
+st.caption(f"Running {_running_version()}")
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 
