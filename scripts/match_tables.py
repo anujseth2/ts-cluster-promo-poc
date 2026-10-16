@@ -96,6 +96,13 @@ def col_summary(cols):
 def run(do_align):
     team_name, cfg = load_team()
     src_conn, tgt_conn = cfg.get("source_connection", ""), cfg.get("target_connection", "")
+    # Configs saved by the connection picker carry a mapping instead of one pair. The matcher
+    # scopes to a single pair, so use it when there is exactly one; otherwise match unscoped.
+    _cmap = cfg.get("connection_map") or {}
+    if not (src_conn or tgt_conn) and len(_cmap) == 1:
+        src_conn, tgt_conn = next(iter(_cmap.items()))
+    elif not (src_conn or tgt_conn) and len(_cmap) > 1:
+        print(f"Team maps {len(_cmap)} connections; matching across all of them (unscoped).")
     print(f"Team: {team_name}   source_conn='{src_conn}'  target_conn='{tgt_conn}'\n")
 
     dev, test = client("TS_SOURCE"), client("TS_TARGET")

@@ -38,6 +38,9 @@ from services.target_cascade import (
     planned_names, missing_capabilities, stale_after_apply,
 )
 from services.table_matcher import column_signature
+from services.connection_map import (
+    connections_in, saved_map, effective_map, unmapped as unmapped_connections, target_for,
+)
 from services.feedback_replace import feedback_preview, replace_prep, replace_finalize
 from services.reconcile import reconcile
 from services.nl_instructions import preview as nl_preview, promote as nl_promote
@@ -548,20 +551,54 @@ def _log_apply_detail(tag, drop_set, man, pruned, items):
 # Source-warehouse reads — promoted to module level so BOTH Source Audit (2b) and any
 # other page can diff the promotion against the source CDW. Pure: session_state + globals.
 # ────────────────────────────────────────────────────────────────────────────
+def _target_connection_names():
+    """(names, error) for the target cluster's connections, read once per session. `names` is
+    None when the read failed, so a caller can tell "the target has none" from "couldn't check"."""
+    if "_tgt_conn_names" not in st.session_state:
+        try:
+            st.session_state._tgt_conn_names = (target_client().list_connection_names(), None)
+        except Exception as e:
+            st.session_state._tgt_conn_names = (None, str(e))
+    return st.session_state._tgt_conn_names
+
+
+def _target_conn_label() -> str:
+    """The target connection(s) this bundle points at, for findings that name a connection."""
+    return ", ".join(sorted({v for v in (st.session_state.get("_export_conn_map") or {}).values()
+                             if v}))
+
+
+def _source_table_coords() -> dict:
+    """db / schema / db_table and the source connection of every promoted table, read from the
+    RAW source export (before any remap), keyed by lowercased table name."""
+    out = {}
+    for it in st.session_state.get("_source_raw_items", []):
+        t = _parse_edoc(it.get("edoc", "{}")).get("table") or {}
+        if t.get("name"):
+            out[t["name"].strip().lower()] = {
+                "name": t["name"], "database": t.get("db", ""),
+                "schema": t.get("schema", ""), "table": t.get("db_table", ""),
+                "connection": (t.get("connection") or {}).get("name", "")}
+    return out
+
+
+def _by_connection(tables, key="connection") -> dict:
+    """Group table coordinates by the connection they sit on, so a connection read asks each
+    connection only about its own tables."""
+    groups = {}
+    for t in tables:
+        if t.get(key):
+            groups.setdefault(t[key], []).append(t)
+    return groups
+
+
 def _read_source_col_map():
     """The SOURCE warehouse's column SET (names) for every promoted table, so the TML can be
     diffed against it (columns present in the TML but gone from the source CDW). hive SHOW
     COLUMNS via the source DBX creds (falling back to target for now), else source
     connection/search. Source coordinates come from the raw source export, pre-remap.
     Returns {table_lower: {col_lower: actual_case}} — same shape as the target map."""
-    coord_by_name = {}
-    for it in st.session_state.get("_source_raw_items", []):
-        t = _parse_edoc(it.get("edoc", "{}")).get("table") or {}
-        if t.get("name"):
-            coord_by_name[t["name"].strip().lower()] = {
-                "name": t["name"], "database": t.get("db", ""),
-                "schema": t.get("schema", ""), "table": t.get("db_table", "")}
-    tbls = list(coord_by_name.values())
+    tbls = list(_source_table_coords().values())
     out = {}
     if not tbls:
         return out
@@ -574,12 +611,12 @@ def _read_source_col_map():
             out.update(hive_column_cases(_host, _whid, _tok, tbls, opt_env("TS_PROXY")))
         except Exception:
             pass
-    _conn = (teams[team_name].get("source_connection", "")
-             or teams[team_name].get("target_connection", ""))
+    # Anything the direct read didn't cover: ask the SOURCE cluster, through the connection each
+    # table actually sits on.
     _rest = [t for t in tbls if (t.get("name") or "").strip().lower() not in out]
-    if _rest and _conn:
+    for _conn, _grp in _by_connection(_rest).items():
         try:
-            out.update(source_client().connection_column_cases(_conn, _rest))
+            out.update(source_client().connection_column_cases(_conn, _grp))
         except Exception:
             pass
     return out
@@ -588,14 +625,7 @@ def _read_source_type_map():
     """The SOURCE warehouse's TYPE per column for every promoted table (DESCRIBE), so the
     promotion can be diffed against source types + casing in one pass. Same creds/coords as
     _read_source_col_map. Returns {table_lower: {col_lower: type_string}}."""
-    coord_by_name = {}
-    for it in st.session_state.get("_source_raw_items", []):
-        t = _parse_edoc(it.get("edoc", "{}")).get("table") or {}
-        if t.get("name"):
-            coord_by_name[t["name"].strip().lower()] = {
-                "name": t["name"], "database": t.get("db", ""),
-                "schema": t.get("schema", ""), "table": t.get("db_table", "")}
-    tbls = list(coord_by_name.values())
+    tbls = list(_source_table_coords().values())
     out = {}
     if not tbls:
         return out
@@ -608,12 +638,10 @@ def _read_source_type_map():
             out.update(hive_column_types(_host, _whid, _tok, tbls, opt_env("TS_PROXY")))
         except Exception:
             pass
-    _conn = (teams[team_name].get("source_connection", "")
-             or teams[team_name].get("target_connection", ""))
     _rest = [t for t in tbls if (t.get("name") or "").strip().lower() not in out]
-    if _rest and _conn:
+    for _conn, _grp in _by_connection(_rest).items():
         try:
-            out.update(source_client().connection_column_types(_conn, _rest))
+            out.update(source_client().connection_column_types(_conn, _grp))
         except Exception:
             pass
     return out
@@ -740,14 +768,32 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Connections")
-    st.caption("Remap connection references from the source to the target cluster.")
-
-    src_conn = st.text_input("Source connection name",
-                             value=team_cfg.get("source_connection", ""),
-                             key="src_conn")
-    tgt_conn = st.text_input("Target connection name",
-                             value=team_cfg.get("target_connection", ""),
-                             key="tgt_conn")
+    st.caption("For each connection the promoted content uses, the target connection it should "
+               "point at.")
+    # Rows: the connections in the current export, plus any this team already has a choice for.
+    # Choices come from the target cluster's own list, so nothing has to be typed or guessed.
+    _found_c = st.session_state.get("_export_conn_names") or []
+    _saved_c = saved_map(team_cfg, _found_c)
+    _tnames, _terr = _target_connection_names()
+    _CHOOSE = "(choose a target connection)"
+    _conn_picks = {}
+    if not (set(_found_c) | set(_saved_c)):
+        st.caption("_Listed here once the selection has been prepared on Source Audit._")
+    for _sc in sorted(set(_found_c) | set(_saved_c)):
+        _cur = _saved_c.get(_sc) or (_sc if _tnames and _sc in _tnames else "")
+        _ck = f"connmap::{team_name}::{_sc}"
+        if _tnames is not None:
+            _opts = [_CHOOSE] + list(_tnames) + ([_cur] if _cur and _cur not in _tnames else [])
+            _v = st.selectbox(_sc, _opts, index=_opts.index(_cur) if _cur else 0, key=_ck,
+                              help="Target connection for content on this source connection.")
+            _conn_picks[_sc] = "" if _v == _CHOOSE else _v
+        else:
+            _conn_picks[_sc] = st.text_input(_sc, value=_cur, key=_ck).strip()
+    if _terr:
+        st.warning(f"Couldn't read the target's connections: {_terr}")
+    if st.button("↻ Refresh target connections", key="refresh_tgt_conns"):
+        st.session_state.pop("_tgt_conn_names", None)
+        st.rerun()
 
     st.caption("Remap the database / schema names too (leave blank to keep them as-is).")
     _dbm0 = team_cfg.get("db_map", {}) or {}
@@ -763,11 +809,23 @@ with st.sidebar:
         tgt_sc = st.text_input("Target schema",   value=_tgt_sc0, key="tgt_sc")
 
     if st.button("Save connection config"):
-        teams[team_name]["source_connection"] = src_conn
-        teams[team_name]["target_connection"] = tgt_conn
+        _before = (st.session_state.get("_export_conn_map"),
+                   teams[team_name].get("db_map", {}), teams[team_name].get("schema_map", {}))
+        # Keep choices for connections outside this export; this export's rows override them.
+        _keep = {k: v for k, v in _saved_c.items() if k not in _conn_picks}
+        teams[team_name]["connection_map"] = {**_keep, **{k: v for k, v in _conn_picks.items() if v}}
+        # The mapping replaces the single source/target pair; blank them so an older reading of
+        # the config can't resurface underneath it.
+        teams[team_name]["source_connection"] = ""
+        teams[team_name]["target_connection"] = ""
         teams[team_name]["db_map"]     = {src_db.strip(): tgt_db.strip()} if src_db.strip() and tgt_db.strip() else {}
         teams[team_name]["schema_map"] = {src_sc.strip(): tgt_sc.strip()} if src_sc.strip() and tgt_sc.strip() else {}
         save_teams(teams)
+        _after = (effective_map(teams[team_name], _found_c, _tnames),
+                  teams[team_name]["db_map"], teams[team_name]["schema_map"])
+        # A bundle prepared under the old choices is stale: prepare it again on the next page.
+        if "transformed_items" in st.session_state and _after != _before:
+            st.session_state._conn_dirty = True
         st.success("Saved.")
 
     st.divider()
@@ -825,9 +883,10 @@ def _prepare_bundle():
     # changed since the last export (consume the dirty flag). Plain navigation back to this page
     # (Home / breadcrumb) does none of these, so the last stage is preserved.
     _objids_dirty = st.session_state.pop("_objids_dirty", False)
+    _conn_dirty = st.session_state.pop("_conn_dirty", False)   # connection choices changed
     _need_export = ("transformed_items" not in st.session_state
                     or st.session_state.get("_export_fb_state") != _fb_state
-                    or _objids_dirty)
+                    or _objids_dirty or _conn_dirty)
     if selected_ids and _need_export:
         if "transformed_items" in st.session_state:
             for _k in ("pr_url", "validation_errors", "validation_ok", "import_phase",
@@ -868,6 +927,13 @@ def _prepare_bundle():
                     fb_items = filter_feedback(
                         fb_items, st.session_state.get("feedback_selected"))
                     items = items + fb_items
+            # Which connections this content sits on, and the target connection each one points at:
+            # the saved choice, else a target connection with the same name.
+            _found_conns = connections_in(items)
+            _tgt_names, _tgt_names_err = _target_connection_names()
+            _cmap = effective_map(teams[team_name], _found_conns, _tgt_names)
+            st.session_state._export_conn_names = _found_conns
+            st.session_state._export_conn_map = _cmap
             # Align promoted table columns to the TARGET warehouse's casing. Some warehouses bind
             # external columns case-sensitively (e.g. Databricks), so a source column CID cannot
             # import against a target column cid. Primary source of truth is the TARGET connection
@@ -890,9 +956,10 @@ def _prepare_bundle():
                     "schema":   _scm.get(t.get("schema", ""), t.get("schema", "")),
                     "table":    tr.get("db_table") or t.get("db_table", ""),
                     "connection": (t.get("connection") or {}).get("name", ""),
+                    "target_connection": target_for(
+                        (t.get("connection") or {}).get("name", ""), _cmap),
                 })
             column_case_map = {}
-            tgt_conn = teams[team_name].get("target_connection", "")
             st.write("② Reading column casing from tables already on the target (fast)…")
             # FAST PATH ONLY during export — a TML metadata read of tables already modeled on the
             # target, no warehouse round-trip. The authoritative CDW column read (via connection/
@@ -939,7 +1006,6 @@ def _prepare_bundle():
             # Persist coords + connection so the opt-in "verify against the warehouse" button can
             # issue the (slow) connection read without re-exporting.
             st.session_state._promoted_coords = promoted
-            st.session_state._promoted_tgt_conn = tgt_conn
             # Stash the RAW source export (pre-transform, pre-drop) so a debug bundle carries the
             # original model+tables — the true joins/columns before any remap or cascade. Captured
             # here, as it happens; edocs are strings so a shallow per-item copy is enough.
@@ -975,12 +1041,11 @@ def _prepare_bundle():
             st.write("③ Applying the data-layer transform (connection remap, obj_ids, column casing)…")
             transformed_items, warnings = transform_items(
                 items,
-                source_connection=teams[team_name].get("source_connection", ""),
-                target_connection=teams[team_name].get("target_connection", ""),
                 db_map=teams[team_name].get("db_map", {}),
                 schema_map=teams[team_name].get("schema_map", {}),
                 table_remap=st.session_state.get("table_remap", {}),
                 column_case_map=applied_case_map,
+                connection_map=_cmap,
             )
             # Prune any tables the user chose to drop out of the model (not-on-target excludes).
             prune = st.session_state.get("prune_tables", set())
@@ -1011,17 +1076,12 @@ def _prepare_bundle():
             st.session_state.warnings          = warnings
             st.session_state._export_fb_state  = _fb_state   # what feedback choice this export reflects
             st.session_state.pop("_fb_previews", None)   # recompute feedback preview vs the fresh export
-            # Flag if a configured source_connection matches NO connection in the exported
-            # tables (the remap would silently skip -> import failure on the target).
-            src_conn   = teams[team_name].get("source_connection", "")
-            conn_names = set()
-            for it in items:
-                c = (_parse_edoc(it.get("edoc", "{}")).get("table", {}) or {}).get("connection", {})
-                if isinstance(c, dict) and c.get("name"):
-                    conn_names.add(c["name"])
+            # A connection with no target to point at would fail on import. Only claim that when the
+            # target's list was actually read; otherwise say the check couldn't run.
+            _unm = unmapped_connections(_found_conns, _cmap)
             st.session_state.conn_mismatch = (
-                {"configured": src_conn, "found": sorted(conn_names)}
-                if src_conn and conn_names and src_conn not in conn_names else None)
+                {"unmapped": _unm, "found": _found_conns, "target_err": _tgt_names_err}
+                if _unm else None)
             _exp_status.update(
                 label=f"Bundle ready — {len(transformed_items)} object(s) prepared.",
                 state="complete", expanded=False)
@@ -1888,8 +1948,7 @@ elif step == 2:
         st.info("Preparing the bundle — if this doesn't clear, check the source connection and retry.")
     else:
         import pandas as pd
-        _src_conn = (teams[team_name].get("source_connection", "")
-                     or teams[team_name].get("target_connection", ""))
+        _src_conn = ", ".join(st.session_state.get("_export_conn_names") or [])
 
         # Apply approved drops to the bundle and make them DURABLE via skip_columns, so a later
         # re-export (e.g. after applying a recasing) re-drops them instead of silently bringing them
@@ -2225,15 +2284,20 @@ elif step == 3:
     if not selected_ids:
         st.info("Select assets in Step 1 first.")
     elif cm:
-        st.error(
-            f"Source connection `{cm['configured']}` matches no connection in the exported tables, "
-            "so the remap is skipped and import will fail on the target. Connections present: "
-            + ", ".join(f"`{n}`" for n in cm["found"])
-            + ". Set the source connection in the sidebar to one of those exactly, or blank it.")
-        if st.button("Re-export after fixing the connection"):
-            for _k in ("transformed_items", "conn_mismatch", "warnings"):
-                st.session_state.pop(_k, None)
-            st.rerun()
+        _unm_list = ", ".join(f"`{n}`" for n in cm["unmapped"])
+        if cm.get("target_err"):
+            st.error(f"Couldn't read the target cluster's connections ({cm['target_err']}), so "
+                     f"there's no way to check where {_unm_list} should point. Retry the read, or "
+                     "type the target connection for each one in the sidebar under **Connections** "
+                     "and save.")
+            if st.button("↻ Read the target's connections again"):
+                st.session_state.pop("_tgt_conn_names", None)
+                st.session_state._conn_dirty = True
+                st.rerun()
+        else:
+            st.error(f"The promoted content uses {_unm_list}, and the target has no connection "
+                     "chosen for it and none with the same name. Import would fail. Pick its "
+                     "target connection in the sidebar under **Connections**, then save.")
     elif transformed_items is None:
         st.info("Nothing to promote.")
     else:
@@ -2762,12 +2826,10 @@ elif step == 3:
                 except Exception:
                     pass
             # 2) connection/search COLUMN for any table hive didn't cover (non-hive warehouses).
-            _conn = (st.session_state.get("_promoted_tgt_conn")
-                     or teams[team_name].get("target_connection", ""))
             _rest = [t for t in tbls if (t.get("name") or "").strip().lower() not in wh]
-            if _rest and _conn:
+            for _conn, _grp in _by_connection(_rest, key="target_connection").items():
                 try:
-                    wh.update(target_client().connection_column_types(_conn, _rest))
+                    wh.update(target_client().connection_column_types(_conn, _grp))
                 except Exception:
                     pass
             # Stash the FULL per-table warehouse type map (all columns of the mismatched tables, as
@@ -2805,13 +2867,7 @@ elif step == 3:
             if not want:
                 return {}
             # Source coordinates from the raw source TML (db / schema / db_table before any remap).
-            coord_by_name = {}
-            for it in st.session_state.get("_source_raw_items", []):
-                t = _parse_edoc(it.get("edoc", "{}")).get("table") or {}
-                if t.get("name"):
-                    coord_by_name[t["name"].strip().lower()] = {
-                        "name": t["name"], "database": t.get("db", ""),
-                        "schema": t.get("schema", ""), "table": t.get("db_table", "")}
+            coord_by_name = _source_table_coords()
             tbls = [coord_by_name[n.strip().lower()] for n in want
                     if n.strip().lower() in coord_by_name]
 
@@ -2828,12 +2884,10 @@ elif step == 3:
                     wh.update(hive_column_types(_host, _whid, _tok, tbls, opt_env("TS_PROXY")))
                 except Exception:
                     pass
-            _conn = (teams[team_name].get("source_connection", "")
-                     or teams[team_name].get("target_connection", ""))
             _rest = [t for t in tbls if (t.get("name") or "").strip().lower() not in wh]
-            if _rest and _conn:
+            for _conn, _grp in _by_connection(_rest).items():
                 try:
-                    wh.update(source_client().connection_column_types(_conn, _rest))
+                    wh.update(source_client().connection_column_types(_conn, _grp))
                 except Exception:
                     pass
             st.session_state._tm_source_full = wh   # full per-table source type map (for the 3-way row)
@@ -3008,7 +3062,7 @@ elif step == 3:
                 org_map = st.session_state.get("_column_case_map") or {}
                 diff_findings = warehouse_missing_findings(
                     st.session_state.get("transformed_items", []), cdw_map, fallback_map=org_map,
-                    connection=teams[team_name].get("target_connection", ""))
+                    connection=_target_conn_label())
 
                 def _tbl_of(f):
                     parts = (f.get("column_fqn") or "").split(".")
@@ -3747,7 +3801,7 @@ elif step == 3:
                     _seen_tm = {(f.get("object"), (f.get("column") or "").lower()) for f in type_mismatch}
                     for _op in warehouse_type_findings(
                             st.session_state.get("transformed_items", []), _tfull,
-                            connection=teams[team_name].get("target_connection", "")):
+                            connection=_target_conn_label()):
                         _k = (_op.get("object"), (_op.get("column") or "").lower())
                         if _k not in _seen_tm:
                             type_mismatch.append(_op); _seen_tm.add(_k)
@@ -4217,7 +4271,7 @@ elif step == 3:
                         try:
                             _fn, _bytes, _sm = capture_zip_bytes(
                                 filtered_items, target_client(), _ts, deep=_deep,
-                                target_connection=teams[team_name].get("target_connection", ""),
+                                target_connection=_target_conn_label(),
                                 source_items=st.session_state.get("_source_raw_items"))
                             st.session_state._dbg_bundle = (_fn, _bytes)
                             st.session_state._dbg_summary = _sm

@@ -74,10 +74,22 @@ def extract_table_refs(doc: dict) -> List[str]:
 
 # ── Data-layer remap helpers ────────────────────────────────────────────────────
 
-def _remap_connection(node: dict, source_connection: str, target_connection: str):
-    """Point a table/model's connection reference at the target cluster's connection."""
+def _remap_connection(node: dict, source_connection: str, target_connection: str,
+                      connection_map: Optional[dict] = None):
+    """Point a table/model's connection reference at the target cluster's connection.
+
+    With `connection_map` ({source name: target name}) each connection is remapped on its own
+    and a connection the map does not name is left untouched. Without it, the older single
+    pair applies, where a blank source name meant every connection."""
     conn = node.get("connection")
     if not isinstance(conn, dict) or not conn.get("name") or _is_var(conn["name"]):
+        return
+    if connection_map is not None:
+        tgt = connection_map.get(conn["name"])
+        if tgt:
+            conn.pop("fqn", None)
+            conn.pop("obj_id", None)
+            conn["name"] = tgt
         return
     if not source_connection or conn["name"] == source_connection:
         # The source connection's GUID/obj_id are meaningless on the target cluster, so
@@ -106,6 +118,7 @@ def transform_doc(
     schema_map: Optional[dict] = None,
     table_remap: Optional[dict] = None,
     column_case_map: Optional[dict] = None,
+    connection_map: Optional[dict] = None,
 ) -> Tuple[dict, List[str]]:
     """
     Apply the data-layer transforms to a single TML document dict.
@@ -144,7 +157,7 @@ def transform_doc(
     if typ == "table":
         # Physical table: this is where db / schema / db_table / connection actually live.
         obj.pop("fqn", None)
-        _remap_connection(obj, source_connection, target_connection)
+        _remap_connection(obj, source_connection, target_connection, connection_map)
         tr = table_remap.get((obj.get("name", "") or "").strip().lower())
         if tr:
             # Matched pair: repoint to the target's physical table (disclosed on the matcher
@@ -172,7 +185,7 @@ def transform_doc(
         for key in ("tables", "model_tables"):
             for t in obj.get(key, []):
                 t.pop("fqn", None)
-                _remap_connection(t, source_connection, target_connection)
+                _remap_connection(t, source_connection, target_connection, connection_map)
                 _remap_location(t, db_map, schema_map)
 
     elif typ == "answer":
@@ -210,6 +223,7 @@ def transform_items(
     schema_map: Optional[dict] = None,
     table_remap: Optional[dict] = None,
     column_case_map: Optional[dict] = None,
+    connection_map: Optional[dict] = None,
 ) -> Tuple[List[dict], List[dict]]:
     """
     Transform a list of raw API items (each with 'edoc' string + 'info' dict).
@@ -225,7 +239,8 @@ def transform_items(
         doc  = json.loads(edoc) if edoc.strip().startswith("{") else yaml.safe_load(edoc)
 
         doc, warns = transform_doc(doc, source_connection, target_connection,
-                                   db_map, schema_map, table_remap, column_case_map)
+                                   db_map, schema_map, table_remap, column_case_map,
+                                   connection_map)
         for w in warns:
             all_warnings.append({"object": name, "issue": w})
 

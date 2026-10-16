@@ -383,6 +383,21 @@ class TSClient:
                 return o.get("metadata_id")
         return None
 
+    def list_connection_names(self) -> list:
+        """Every connection name visible on this cluster, sorted, for the connection picker.
+        Raises on failure: an empty list has to mean the cluster has none, not that the read
+        failed."""
+        try:
+            r = self._post("/api/rest/2.0/connection/search",
+                           {"record_size": -1, "record_offset": 0})
+        except requests.HTTPError as e:
+            code = e.response.status_code if e.response is not None else "?"
+            raise RuntimeError(f"Listing connections failed (HTTP {code})"
+                               + (" — the token may have expired" if code in (401, 403) else "")
+                               ) from e
+        rows = r if isinstance(r, list) else (r or {}).get("connection", [])
+        return sorted({(c.get("name") or "").strip() for c in rows if (c.get("name") or "").strip()})
+
     def _connection_meta(self, identifier: str):
         """(connection_guid, inferred_auth_type) for a connection, from its stored config.
         The auth type is inferred from the configuration keys; None if unrecognised."""
