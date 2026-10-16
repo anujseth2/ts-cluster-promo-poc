@@ -1111,3 +1111,14 @@ def test_case_findings_use_the_modeled_fallback_unverified(make_table_doc, make_
 def test_missing_column_is_not_a_case_finding(make_table_doc, make_item):
     item = _cased_item(make_table_doc, make_item, [("Gone", "VARCHAR")])
     assert warehouse_case_findings([item], {"commerce": {"other": "other"}}) == []
+
+
+def test_recased_columns_compares_source_with_what_shipped(make_table_doc, make_item):
+    from services.import_diagnostics import recased_columns
+    src = make_item(make_table_doc(columns=[("Region", "VARCHAR"), ("amount", "DOUBLE")]), "commerce")
+    shipped_doc = make_table_doc(columns=[("Region", "VARCHAR"), ("amount", "DOUBLE")])
+    shipped_doc["table"]["columns"][0]["db_column_name"] = "REGION"     # recased
+    shipped_doc["table"]["columns"][1]["db_column_name"] = "amount_v2"  # renamed: not a recase
+    shipped = make_item(shipped_doc, "commerce")
+    assert recased_columns([src], [shipped]) == [
+        {"table": "commerce", "from": "Region", "to": "REGION"}]

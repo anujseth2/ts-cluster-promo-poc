@@ -32,7 +32,7 @@ from services.import_diagnostics import (
     restore_unneeded_type_changes, promotion_plan, scan_names_for_drops,
     dependents_using_columns,
     blocking, warnings_only, is_blocking_result, drop_column_properties,
-    distinct_causes, rejected_for_others, warehouse_case_findings,
+    distinct_causes, rejected_for_others, warehouse_case_findings, recased_columns,
 )
 from services.target_cascade import (
     plan_tree, subtree_actions, tree_lines, dry_run_plan, snapshot_plan, apply_order,
@@ -1080,19 +1080,6 @@ def _prepare_bundle():
                         applied_case_map.setdefault(_t, {})[_c] = _case
             for _t, _cols in _recase_map(st.session_state.get("recase_target_approved")).items():
                 applied_case_map.setdefault(_t, {}).update(_cols)
-            # Record exactly what the transform will recase, so Import Results can list it (the
-            # recase is otherwise silent). Mirrors the transformer: a db_column_name is recased when
-            # it differs from the approved casing.
-            _recase_events = []
-            for _it in items:
-                _rt = (_parse_edoc(_it.get("edoc", "{}")).get("table") or {})
-                _rcc = applied_case_map.get((_rt.get("name") or "").strip().lower())
-                for _rcol in ((_rt.get("columns") or []) if _rcc else []):
-                    _rdbn = _rcol.get("db_column_name")
-                    _rtgt = _rcc.get(_rdbn.strip().lower()) if _rdbn else None
-                    if _rtgt and _rtgt != _rdbn:
-                        _recase_events.append({"table": _rt["name"], "from": _rdbn, "to": _rtgt})
-            st.session_state._recase_events = _recase_events
             st.session_state._recase_applied_set = {f"{_t}::{_c}" for _t, _cols in applied_case_map.items()
                                                     for _c in _cols}
             st.write("③ Applying the data-layer transform (connection remap, obj_ids, column casing)…")
@@ -3141,9 +3128,14 @@ elif step == 3:
                     st.session_state.get("transformed_items", []), cdw_map, fallback_map=org_map,
                     connection=_target_conn_label())
 
+                # The validation error names the WAREHOUSE table (db_table); the maps are keyed by
+                # the ThoughtSpot table name. Resolve first, or a table whose two names differ looks
+                # uncovered and its errors come back as duplicate "missing" rows that no drop matches.
+                for f in wh_missing:
+                    f["object"] = _resolve_finding_table(f)
+
                 def _tbl_of(f):
-                    parts = (f.get("column_fqn") or "").split(".")
-                    return (parts[-2] if len(parts) >= 2 else f.get("object", "")).strip().lower()
+                    return (f.get("object") or "").strip().lower()
 
                 covered = {k for k in cdw_map} | {k for k in org_map}
                 # keep only validation-confirmed missing columns for tables neither map could cover
@@ -5365,16 +5357,16 @@ elif step == 5:
                 if dropped_vizs:
                     st.markdown(f"**Visualizations dropped:** {dropped_vizs}")
 
-        # What the promotion recased to match the warehouse — only the APPROVED recasings that were
-        # actually applied (approve-first; proposals the operator didn't approve aren't listed here).
-        _applied_recase = st.session_state.get("_recase_applied_set", set())
-        _recases = [r for r in (st.session_state.get("_recase_events") or [])
-                    if f"{r['table'].strip().lower()}::{r['from'].strip().lower()}" in _applied_recase]
+        # What the promotion recased: the source export against what was shipped, so a recasing
+        # counts however it was applied (at export, on Source Audit, or on TML Validation).
+        _recases = recased_columns(st.session_state.get("_source_raw_items"),
+                                   st.session_state.get("transformed_items"))
         if _recases:
             with st.expander(f"Recased to match the warehouse ({len(_recases)} column(s), approved)",
                              expanded=True):
-                st.caption("Physical column names aligned to the warehouse's exact casing (approved "
-                           "in the recasing panel) so the TML binds on import. Logical names unchanged.")
+                st.caption("Physical column names aligned to a warehouse's exact casing (each one "
+                           "approved on Source Audit or TML Validation) so the TML binds on import. "
+                           "Logical names unchanged.")
                 _rc = pd.DataFrame([{"Table": r["table"], "From": r["from"], "To": r["to"]}
                                     for r in _recases])
                 st.dataframe(_sno(_rc), use_container_width=True, hide_index=True)

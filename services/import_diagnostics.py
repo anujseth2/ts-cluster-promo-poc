@@ -707,6 +707,33 @@ def warehouse_missing_findings(items, cdw_map, fallback_map=None, connection="")
     return findings
 
 
+def recased_columns(source_items, shipped_items):
+    """Columns whose physical name differs only in casing between the source export and what was
+    shipped: what the promotion recased, whichever step applied it. Matched per table by the
+    column's logical name. Returns [{"table", "from", "to"}]."""
+    def _cols(items):
+        out = {}
+        for it in items or []:
+            try:
+                t = (_parse_edoc(it) or {}).get("table") or {}
+            except Exception:
+                continue
+            if t.get("name"):
+                out[t["name"].strip().lower()] = (t["name"], {
+                    (c.get("name") or "").strip().lower(): c.get("db_column_name") or ""
+                    for c in t.get("columns", []) or []})
+        return out
+    src, shipped = _cols(source_items), _cols(shipped_items)
+    events = []
+    for key, (name, cols) in shipped.items():
+        before = (src.get(key) or (None, {}))[1]
+        for logical, dbn in cols.items():
+            was = before.get(logical)
+            if was and dbn and was != dbn and was.lower() == dbn.lower():
+                events.append({"table": name, "from": was, "to": dbn})
+    return events
+
+
 def warehouse_case_findings(items, cdw_map, fallback_map=None, connection=""):
     """Promoted columns that exist in the target warehouse but under different casing.
 
