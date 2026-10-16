@@ -1083,3 +1083,31 @@ def test_distinct_causes_keeps_genuinely_different_columns_apart():
     found = [{"kind": "missing_in_target_warehouse", "object": "t", "column": "a"},
              {"kind": "missing_in_target_warehouse", "object": "t", "column": "b"}]
     assert len(distinct_causes(found)) == 2
+
+
+# ── Casing that differs on the target ────────────────────────────────────────────────────────
+
+from services.import_diagnostics import warehouse_case_findings
+
+
+def _cased_item(make_table_doc, make_item, cols):
+    return make_item(make_table_doc(columns=cols), "commerce")
+
+
+def test_case_only_difference_on_target_is_found(make_table_doc, make_item):
+    item = _cased_item(make_table_doc, make_item, [("CID", "VARCHAR"), ("Revenue", "DOUBLE")])
+    found = warehouse_case_findings([item], {"commerce": {"cid": "cid", "revenue": "Revenue"}})
+    assert [(f["column"], f["target_case"], f["verified"]) for f in found] == [("CID", "cid", True)]
+    # the missing-column diff stays silent about it: the column exists
+    assert warehouse_missing_findings([item], {"commerce": {"cid": "cid", "revenue": "Revenue"}}) == []
+
+
+def test_case_findings_use_the_modeled_fallback_unverified(make_table_doc, make_item):
+    item = _cased_item(make_table_doc, make_item, [("CID", "VARCHAR")])
+    found = warehouse_case_findings([item], {}, fallback_map={"commerce": {"cid": "cid"}})
+    assert found and found[0]["verified"] is False
+
+
+def test_missing_column_is_not_a_case_finding(make_table_doc, make_item):
+    item = _cased_item(make_table_doc, make_item, [("Gone", "VARCHAR")])
+    assert warehouse_case_findings([item], {"commerce": {"other": "other"}}) == []

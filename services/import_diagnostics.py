@@ -707,6 +707,47 @@ def warehouse_missing_findings(items, cdw_map, fallback_map=None, connection="")
     return findings
 
 
+def warehouse_case_findings(items, cdw_map, fallback_map=None, connection=""):
+    """Promoted columns that exist in the target warehouse but under different casing.
+
+    The missing-column diff compares names case-insensitively, so these never show up as missing,
+    yet a case-sensitive warehouse (Databricks) refuses to bind them and the import fails. Each
+    finding carries the target's casing so the operator can recase to it, or drop the column.
+    Same maps and `verified` meaning as warehouse_missing_findings."""
+    cdw_map = cdw_map or {}
+    fallback_map = fallback_map or {}
+    findings = []
+    for item in items:
+        try:
+            doc = _parse_edoc(item)
+        except Exception:
+            continue
+        t = (doc or {}).get("table")
+        if not t or not t.get("name"):
+            continue
+        key = t["name"].strip().lower()
+        wh = cdw_map.get(key)
+        verified = wh is not None
+        if wh is None:
+            wh = fallback_map.get(key)
+        if not wh:
+            continue
+        for c in t.get("columns", []) or []:
+            dbn = (c.get("db_column_name") or "").strip()
+            actual = wh.get(dbn.lower()) if dbn else None
+            if not actual or actual == dbn:
+                continue
+            findings.append({
+                "kind": "case_differs_on_target",
+                "object": t["name"],
+                "column": dbn,
+                "target_case": actual,
+                "connection": (t.get("connection") or {}).get("name") or connection,
+                "verified": verified,
+            })
+    return findings
+
+
 def silent_drop_findings(source_table_docs, target_docs_by_name):
     """Pre-import safety net for the SILENT target-extra case the platform never reports.
 

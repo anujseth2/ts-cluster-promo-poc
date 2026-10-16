@@ -32,7 +32,7 @@ from services.import_diagnostics import (
     restore_unneeded_type_changes, promotion_plan, scan_names_for_drops,
     dependents_using_columns,
     blocking, warnings_only, is_blocking_result, drop_column_properties,
-    distinct_causes, rejected_for_others,
+    distinct_causes, rejected_for_others, warehouse_case_findings,
 )
 from services.target_cascade import (
     plan_tree, subtree_actions, tree_lines, dry_run_plan, snapshot_plan, apply_order,
@@ -594,58 +594,101 @@ def _by_connection(tables, key="connection") -> dict:
     return groups
 
 
-def _read_source_col_map():
-    """The SOURCE warehouse's column SET (names) for every promoted table, so the TML can be
-    diffed against it (columns present in the TML but gone from the source CDW). hive SHOW
-    COLUMNS via the source DBX creds (falling back to target for now), else source
-    connection/search. Source coordinates come from the raw source export, pre-remap.
-    Returns {table_lower: {col_lower: actual_case}} — same shape as the target map."""
-    tbls = list(_source_table_coords().values())
+def _source_read_problems() -> list:
+    """The column and type reads' failures, once each. Both reads hit the same warehouse, so one
+    unreachable host would otherwise be listed twice (differing only in object addresses)."""
+    import re as _re
+    seen, out = set(), []
+    for e in ((st.session_state.get("_source_read_errors") or [])
+              + (st.session_state.get("_source_type_errors") or [])):
+        k = _re.sub(r" at 0x[0-9a-fA-F]+", "", e)
+        if k not in seen:
+            seen.add(k); out.append(e)
+    return out
+
+
+def _recase_map(scoped_to_case: dict) -> dict:
+    """{"Table::col": casing} -> the {table_lower: {col_lower: casing}} shape recasing takes."""
     out = {}
+    for _sk, _case in (scoped_to_case or {}).items():
+        _t, _, _c = _sk.partition("::")
+        if _t and _c and _case:
+            out.setdefault(_t.strip().lower(), {})[_c.strip().lower()] = _case
+    return out
+
+
+def _dbx_creds(side: str):
+    """(host, warehouse id, token) for reading a side's Databricks warehouse directly. The source
+    uses its own TS_SOURCE_DBX_* block, or the target's block when its own isn't filled in."""
+    def _block(s):
+        return (opt_env(f"TS_{s}_DBX_HOST"), opt_env(f"TS_{s}_DBX_WAREHOUSE"),
+                opt_env(f"TS_{s}_DBX_TOKEN"))
+    creds = _block(side)
+    if side == "SOURCE" and not all(creds):
+        creds = _block("TARGET")
+    host, whid, tok = creds
+    # The statements API needs a full URL; accept the bare workspace host too.
+    if host and "://" not in host:
+        host = "https://" + host
+    return host, whid, tok
+
+
+def _read_source_warehouse(kind: str):
+    """Read the SOURCE warehouse for every promoted table: column casing (`kind="cases"`, SHOW
+    COLUMNS) or types (`kind="types"`, DESCRIBE). Directly from Databricks when credentials are
+    set, then through the source cluster's own connection for anything that read didn't cover.
+    Source coordinates come from the raw source export, before any remap.
+
+    Returns (map, errors): {table_lower: {col_lower: value}} and a list of what failed, worded for
+    the operator. A failure is reported, never folded into an empty result."""
+    tbls = list(_source_table_coords().values())
+    out, errs = {}, []
     if not tbls:
-        return out
-    _host = opt_env("TS_SOURCE_DBX_HOST") or opt_env("TS_TARGET_DBX_HOST")
-    _whid = opt_env("TS_SOURCE_DBX_WAREHOUSE") or opt_env("TS_TARGET_DBX_WAREHOUSE")
-    _tok  = opt_env("TS_SOURCE_DBX_TOKEN") or opt_env("TS_TARGET_DBX_TOKEN")
-    if _host and _whid and _tok:
+        return out, errs
+    host, whid, tok = _dbx_creds("SOURCE")
+    if host and whid and tok:
+        dbg = []
         try:
-            from services.databricks_direct import hive_column_cases
-            out.update(hive_column_cases(_host, _whid, _tok, tbls, opt_env("TS_PROXY")))
-        except Exception:
-            pass
+            from services import databricks_direct as _dd
+            _fn = _dd.hive_column_cases if kind == "cases" else _dd.hive_column_types
+            out.update(_fn(host, whid, tok, tbls, opt_env("TS_PROXY"), debug=dbg))
+        except Exception as e:
+            errs.append(f"Databricks (`{host}`): {friendly_error(str(e))[2] or e}")
+        for d in dbg:
+            if d.get("state") != "SUCCEEDED":
+                errs.append(f"Databricks, `{d.get('fqn')}`: "
+                            f"{d.get('error') or d.get('state') or 'no result'}")
     # Anything the direct read didn't cover: ask the SOURCE cluster, through the connection each
     # table actually sits on.
     _rest = [t for t in tbls if (t.get("name") or "").strip().lower() not in out]
     for _conn, _grp in _by_connection(_rest).items():
         try:
-            out.update(source_client().connection_column_cases(_conn, _grp))
-        except Exception:
-            pass
+            _cl = source_client()
+            _fn = _cl.connection_column_cases if kind == "cases" else _cl.connection_column_types
+            out.update(_fn(_conn, _grp))
+        except Exception as e:
+            errs.append(f"Source connection `{_conn}`: {friendly_error(str(e))[2] or e}")
+    _unread = [t["name"] for t in tbls if (t.get("name") or "").strip().lower() not in out]
+    if _unread and not errs:
+        errs.append("No columns came back for " + ", ".join(f"`{n}`" for n in _unread)
+                    + " (no error was returned). Check the table's database, schema and name exist "
+                      "in the source warehouse.")
+    return out, errs
+
+
+def _read_source_col_map():
+    """The SOURCE warehouse's columns with their actual casing, for every promoted table.
+    Returns {table_lower: {col_lower: actual_case}}; failures go to `_source_read_errors`."""
+    out, errs = _read_source_warehouse("cases")
+    st.session_state._source_read_errors = errs
     return out
 
+
 def _read_source_type_map():
-    """The SOURCE warehouse's TYPE per column for every promoted table (DESCRIBE), so the
-    promotion can be diffed against source types + casing in one pass. Same creds/coords as
-    _read_source_col_map. Returns {table_lower: {col_lower: type_string}}."""
-    tbls = list(_source_table_coords().values())
-    out = {}
-    if not tbls:
-        return out
-    _host = opt_env("TS_SOURCE_DBX_HOST") or opt_env("TS_TARGET_DBX_HOST")
-    _whid = opt_env("TS_SOURCE_DBX_WAREHOUSE") or opt_env("TS_TARGET_DBX_WAREHOUSE")
-    _tok  = opt_env("TS_SOURCE_DBX_TOKEN") or opt_env("TS_TARGET_DBX_TOKEN")
-    if _host and _whid and _tok:
-        try:
-            from services.databricks_direct import hive_column_types
-            out.update(hive_column_types(_host, _whid, _tok, tbls, opt_env("TS_PROXY")))
-        except Exception:
-            pass
-    _rest = [t for t in tbls if (t.get("name") or "").strip().lower() not in out]
-    for _conn, _grp in _by_connection(_rest).items():
-        try:
-            out.update(source_client().connection_column_types(_conn, _grp))
-        except Exception:
-            pass
+    """The SOURCE warehouse's type per column, for every promoted table.
+    Returns {table_lower: {col_lower: type_string}}; failures go to `_source_type_errors`."""
+    out, errs = _read_source_warehouse("types")
+    st.session_state._source_type_errors = errs
     return out
 
 
@@ -991,9 +1034,7 @@ def _prepare_bundle():
             # SHOW COLUMNS (works on hive AND Unity Catalog). Gated on target DBX creds in .env; when
             # present this fills/overrides the map for tables the fast path can't see (not yet on the
             # target) — e.g. a promoted model whose `CID` must bind to the warehouse's `cid`.
-            _dbx_host = opt_env("TS_TARGET_DBX_HOST")
-            _dbx_wh   = opt_env("TS_TARGET_DBX_WAREHOUSE")
-            _dbx_tok  = opt_env("TS_TARGET_DBX_TOKEN")
+            _dbx_host, _dbx_wh, _dbx_tok = _dbx_creds("TARGET")
             _hive = {}   # authoritative physical read of the TARGET warehouse (hive/UC), if creds set
             if _dbx_host and _dbx_wh and _dbx_tok:
                 st.write("②b Reading hive_metastore casing directly from Databricks…")
@@ -1020,35 +1061,40 @@ def _prepare_bundle():
             # Stash the RAW source export (pre-transform, pre-drop) so a debug bundle carries the
             # original model+tables — the true joins/columns before any remap or cascade. Captured
             # here, as it happens; edocs are strings so a shallow per-item copy is enough.
-            # Record the physical columns the transform will recase to the warehouse casing, so the
-            # Import Results report can show it (the recase is otherwise silent). Mirrors the
-            # transformer rule: db_column_name is recased when it differs from the map's casing.
-            _recase_events = []
-            for _it in items:
-                _rt = (_parse_edoc(_it.get("edoc", "{}")).get("table") or {})
-                _rtn = _rt.get("name")
-                _rcc = column_case_map.get((_rtn or "").strip().lower()) if _rtn else None
-                if not _rcc:
-                    continue
-                for _rcol in (_rt.get("columns") or []):
-                    _rdbn = _rcol.get("db_column_name")
-                    if _rdbn:
-                        _rtgt = _rcc.get(_rdbn.strip().lower())
-                        if _rtgt and _rtgt != _rdbn:
-                            _recase_events.append({"table": _rtn, "from": _rdbn, "to": _rtgt})
-            st.session_state._recase_events = _recase_events
             st.session_state._source_raw_items = [dict(it) for it in items]
             # APPROVE-FIRST recasing (Anuj 2026-08-18: no silent mutations). Nothing is recased until
             # the operator approves it in the "Column recasing" panel — the transform sees only the
             # APPROVED subset of the (full) warehouse casing map. Empty approval set → no recasing, so
             # unapproved columns keep their source casing. `_column_case_map` stays the FULL map (other
             # consumers — the missing-column fallback — need it).
+            # Source first, then target (18 Aug): a recasing approved on Source Audit takes the SOURCE
+            # warehouse's casing; one approved on TML Validation takes the TARGET's and, being the
+            # later decision, wins where both touched the same column.
             _rapproved = st.session_state.get("recase_approved", set())
-            applied_case_map = {
-                _t: {_c: _case for _c, _case in (_cols or {}).items()
-                     if f"{_t}::{_c}" in _rapproved}
-                for _t, _cols in column_case_map.items()}
-            st.session_state._recase_applied_set = set(_rapproved)
+            _src_case = (st.session_state.get("_source_case_durable")
+                         or st.session_state.get("_source_col_map") or {})
+            applied_case_map = {}
+            for _t, _cols in _src_case.items():
+                for _c, _case in (_cols or {}).items():
+                    if f"{_t}::{_c}" in _rapproved:
+                        applied_case_map.setdefault(_t, {})[_c] = _case
+            for _t, _cols in _recase_map(st.session_state.get("recase_target_approved")).items():
+                applied_case_map.setdefault(_t, {}).update(_cols)
+            # Record exactly what the transform will recase, so Import Results can list it (the
+            # recase is otherwise silent). Mirrors the transformer: a db_column_name is recased when
+            # it differs from the approved casing.
+            _recase_events = []
+            for _it in items:
+                _rt = (_parse_edoc(_it.get("edoc", "{}")).get("table") or {})
+                _rcc = applied_case_map.get((_rt.get("name") or "").strip().lower())
+                for _rcol in ((_rt.get("columns") or []) if _rcc else []):
+                    _rdbn = _rcol.get("db_column_name")
+                    _rtgt = _rcc.get(_rdbn.strip().lower()) if _rdbn else None
+                    if _rtgt and _rtgt != _rdbn:
+                        _recase_events.append({"table": _rt["name"], "from": _rdbn, "to": _rtgt})
+            st.session_state._recase_events = _recase_events
+            st.session_state._recase_applied_set = {f"{_t}::{_c}" for _t, _cols in applied_case_map.items()
+                                                    for _c in _cols}
             st.write("③ Applying the data-layer transform (connection remap, obj_ids, column casing)…")
             transformed_items, warnings = transform_items(
                 items,
@@ -1134,7 +1180,10 @@ if step == 0:
                         "realign_types", "_source_audit_dirty", "skip_selected", "skip_expanded",
                         "_skip_gen", "wh_drop_selected",
                         "tm_drop_selected", "tm_realign_selected", "_tm_realign_to",
-                        "_tm_target_full", "_tm_source_full", "_target_modeled_map"):
+                        "_tm_target_full", "_tm_source_full", "_target_modeled_map",
+                        "_source_case_durable", "_source_read_errors", "_source_type_errors",
+                        "recase_target_approved", "tc_recase_selected", "tc_drop_selected",
+                        "_tc_case_to"):
                 st.session_state.pop(key, None)
 
     assets = st.session_state.get("assets", [])
@@ -2012,6 +2061,9 @@ elif step == 2:
                                state=("complete" if _sm else "error"), expanded=not bool(_sm))
                 st.session_state._source_col_map  = _sm
                 st.session_state._source_type_map = _stm
+                # The casing approvals below are re-applied on every re-export, so keep the casing
+                # they were approved against even after the working map is cleared.
+                st.session_state._source_case_durable = _sm
                 st.rerun()
 
         _src_ran = "_source_col_map" in st.session_state    # a read has happened this session
@@ -2022,21 +2074,27 @@ elif step == 2:
                            "columns the source no longer has, type drift, and casing that needs recasing.")
             else:
                 # Ran, but came back empty — say WHY instead of reverting to "hasn't run yet".
-                _has_dbx = bool((opt_env("TS_SOURCE_DBX_HOST") or opt_env("TS_TARGET_DBX_HOST"))
-                                and (opt_env("TS_SOURCE_DBX_WAREHOUSE") or opt_env("TS_TARGET_DBX_WAREHOUSE"))
-                                and (opt_env("TS_SOURCE_DBX_TOKEN") or opt_env("TS_TARGET_DBX_TOKEN")))
-                if not _has_dbx:
-                    st.error("The source read came back with **0 tables** — no direct Databricks creds are "
-                             "set, so it fell back to the connection's column read, which times out on "
-                             "hive_metastore. Add `TS_TARGET_DBX_HOST`, `TS_TARGET_DBX_WAREHOUSE`, and "
-                             "`TS_TARGET_DBX_TOKEN` to `.env` (the same creds the rest of the audit uses), "
-                             "then read again.")
+                _src_errs = _source_read_problems()
+                if _src_errs:
+                    st.error("The source read came back with **0 tables**. What failed:\n\n"
+                             + "\n".join(f"- {e}" for e in _src_errs))
+                elif not all(_dbx_creds("SOURCE")):
+                    st.error("The source read came back with **0 tables**. No Databricks credentials "
+                             "are set, so it used the connection's own column read, which times out "
+                             "on hive_metastore. Fill in `TS_SOURCE_DBX_HOST`, "
+                             "`TS_SOURCE_DBX_WAREHOUSE` and `TS_SOURCE_DBX_TOKEN` in `.env` (or the "
+                             "TARGET block, which the source check uses when its own is blank), "
+                             "restart the app, then read again.")
                 else:
-                    st.error("The source read came back with **0 tables** even though Databricks creds are "
-                             "set. The SQL warehouse may be cold or stopped (retry), or the promoted "
-                             "tables' db / schema / db_table don't resolve in that warehouse. Retry; if it "
-                             "persists, confirm the warehouse is running and the table coordinates match.")
+                    st.error("The source read came back with **0 tables** and no error. Check the "
+                             "promoted tables' database, schema and name exist in the source "
+                             "warehouse, then read again.")
         else:
+            # Some tables read, some didn't: say which, so a gap isn't mistaken for "no drift".
+            _src_errs = _source_read_problems()
+            if _src_errs:
+                st.warning("Part of the source warehouse couldn't be read, so tables below may be "
+                           "missing from these checks:\n\n" + "\n".join(f"- {e}" for e in _src_errs))
             # (A) columns absent from the SOURCE warehouse → approve-drop (out-of-sync TML) ──
             _src_missing = warehouse_missing_findings(
                 st.session_state.get("transformed_items", []), _src_map, connection=_src_conn)
@@ -2832,8 +2890,7 @@ elif step == 3:
 
             wh = {}   # name.lower() -> {col_lower: warehouse_type}
             # 1) hive_metastore direct (authoritative + fast; skips the connection/search 504).
-            _host = opt_env("TS_TARGET_DBX_HOST"); _whid = opt_env("TS_TARGET_DBX_WAREHOUSE")
-            _tok  = opt_env("TS_TARGET_DBX_TOKEN")
+            _host, _whid, _tok = _dbx_creds("TARGET")
             if tbls and _host and _whid and _tok:
                 try:
                     from services.databricks_direct import hive_column_types
@@ -2890,9 +2947,7 @@ elif step == 3:
             # Source DBX creds — fall back to the TARGET creds for now (Anuj: "source == target,
             # will separate later"). When the source warehouse is genuinely distinct, set the
             # TS_SOURCE_DBX_* vars and this uses them without a code change.
-            _host = opt_env("TS_SOURCE_DBX_HOST") or opt_env("TS_TARGET_DBX_HOST")
-            _whid = opt_env("TS_SOURCE_DBX_WAREHOUSE") or opt_env("TS_TARGET_DBX_WAREHOUSE")
-            _tok  = opt_env("TS_SOURCE_DBX_TOKEN") or opt_env("TS_TARGET_DBX_TOKEN")
+            _host, _whid, _tok = _dbx_creds("SOURCE")
             if tbls and _host and _whid and _tok:
                 try:
                     from services.databricks_direct import hive_column_types
@@ -3096,6 +3151,13 @@ elif step == 3:
                 for f in confirmed_extra:
                     f["verified"] = True
                 wh_missing = diff_findings + confirmed_extra
+                # Columns the target has, but cased differently. The diff above is case-blind, so
+                # without this they'd fail to bind and appear nowhere on the page.
+                _dropped_now = {d.lower() for d in st.session_state.get("dropped_col_names", set())}
+                case_diff = [f for f in warehouse_case_findings(
+                                 st.session_state.get("transformed_items", []), cdw_map,
+                                 fallback_map=org_map, connection=_target_conn_label())
+                             if f"{f['object']}::{f['column']}".lower() not in _dropped_now]
 
             # The failed table's header name is often "unknown"; recover the real table name
             # from the error FQN + the promotion bundle so target lookups resolve.
@@ -3213,6 +3275,93 @@ elif step == 3:
                         st.caption("If an attempt shows HTTP 200 with objects: False and no error, the "
                                    "fetch ran but the warehouse returned nothing (service-principal / "
                                    "catalog path). An error (e.g. code 10086) means a privilege problem.")
+
+            # ── target casing: the column exists on the target, cased differently ──
+            if case_diff:
+                import pandas as pd
+                st.markdown("#### Column casing differs from the target warehouse")
+                st.caption("These columns exist in the target warehouse under different casing, and "
+                           "a case-sensitive warehouse won't bind them as they are. **Recase** sets "
+                           "the promoted column to the target's casing; **Drop** leaves it out of this "
+                           "promotion (with anything that uses it). Nothing changes until you tick and "
+                           "apply.")
+                _tcr = st.session_state.setdefault("tc_recase_selected", set())
+                _tcd = st.session_state.setdefault("tc_drop_selected", set())
+                _tc_to = {}
+                _tc_rows = []
+                for f in sorted(case_diff, key=lambda x: ((x.get("object") or "").lower(),
+                                                          (x.get("column") or "").lower())):
+                    _sk = f"{f['object']}::{f['column']}"
+                    _tc_to[_sk] = f["target_case"]
+                    _tc_rows.append({
+                        "#":          str(_tbl_serial.get(f["object"].strip().lower(), "")),
+                        "Table":      f["object"],
+                        "Promoted":   f["column"],
+                        "Target":     f["target_case"],
+                        "✓":          "✓" if f.get("verified") else "⚠︎",
+                        "Recase?":    _sk in _tcr,
+                        "Drop?":      _sk in _tcd,
+                        "_scoped":    _sk,
+                    })
+                st.session_state._tc_case_to = _tc_to   # so "Apply all" can read the target casing
+                _tcdf = pd.DataFrame(_tc_rows, columns=["#", "Table", "Promoted", "Target", "✓",
+                                                        "Recase?", "Drop?", "_scoped"])
+                _tc1, _tc2, _ = st.columns([1.3, 1, 2])
+                with _tc1:
+                    if st.button(f"Recase all ({len(_tcdf)})", key="tc_re_all",
+                                 use_container_width=True):
+                        _tcr.update(_tcdf["_scoped"].tolist()); _tcd.clear()
+                        _bump_editor("tc"); st.rerun()
+                with _tc2:
+                    if st.button("Clear all", key="tc_clear", use_container_width=True,
+                                 disabled=not (_tcr or _tcd)):
+                        _tcr.clear(); _tcd.clear(); _bump_editor("tc"); st.rerun()
+                _select_editor(
+                    _tcdf, ["Recase?", "Drop?"], ["tc_recase_selected", "tc_drop_selected"], "tc",
+                    column_config={
+                        "#":        st.column_config.TextColumn("#", width="small"),
+                        "Table":    st.column_config.TextColumn("Table", width="medium"),
+                        "Promoted": st.column_config.TextColumn("Promoted casing", width="medium"),
+                        "Target":   st.column_config.TextColumn("Target warehouse casing",
+                                                                width="medium"),
+                        "✓":        st.column_config.TextColumn("✓", width="small",
+                                      help="✓ read from the target warehouse · ⚠︎ from the target's "
+                                           "modeled columns"),
+                        "Recase?":  st.column_config.CheckboxColumn("Recase?", width="small",
+                                      help="Set the promoted column to the target's casing."),
+                        "Drop?":    st.column_config.CheckboxColumn("Drop?", width="small",
+                                      help="Leave the column out of this promotion, with its "
+                                           "dependents."),
+                    },
+                    disabled=["#", "Table", "Promoted", "Target", "✓"],
+                    exclusive=True)   # Recase? wins over Drop? per row
+                st.caption(f"**{len(_tcr)}** to recase, **{len(_tcd - _tcr)}** to drop.")
+                if not _discovered and st.button("Apply recase / drops & re-validate", key="tc_apply",
+                                                 disabled=not (_tcr or _tcd)):
+                    _items = st.session_state.transformed_items
+                    _rc = {k: _tc_to[k] for k in _tcr if k in _tc_to}
+                    if _rc:
+                        _items, _ = recase_columns(_items, _recase_map(_rc))
+                        st.session_state.setdefault("recase_target_approved", {}).update(_rc)
+                    _drop = {k for k in _tcd if k not in _tcr}
+                    if _drop:
+                        _items, _man = drop_columns(_items, _drop)
+                        _record_drop(_man)
+                        st.session_state.setdefault("dropped_col_names", set()).update(_drop)
+                    st.session_state.transformed_items = _items
+                    _tcr.clear(); _tcd.clear()
+                    filtered_fixed = [i for i in st.session_state.transformed_items
+                                      if i.get("info", {}).get("name") not in skip_objects]
+                    with st.status("Re-validating…", expanded=True) as _rv:
+                        _res = _safe_validate(filtered_fixed, step=lambda _m: _rv.write(_m))
+                        _rv.update(state=("complete" if _res else "error"), expanded=False)
+                        if _res:
+                            _, err, ok = _res
+                            st.session_state.validation_errors = err
+                            st.session_state.validation_ok     = ok
+                            st.session_state.pop("silent_drops", None)
+                    if _res:
+                        st.rerun()
 
             # ── source-extra: a source column the target warehouse doesn't have ──
             if wh_missing:
@@ -3877,18 +4026,25 @@ elif step == 3:
                         _quiet_agree.append(_scoped)
                         continue
                     _agree = bool(src_cdw and tgt_t and _tnorm(src_cdw) == _tnorm(tgt_t))
-                    # REALIGN only when both warehouses agree on a real type and the TML is the stale
-                    # outlier — written as the TS TOKEN (INT64, not 'bigint'). Disagree → fix warehouse.
-                    _ts = warehouse_type_to_ts(tgt_t) if _agree else ""
-                    if _ts and _tnorm(_ts) != _tnorm(src_tml):
-                        _ralign = _ts
+                    # REALIGN to the TARGET warehouse's type, written as the TS TOKEN (INT64, not
+                    # 'bigint'): a realign only validates when it matches the target. Offered whether
+                    # or not the source agrees, but the Issue says which, because realigning across a
+                    # real source/target difference changes what the column is on the target.
+                    _ts = warehouse_type_to_ts(tgt_t) if tgt_t else ""
+                    _ralign = _ts if (_ts and _tnorm(_ts) != _tnorm(src_tml)) else ""
+                    if _ralign and _agree:
                         _issue = "TML type is stale; both warehouses agree it should be " + _ts
-                    elif not _agree and src_cdw and tgt_t:
-                        _ralign = ""
-                        _issue = "source vs target warehouse types differ — fix the warehouse, or drop"
+                    elif _ralign and src_cdw:
+                        _issue = (f"source warehouse has {src_cdw.upper()}, target has "
+                                  f"{tgt_t.upper()}: realign sets the target's type, or fix the "
+                                  "warehouse, or drop")
+                    elif _ralign:
+                        _issue = ("source warehouse type unread; realign sets the target's type, "
+                                  "or drop")
+                    elif tgt_t:
+                        _issue = "target type has no ThoughtSpot equivalent; fix the warehouse, or drop"
                     else:
-                        _ralign = ""
-                        _issue = "types differ — realign only when both warehouses agree; else drop"
+                        _issue = "target warehouse type unread; drop, or re-read the warehouse"
                     if _ralign:
                         _realign_to[_scoped] = _ralign
                     _rows.append({
@@ -3943,9 +4099,11 @@ elif step == 3:
                     st.markdown("#### Column type mismatches")
                     st.caption(
                         "The data type disagrees across **source CDW · source TML · target CDW**. "
-                        "**Flagged, never auto-corrected.** Realign when both warehouses agree the TML "
-                        "is stale; when they genuinely differ, fix the warehouse, or drop as a last "
-                        "resort (scoped to that one table).")
+                        "Nothing changes until you tick and apply. **Realign** sets the promoted "
+                        "column to the target warehouse's type. Where the source and target "
+                        "warehouses themselves differ, that changes what the column is on the target, "
+                        "so fixing the warehouse is the alternative; drop is the last resort (scoped "
+                        "to that one table).")
                 elif not _void_rows:
                     # ACCOUNT for the findings, never just render "empty". ThoughtSpot reported a
                     # type problem; if this table has no row for it, say which column and why, or
@@ -4014,13 +4172,13 @@ elif step == 3:
                                         help="The target warehouse's physical type for this column."),
                         "Issue":      st.column_config.TextColumn("Issue", width="medium"),
                         "Realign to": st.column_config.TextColumn("Realign to", width="small",
-                                        help="The TS type token a realign would set on the TML. Only "
-                                             "offered when BOTH warehouses agree on a real type and the "
-                                             "TML is the stale outlier; blank ('—') when they disagree "
-                                             "or the column is VOID (drop / fix the warehouse instead)."),
+                                        help="The target warehouse's type as a ThoughtSpot token: what "
+                                             "a realign sets on the promoted column. Blank ('—') when "
+                                             "the target type is unread or has no ThoughtSpot "
+                                             "equivalent."),
                         "Realign?":   st.column_config.CheckboxColumn("Realign?", width="small",
-                                        help="Set the TML's type to 'Realign to' (approve-first). "
-                                             "Preferred over dropping when both warehouses agree."),
+                                        help="Set the promoted column's type to 'Realign to' "
+                                             "(approve-first)."),
                         "Drop?":      st.column_config.CheckboxColumn("Drop?", width="small",
                                         help="Last resort: drop this column (scoped to this table) "
                                              "and its dependents."),
@@ -4028,9 +4186,9 @@ elif step == 3:
                     disabled=["#", "Table", "Column", "Source CDW", "Source TML", "Target CDW",
                               "Issue", "Realign to"],
                     exclusive=True)   # Realign? wins over Drop? per row
-                st.caption(f"**{len(_tmrsel)}** to realign, **{len(_tmsel)}** to drop. Realigning the "
-                           "type is preferred when both warehouses agree (your approval, not automatic); "
-                           "drop only as a last resort.")
+                st.caption(f"**{len(_tmrsel)}** to realign, **{len(_tmsel)}** to drop. Realigning "
+                           "keeps the column (your approval, not automatic); drop only as a last "
+                           "resort.")
 
                 if not _discovered and st.button("Apply realign / drops, re-export & re-validate",
                                                  key="tm_apply", disabled=not (_tmsel or _tmrsel)):
@@ -4357,10 +4515,17 @@ elif step == 3:
                                 for k in st.session_state.get("tm_realign_selected", set())
                                 if st.session_state.get("_tm_realign_to", {}).get(k)}
                 _all_drop -= set(_all_realign)
+                # Target-casing choices: recase to the target's casing, or drop.
+                _tc_to_all = st.session_state.get("_tc_case_to", {}) or {}
+                _all_recase = {k: _tc_to_all[k] for k in st.session_state.get("tc_recase_selected", set())
+                               if k in _tc_to_all}
+                _all_drop |= {k for k in st.session_state.get("tc_drop_selected", set())
+                              if k not in _all_recase}
                 _tbl_now = set(tbl_drop)   # whole tables to prune (empty / disconnected)
                 st.divider()
                 _lbl_tbl = f" + {len(_tbl_now)} table(s)" if _tbl_now else ""
-                _lbl_re = f"{len(_all_realign)} realign · " if _all_realign else ""
+                _lbl_re = ((f"{len(_all_realign)} realign · " if _all_realign else "")
+                           + (f"{len(_all_recase)} recase · " if _all_recase else ""))
                 st.caption("All of the above was found by validating repeatedly until clean — "
                            "tick realign or drop, then resolve everything in a single re-validate.")
                 if st.button(f"Apply all resolutions & re-validate  ·  {_lbl_re}{len(_all_drop)} column(s){_lbl_tbl} to drop",
@@ -4369,6 +4534,11 @@ elif step == 3:
                         fixed, _rn = realign_column_types(st.session_state.transformed_items, _all_realign)
                         st.session_state.transformed_items = fixed
                         st.session_state.setdefault("realign_types", {}).update(_all_realign)   # durable
+                    if _all_recase:
+                        fixed, _ = recase_columns(st.session_state.transformed_items,
+                                                  _recase_map(_all_recase))
+                        st.session_state.transformed_items = fixed
+                        st.session_state.setdefault("recase_target_approved", {}).update(_all_recase)
                     if _all_drop:
                         fixed, _man = drop_columns(st.session_state.transformed_items, _all_drop)
                         st.session_state.transformed_items = fixed
@@ -4399,6 +4569,8 @@ elif step == 3:
                             st.session_state.pop("src_type_drop_selected", None)
                             st.session_state.pop("tm_drop_selected", None)
                             st.session_state.pop("tm_realign_selected", None)
+                            st.session_state.pop("tc_recase_selected", None)
+                            st.session_state.pop("tc_drop_selected", None)
                             st.session_state.pop("_source_col_map", None)    # stale after drops
                     if _res:
                         st.rerun()
