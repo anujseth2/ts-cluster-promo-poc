@@ -32,6 +32,7 @@ from services.import_diagnostics import (
     restore_unneeded_type_changes, promotion_plan, scan_names_for_drops,
     dependents_using_columns,
     blocking, warnings_only, is_blocking_result, drop_column_properties,
+    distinct_causes, rejected_for_others,
 )
 from services.target_cascade import (
     plan_tree, subtree_actions, tree_lines, dry_run_plan, snapshot_plan, apply_order,
@@ -2576,8 +2577,11 @@ elif step == 3:
                     found = found + [d for d in _static if finding_key(d) not in _fk]
                 for f in found:
                     seen.setdefault(finding_key(f), f)
-                _tick(f"Pass {passes} · {len(errs)} error(s) → {len(found)} finding(s) this pass, "
-                      f"{len(seen)} unique so far; resolving on a copy…", 0.80)
+                _rej = sum(1 for r in errs if rejected_for_others(r))
+                _tick(f"Pass {passes} · {len(errs) - _rej} file error(s)"
+                      + (f" (+{_rej} rejected only because another file failed)" if _rej else "")
+                      + f" → {len(distinct_causes(found))} cause(s) this pass, "
+                      f"{len(distinct_causes(seen.values()))} so far; resolving on a copy…", 0.80)
                 # Neutralize this pass's issues on the copy so the NEXT ones surface.
                 drop_set, viz_set, tbl_set = set(), set(), set()
                 for f in found:
@@ -2731,7 +2735,8 @@ elif step == 3:
             _tail = {"clean": " — validated clean.",
                      "no_progress": " — stopped; remaining errors can't be auto-resolved.",
                      "request_failed": " — stopped: the target connection failed."}[_reason]
-            status_ctx.update(label=f"Found {len(_found)} issue(s) over {_passes} pass(es)" + _tail,
+            status_ctx.update(label=f"Found {len(distinct_causes(blocking(_found)))} issue(s) over "
+                                    f"{_passes} pass(es)" + _tail,
                               state=("complete" if _reason != "request_failed" else "error"),
                               expanded=False)
 
@@ -2939,7 +2944,7 @@ elif step == 3:
             _rtail = {"clean": " · validated clean",
                       "no_progress": " · stopped before clean (remaining errors can't be auto-resolved)",
                       "request_failed": " · stopped: connection to the target failed — warm the warehouse and retry"}
-            _n_block = len(blocking(st.session_state.get("discovered_findings", [])))
+            _n_block = len(distinct_causes(blocking(st.session_state.get("discovered_findings", []))))
             _n_warn  = len(st.session_state.get("accepted_warnings") or [])
             st.caption(f"Validation: {_n_block} issue(s)"
                        + (f" · {_n_warn} accepted with a warning" if _n_warn else "")
@@ -2985,10 +2990,17 @@ elif step == 3:
         # each file's status/error). Full history appended to logs/validate_runs.jsonl.
         _lv = st.session_state.get("_last_validate")
         if _lv:
-            _n_err = sum(1 for r in _lv["results"]
-                         if (r.get("status") or "").upper() not in ("OK", "WARNING"))
-            with st.expander(f"Validation run log — {len(_lv['results'])} file(s), {_n_err} error(s) "
-                             f"· {_lv['ts']}  (full history in logs/validate_runs.jsonl)"):
+            _failed = [r for r in _lv["results"]
+                       if (r.get("status") or "").upper() not in ("OK", "WARNING")]
+            # In an all-or-nothing batch one failing file gets ThoughtSpot's batch notice attached
+            # to every other file. Those were rejected because of it, not for errors of their own.
+            _n_others = sum(1 for r in _failed if rejected_for_others(r))
+            _n_err = len(_failed) - _n_others
+            with st.expander(f"Validation run log — {len(_lv['results'])} file(s), {_n_err} with an "
+                             "error of their own"
+                             + (f", {_n_others} rejected only because another file failed"
+                                if _n_others else "")
+                             + f" · {_lv['ts']}  (full history in logs/validate_runs.jsonl)"):
                 import pandas as pd
                 st.dataframe(_sno(pd.DataFrame(_lv["results"])[["name", "status", "error"]]),
                              use_container_width=True, hide_index=True)
@@ -3082,7 +3094,8 @@ elif step == 3:
 
             _unverified = sum(1 for f in wh_missing if not f.get("verified"))
             if findings:
-                _issue_msg = f"Validation found {len(findings)} issue(s) to resolve before import."
+                _issue_msg = (f"Validation found {len(distinct_causes(findings))} issue(s) to resolve "
+                              "before import.")
                 if _unverified:
                     _issue_msg += (f"  {_unverified} column(s) below could not be checked against the "
                                    "warehouse (marked ⚠︎ unverified).")
@@ -5090,11 +5103,20 @@ elif step == 5:
         _src_h = opt_env("TS_SOURCE_HOST").replace("https://", "").rstrip("/") or "source"
         _tgt_h = opt_env("TS_TARGET_HOST").replace("https://", "").rstrip("/") or "target"
         st.markdown(f"Promoted **{len(df)}** object(s):  `{_src_h}`  →  `{_tgt_h}`  ·  team **{team_name}**")
+        # An all-or-nothing import rejects every object when one fails; those carry ThoughtSpot's
+        # batch notice naming the real culprit. Count only the objects that failed on their own.
+        _rej_n = (int(failed.apply(lambda r: rejected_for_others(r.to_dict()), axis=1).sum())
+                  if not failed.empty else 0)
         col1, col2, col3, col4 = st.columns(4)
         col1.metric("Succeeded",  len(success))
-        col2.metric("Failed",     len(failed))
+        col2.metric("Failed",     len(failed) - _rej_n,
+                    help=(f"{_rej_n} more were not imported only because another object failed "
+                          "(the import is all-or-nothing)." if _rej_n else None))
         col3.metric("With a warning", len(warned))
         col4.metric("Duplicates", dup_ct)
+        if _rej_n:
+            st.caption(f"{_rej_n} other object(s) were not imported only because another object "
+                       "failed. The import is all-or-nothing, so they land once that one is fixed.")
         # One roll-up line: how each succeeded object landed on the target + what kinds shifted.
         if not success.empty:
             _created = int((success["change"] == "created").sum())

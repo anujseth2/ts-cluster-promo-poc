@@ -361,6 +361,55 @@ def blocking(findings):
     return [f for f in (findings or []) if f.get("severity", "error") != "warning"]
 
 
+_UMBRELLA_HEAD = re.compile(r"Unable to import tml due to following errors:", re.I)
+_UMBRELLA_ITEM = re.compile(r"-\s*<b>([^<]+)</b>\s*:[^<]*", re.I)
+_UMBRELLA_BOILERPLATE = re.compile(
+    r"<[^>]+>|SOLUTION:|Either fix the error objects or remove those objects from import"
+    r"(?: and then re-import)?\.?", re.I)
+_ERROR_IDS = re.compile(
+    r"(?:Incident Id:\s*)?\[?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\]?", re.I)
+
+
+def rejected_for_others(result) -> bool:
+    """True when a file's only error is ThoughtSpot's batch notice ("Unable to import tml due to
+    following errors: - X: ...") and the objects it names are not this file. In an all-or-nothing
+    import one failing file gets that notice attached to every other file, so those files were
+    rejected because of someone else, not for anything wrong with them."""
+    msg = (result or {}).get("error") or ""
+    if not _UMBRELLA_HEAD.search(msg):
+        return False
+    named = {n.strip().lower() for n in _UMBRELLA_ITEM.findall(msg)}
+    rest = _UMBRELLA_BOILERPLATE.sub("", _UMBRELLA_ITEM.sub("", _UMBRELLA_HEAD.sub("", msg)))
+    if rest.strip():
+        return False   # carries something of its own beyond the notice
+    return ((result.get("name") or "").strip().lower() not in named)
+
+
+def _normalised_error(msg):
+    """An error's text without the per-occurrence incident ids, so one cause reported on several
+    files reads as one."""
+    return re.sub(r"\s+", " ", _ERROR_IDS.sub("", msg or "")).strip().lower()[:300]
+
+
+def distinct_causes(findings):
+    """One finding per underlying cause, for counting. ThoughtSpot repeats a cause in ways the
+    finding keys keep apart: a blocked table appears once from the batch notice (table only) and
+    once with its column and dependents, and an unclassified error repeats on every file it
+    touched with a fresh incident id each time."""
+    findings = list(findings or [])
+    detailed = {(f.get("object") or "").strip().lower() for f in findings
+                if f.get("kind") == "drop_blocked_by_dependents" and f.get("columns")}
+    seen = {}
+    for f in findings:
+        k = f.get("kind")
+        obj = (f.get("object") or "").strip().lower()
+        if k == "drop_blocked_by_dependents" and not f.get("columns") and obj in detailed:
+            continue
+        key = (k, _normalised_error(f.get("error"))) if k == "other" else finding_key(f)
+        seen.setdefault(key, f)
+    return list(seen.values())
+
+
 def warnings_only(findings):
     """The findings ThoughtSpot accepted but wants the operator to know about."""
     return [f for f in (findings or []) if f.get("severity") == "warning"]

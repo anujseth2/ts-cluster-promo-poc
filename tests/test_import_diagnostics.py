@@ -1023,3 +1023,63 @@ def test_a_column_you_dropped_is_not_a_silent_drop_risk():
     assert expected == [("sales_customers", ["customerID"])], "your own drop is expected, not a risk"
     assert surprise == [("sales_customers", ["legacy_flag"])], \
         "a column nobody dropped IS the surprise worth stopping for"
+
+
+# ── Counting causes, not rows ────────────────────────────────────────────────────────────────
+
+from services.import_diagnostics import distinct_causes, rejected_for_others
+
+_NOTICE = ("Unable to import tml due to following errors:<br/>- <b>dim_location_respbio_br</b>: "
+           "Deleted columns have dependents.<br/><br/><b>SOLUTION:</b><br/>Either fix the error "
+           "objects or remove those objects from import and then re-import.<br/>")
+_SPECIFIC = ("Deleted columns have dependents.<br/>- <b>CITY</b><ul><li>OE test - Respbio "
+             "Subnational Performance</li></ul><br/><b>SOLUTION:</b><br/>Either replace the "
+             "deleted columns, or remove the dependencies.<br/>")
+
+
+def test_batch_notice_on_another_file_is_rejected_for_others():
+    assert rejected_for_others({"name": "fact_sales", "status": "ERROR", "error": _NOTICE})
+
+
+def test_batch_notice_naming_the_file_itself_is_its_own_failure():
+    assert not rejected_for_others(
+        {"name": "dim_location_respbio_br", "status": "ERROR", "error": _NOTICE})
+
+
+def test_a_specific_error_is_never_rejected_for_others():
+    assert not rejected_for_others({"name": "x", "status": "ERROR", "error": _SPECIFIC})
+
+
+def test_notice_plus_its_own_detail_is_not_rejected_for_others():
+    assert not rejected_for_others(
+        {"name": "x", "status": "ERROR", "error": _NOTICE + "Formula Revenue is invalid."})
+
+
+def test_gsk_run_shape_counts_two_causes_not_thirty_one():
+    # 29 files carry the batch notice, the blocked table carries the detail, and one model column
+    # has an invalid property: two causes.
+    results = ([{"name": f"file_{i}", "status": "ERROR", "error": _NOTICE} for i in range(29)]
+               + [{"name": "dim_location_respbio_br", "status": "ERROR", "error": _SPECIFIC},
+                  {"name": "OE test", "status": "ERROR",
+                   "error": "Model/Worksheet columns have invalid properties.<br/>- "
+                            "fact_subnational_day_bridge_respbio_br::DAY_DATE_FIELD * calendar"}])
+    found = classify_import_errors(results)
+    assert len(distinct_causes(found)) == 2
+    assert sum(1 for r in results if rejected_for_others(r)) == 29
+
+
+def test_one_unclassified_error_on_two_files_is_one_cause():
+    err = ("Data source metadata could not be found.<br/>Error Code: CONNECTION_CREATION_ERROR "
+           "Incident Id: {} Error Message: Failed to initialize pool [{}]")
+    a = err.format("358c1065-4686-46f4-874c-32e1709fd269", "bbb19084-8fda-4c02-80c1-8733c8fd99c3")
+    b = err.format("4bfbd4ee-6c18-4137-a44a-550fd650c2d6", "de59197f-8d11-4b30-a688-783672998555")
+    found = classify_import_errors([{"name": "sales_customers", "status": "ERROR", "error": a},
+                                    {"name": "unknown", "status": "ERROR", "error": b}])
+    assert len(found) == 2
+    assert len(distinct_causes(found)) == 1
+
+
+def test_distinct_causes_keeps_genuinely_different_columns_apart():
+    found = [{"kind": "missing_in_target_warehouse", "object": "t", "column": "a"},
+             {"kind": "missing_in_target_warehouse", "object": "t", "column": "b"}]
+    assert len(distinct_causes(found)) == 2
