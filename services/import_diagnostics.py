@@ -749,6 +749,36 @@ def column_roles(items) -> dict:
     return out
 
 
+def measures_that_convert(items) -> list:
+    """Every column the bundle declares MEASURE with a type a measure can't have, i.e. the ones
+    ThoughtSpot will turn into attributes on import. Read from the bundle itself because the
+    platform's own warning is incomplete: with two such columns on one table it named only one
+    (seen on ps-internal). Returns [{"object", "column", "data_type"}]."""
+    out = []
+    for it in items or []:
+        try:
+            t = (_parse_edoc(it) or {}).get("table") or {}
+        except Exception:
+            continue
+        for c in t.get("columns", []) or []:
+            dt = (c.get("db_column_properties") or {}).get("data_type") or ""
+            if measure_becomes_attribute((c.get("properties") or {}).get("column_type"), dt):
+                out.append({"object": t.get("name"), "column": c.get("name"), "data_type": dt})
+    return out
+
+
+def converted_measures(items, findings) -> list:
+    """The measures that become attributes: those the bundle predicts plus any the platform named,
+    once each. Returns [(table, column)]."""
+    seen, out = set(), []
+    for f in list(measures_that_convert(items)) + [
+            f for f in (findings or []) if f.get("kind") == "measure_became_attribute"]:
+        key = ((f.get("object") or "").lower(), (f.get("column") or "").lower())
+        if key not in seen:
+            seen.add(key); out.append((f.get("object"), f.get("column")))
+    return out
+
+
 def measure_note(roles: dict, table, column, new_type) -> str:
     """The warning to show beside a realign that would turn a measure into an attribute, or ""."""
     role = roles.get(((table or "").strip().lower(), (column or "").strip().lower()), "")

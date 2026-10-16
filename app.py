@@ -33,7 +33,7 @@ from services.import_diagnostics import (
     dependents_using_columns,
     blocking, warnings_only, is_blocking_result, drop_column_properties,
     distinct_causes, rejected_for_others, warehouse_case_findings, recased_columns,
-    column_roles, measure_note,
+    column_roles, measure_note, converted_measures,
 )
 from services.target_cascade import (
     plan_tree, subtree_actions, tree_lines, dry_run_plan, snapshot_plan, apply_order,
@@ -3018,6 +3018,19 @@ elif step == 3:
                        + (f" · {_n_warn} accepted with a warning" if _n_warn else "")
                        + f" over {_dm['passes']} pass(es)"
                        + _rtail.get(_dm.get("reason", ""), ""))
+            # A measure ThoughtSpot turns into an attribute is a real change on the target, not a
+            # formality. Shown here so it appears whether or not validation is otherwise clean
+            # (it usually is, right after the realign that causes it).
+            # From the bundle as well as the platform's warning, which names only one per table.
+            _m2a = converted_measures(st.session_state.get("transformed_items"),
+                                      st.session_state.get("accepted_warnings"))
+            if _m2a:
+                st.warning("ThoughtSpot will turn these **measures into attributes** on the target, "
+                           "because of the type they now have: "
+                           + ", ".join(f"`{t}`.`{c}`" for t, c in _m2a)
+                           + ". They can no longer be summed, and anything on the target that sums "
+                             "them will need changing. Clear the realign and drop the column instead "
+                             "if that isn't wanted.")
 
         # Type realignments are DURABLE: once approved they are re-applied to every export from
         # then on. So a realignment approved under an older, stricter rule keeps rewriting the TML
@@ -3185,16 +3198,6 @@ elif step == 3:
                            f"{len(accepted)} warning(s), listed below.")
 
             # ── accepted with a warning: applied by the platform, no action required ──
-            # A measure ThoughtSpot turned into an attribute is a real change on the target, not a
-            # formality, so it gets its own callout instead of sitting in the collapsed list below.
-            _m2a = [f for f in (accepted or []) if f["kind"] == "measure_became_attribute"]
-            if _m2a:
-                st.warning("ThoughtSpot will turn these **measures into attributes** on the target, "
-                           "because of the type they now have: "
-                           + ", ".join(f"`{f.get('object')}`.`{f.get('column')}`" for f in _m2a)
-                           + ". They can no longer be summed, and anything on the target that sums "
-                             "them will need changing. Clear the realign and drop the column instead "
-                             "if that isn't wanted.")
             if accepted:
                 _tc = [f for f in accepted if f["kind"] == "type_changed_notice"]
                 with st.expander(f"Accepted with a warning — {len(accepted)} item(s), no action "
@@ -5330,11 +5333,11 @@ elif step == 5:
         if _rej_n:
             st.caption(f"{_rej_n} other object(s) were not imported only because another object "
                        "failed. The import is all-or-nothing, so they land once that one is fixed.")
-        _m2a_imp = [f for f in classify_import_errors(results)
-                    if f["kind"] == "measure_became_attribute"]
+        _m2a_imp = converted_measures(st.session_state.get("transformed_items"),
+                                      classify_import_errors(results))
         if _m2a_imp:
             st.warning("Landed as **attributes, not measures**, because of their type on the target: "
-                       + ", ".join(f"`{f.get('object')}`.`{f.get('column')}`" for f in _m2a_imp)
+                       + ", ".join(f"`{t}`.`{c}`" for t, c in _m2a_imp)
                        + ". They can no longer be summed there.")
         # One roll-up line: how each succeeded object landed on the target + what kinds shifted.
         if not success.empty:

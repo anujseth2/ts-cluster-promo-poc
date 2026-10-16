@@ -1159,3 +1159,18 @@ def test_the_platform_conversion_warning_is_classified():
     found = classify_import_errors([{"name": "role_probe", "status": "WARNING", "error": msg}])
     assert [(f["kind"], f["column"], f["severity"]) for f in found] == [
         ("measure_became_attribute", "m_date", "warning")]
+
+
+def test_converted_measures_lists_what_the_platform_left_out(make_table_doc, make_item):
+    from services.import_diagnostics import converted_measures
+    doc = make_table_doc(columns=[("amount", "VARCHAR"), ("units", "BOOL"), ("qty", "INT64")])
+    for c in doc["table"]["columns"]:
+        c["properties"]["column_type"] = "MEASURE"
+    item = make_item(doc, "promo_split_region_sales")
+    doc["table"]["name"] = "promo_split_region_sales"
+    item = make_item(doc, "promo_split_region_sales")
+    # the platform's warning named only `units` for a table where two measures convert
+    platform = [{"kind": "measure_became_attribute", "object": "promo_split_region_sales",
+                 "column": "units"}]
+    assert converted_measures([item], platform) == [
+        ("promo_split_region_sales", "amount"), ("promo_split_region_sales", "units")]
