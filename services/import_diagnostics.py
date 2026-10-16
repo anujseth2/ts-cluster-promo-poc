@@ -160,6 +160,12 @@ def friendly_error(msg: str):
     return None, None, _clean(msg)
 
 
+# ThoughtSpot's notice when a column declared MEASURE has a type a measure can't have.
+_MEASURE_TO_ATTRIBUTE = re.compile(
+    r"Incompatible column type MEASURE\.\s*Using correct column type ATTRIBUTE for column having "
+    r"name (.+?) and db_column_name (.+?)\.(?:\s|<|$)", re.I)
+
+
 def classify_import_errors(results):
     """results: [{'name','type','status','error'}] from TSClient.import_tml.
     Returns findings: list of {kind, object, ...}:
@@ -338,6 +344,11 @@ def classify_import_errors(results):
                              "guids": [g.strip() for v in _by_type.values()
                                        for g in v.split(",") if g.strip()],
                              "error": msg.strip()})
+        for _nm, _dbn in _MEASURE_TO_ATTRIBUTE.findall(msg):
+            matched = True
+            findings.append({"kind": "measure_became_attribute", "object": r.get("name"),
+                             "column": _nm.strip(), "db_column": _dbn.strip(),
+                             "error": msg.strip()})
         if not matched:
             findings.append({"kind": "other", "object": r.get("name"), "error": msg.strip()})
         for _f in findings[_start:]:
@@ -434,6 +445,8 @@ def finding_key(f):
                 (f.get("missing_ref") or "").strip().lower())
     if k == "model_table_no_columns":
         return (k, obj, tuple(sorted((t or "").lower() for t in f.get("tables", []))))
+    if k == "measure_became_attribute":
+        return (k, obj, (f.get("column") or "").strip().lower())
     if k in ("type_changed_notice", "invalid_type_token"):
         return (k, obj, (f.get("column") or "").strip().lower())
     if k == "table_missing_on_target":
@@ -705,6 +718,44 @@ def warehouse_missing_findings(items, cdw_map, fallback_map=None, connection="")
                                "modeled could show here. Verify before dropping.")
             findings.append(f)
     return findings
+
+
+def measure_becomes_attribute(column_type, new_type) -> bool:
+    """True when giving a MEASURE column `new_type` makes ThoughtSpot turn it into an ATTRIBUTE.
+
+    A measure has to be numeric. Verified on ps-internal (VALIDATE_ONLY): a MEASURE declared
+    VARCHAR, DATE, BOOL or DATE_TIME is each accepted with "Incompatible column type MEASURE.
+    Using correct column type ATTRIBUTE", while INT64 and DOUBLE stay measures. An unknown type
+    claims nothing."""
+    return ((column_type or "").strip().upper() == "MEASURE"
+            and type_family(new_type) in ("str", "bool", "date"))
+
+
+def column_roles(items) -> dict:
+    """{(table_lower, column_lower): column_type} for every table column in the bundle, keyed by
+    both the physical db_column_name and the logical name, so either form of a finding finds it."""
+    out = {}
+    for it in items or []:
+        try:
+            t = (_parse_edoc(it) or {}).get("table") or {}
+        except Exception:
+            continue
+        tn = (t.get("name") or "").strip().lower()
+        for c in t.get("columns", []) or []:
+            role = ((c.get("properties") or {}).get("column_type") or "").upper()
+            for n in (c.get("db_column_name"), c.get("name")):
+                if tn and n:
+                    out[(tn, n.strip().lower())] = role
+    return out
+
+
+def measure_note(roles: dict, table, column, new_type) -> str:
+    """The warning to show beside a realign that would turn a measure into an attribute, or ""."""
+    role = roles.get(((table or "").strip().lower(), (column or "").strip().lower()), "")
+    if not measure_becomes_attribute(role, new_type):
+        return ""
+    return (f"a measure here: as {new_type} ThoughtSpot makes it an attribute on the target, so it "
+            "can no longer be summed, and anything there that sums it will need changing")
 
 
 def recased_columns(source_items, shipped_items):

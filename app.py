@@ -33,6 +33,7 @@ from services.import_diagnostics import (
     dependents_using_columns,
     blocking, warnings_only, is_blocking_result, drop_column_properties,
     distinct_causes, rejected_for_others, warehouse_case_findings, recased_columns,
+    column_roles, measure_note,
 )
 from services.target_cascade import (
     plan_tree, subtree_actions, tree_lines, dry_run_plan, snapshot_plan, apply_order,
@@ -2143,6 +2144,7 @@ elif step == 2:
                 _stsel  = st.session_state.setdefault("src_type_drop_selected", set())
                 _strsel = st.session_state.setdefault("src_type_realign_selected", set())
                 _src_realign_to = {}   # scoped key -> TS token, from the SOURCE warehouse type
+                _st_roles = column_roles(st.session_state.get("transformed_items", []))
                 _strows = []
                 for _f in sorted(_stfind, key=lambda x: ((x.get("object") or "").lower(),
                                                          (x.get("column") or "").lower())):
@@ -2159,11 +2161,15 @@ elif step == 2:
                                     "Source type": (_scdw.upper() if _scdw else "(?)"),
                                     "TML type": _tml or "(?)",
                                     "Realign to": _ral if _ral else "—",
+                                    "Note": (f"⚠ {measure_note(_st_roles, _tbl, _f['column'], _ral)}"
+                                             if _ral and measure_note(_st_roles, _tbl, _f["column"], _ral)
+                                             else ""),
                                     "Realign?": _sk in _strsel,
                                     "Drop?": _sk in _stsel, "_scoped": _sk})
                 st.session_state._src_realign_to = _src_realign_to
                 _stdf = pd.DataFrame(_strows, columns=["Table", "Column", "Source type", "TML type",
-                                                       "Realign to", "Realign?", "Drop?", "_scoped"])
+                                                       "Realign to", "Note", "Realign?", "Drop?",
+                                                       "_scoped"])
                 _realignable = [r["_scoped"] for _, r in _stdf.iterrows()
                                 if r.get("Realign to") not in ("—", "", None)]
                 _stb1, _stb2, _stb3, _ = st.columns([1.3, 1, 1, 2])
@@ -2197,13 +2203,23 @@ elif step == 2:
                                         help="The TS token a realign writes to the TML, from the source "
                                              "warehouse's type. '—' when the source has no usable type "
                                              "(drop instead)."),
+                        "Note": st.column_config.TextColumn("Note", width="large",
+                                  help="What else a realign changes, e.g. a measure that would "
+                                       "become an attribute."),
                         "Realign?": st.column_config.CheckboxColumn("Realign?", width="small",
                                       help="Rewrite the TML type to match the source (approve-first)."),
                         "Drop?":  st.column_config.CheckboxColumn("Drop?", width="small",
                                     help="Last resort: drop this column (scoped to this table)."),
                     },
-                    disabled=["Table", "Column", "Source type", "TML type", "Realign to"],
+                    disabled=["Table", "Column", "Source type", "TML type", "Realign to", "Note"],
                     exclusive=True)   # Realign? wins over Drop? per row
+                _st_m2a = [r for r in _strows if r.get("Note")]
+                if _st_m2a:
+                    st.warning("Realigning " + ", ".join(
+                        f"`{r['Table']}`.`{r['Column']}` to {r['Realign to']}" for r in _st_m2a)
+                        + " turns a **measure into an attribute**: it can no longer be summed, and "
+                          "anything that sums it will need changing. Drop it instead if that isn't "
+                          "wanted.")
                 st.caption(f"**{len(_strsel)}** to realign, **{len(_stsel)}** to drop.")
                 if (_stsel or _strsel) and st.button("Apply source type fixes", key="srctype_apply"):
                     _items = st.session_state.transformed_items
@@ -3169,6 +3185,16 @@ elif step == 3:
                            f"{len(accepted)} warning(s), listed below.")
 
             # ── accepted with a warning: applied by the platform, no action required ──
+            # A measure ThoughtSpot turned into an attribute is a real change on the target, not a
+            # formality, so it gets its own callout instead of sitting in the collapsed list below.
+            _m2a = [f for f in (accepted or []) if f["kind"] == "measure_became_attribute"]
+            if _m2a:
+                st.warning("ThoughtSpot will turn these **measures into attributes** on the target, "
+                           "because of the type they now have: "
+                           + ", ".join(f"`{f.get('object')}`.`{f.get('column')}`" for f in _m2a)
+                           + ". They can no longer be summed, and anything on the target that sums "
+                             "them will need changing. Clear the realign and drop the column instead "
+                             "if that isn't wanted.")
             if accepted:
                 _tc = [f for f in accepted if f["kind"] == "type_changed_notice"]
                 with st.expander(f"Accepted with a warning — {len(accepted)} item(s), no action "
@@ -3230,7 +3256,7 @@ elif step == 3:
                         st.dataframe(_sno(pd.DataFrame(_rows_tc)),
                                      use_container_width=True, hide_index=True)
                     for f in accepted:
-                        if f["kind"] == "type_changed_notice":
+                        if f["kind"] in ("type_changed_notice", "measure_became_attribute"):
                             continue
                         st.markdown(f"**{f.get('object') or '(not named)'}** — "
                                     f"{f.get('error', '')}")
@@ -3974,6 +4000,7 @@ elif step == 3:
                 _tmsel   = st.session_state.setdefault("tm_drop_selected", set())
                 _tmrsel  = st.session_state.setdefault("tm_realign_selected", set())
                 _realign_to = {}   # scoped key -> the TS TOKEN a realign would write
+                _tm_roles = column_roles(st.session_state.get("transformed_items", []))
                 # Columns already dropped this run are NOT candidates — otherwise a column you resolved
                 # by dropping keeps reappearing one re-validate at a time.
                 _already_gone = st.session_state.get("dropped_col_names", set())
@@ -4037,6 +4064,11 @@ elif step == 3:
                         _issue = "target type has no ThoughtSpot equivalent; fix the warehouse, or drop"
                     else:
                         _issue = "target warehouse type unread; drop, or re-read the warehouse"
+                    # Say it BEFORE the realign is ticked: a measure can't be text, a date or a
+                    # boolean, and ThoughtSpot only mentions the conversion as a warning afterwards.
+                    _mn = measure_note(_tm_roles, obj, col, _ralign) if _ralign else ""
+                    if _mn:
+                        _issue = f"⚠ {_mn}. {_issue}"
                     if _ralign:
                         _realign_to[_scoped] = _ralign
                     _rows.append({
@@ -4178,6 +4210,13 @@ elif step == 3:
                     disabled=["#", "Table", "Column", "Source CDW", "Source TML", "Target CDW",
                               "Issue", "Realign to"],
                     exclusive=True)   # Realign? wins over Drop? per row
+                _tm_m2a = [r for r in _rows if str(r.get("Issue", "")).startswith("⚠")]
+                if _tm_m2a:
+                    st.warning("Realigning " + ", ".join(
+                        f"`{r['Table']}`.`{r['Column']}` to {r['Realign to']}" for r in _tm_m2a)
+                        + " turns a **measure into an attribute** on the target: it can no longer "
+                          "be summed, and anything there that sums it will need changing. Drop it, "
+                          "or fix the target warehouse, if that isn't wanted.")
                 st.caption(f"**{len(_tmrsel)}** to realign, **{len(_tmsel)}** to drop. Realigning "
                            "keeps the column (your approval, not automatic); drop only as a last "
                            "resort.")
@@ -5291,6 +5330,12 @@ elif step == 5:
         if _rej_n:
             st.caption(f"{_rej_n} other object(s) were not imported only because another object "
                        "failed. The import is all-or-nothing, so they land once that one is fixed.")
+        _m2a_imp = [f for f in classify_import_errors(results)
+                    if f["kind"] == "measure_became_attribute"]
+        if _m2a_imp:
+            st.warning("Landed as **attributes, not measures**, because of their type on the target: "
+                       + ", ".join(f"`{f.get('object')}`.`{f.get('column')}`" for f in _m2a_imp)
+                       + ". They can no longer be summed there.")
         # One roll-up line: how each succeeded object landed on the target + what kinds shifted.
         if not success.empty:
             _created = int((success["change"] == "created").sum())

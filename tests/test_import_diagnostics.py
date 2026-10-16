@@ -1122,3 +1122,40 @@ def test_recased_columns_compares_source_with_what_shipped(make_table_doc, make_
     shipped = make_item(shipped_doc, "commerce")
     assert recased_columns([src], [shipped]) == [
         {"table": "commerce", "from": "Region", "to": "REGION"}]
+
+
+# ── A measure realigned to a non-numeric type becomes an attribute ──────────────────────────
+
+import pytest
+from services.import_diagnostics import measure_becomes_attribute, column_roles, measure_note
+
+
+@pytest.mark.parametrize("token,converts", [
+    ("VARCHAR", True), ("DATE", True), ("BOOL", True), ("DATE_TIME", True),   # verified on cluster
+    ("INT64", False), ("DOUBLE", False),                                     # verified on cluster
+    ("INT32", False), ("FLOAT", False), ("", False),
+])
+def test_measure_becomes_attribute_matches_the_cluster(token, converts):
+    assert measure_becomes_attribute("MEASURE", token) is converts
+
+
+def test_an_attribute_never_converts():
+    assert not measure_becomes_attribute("ATTRIBUTE", "VARCHAR")
+
+
+def test_measure_note_names_the_consequence(make_table_doc, make_item):
+    doc = make_table_doc(columns=[("amount", "DOUBLE")])
+    doc["table"]["columns"][0]["properties"]["column_type"] = "MEASURE"
+    roles = column_roles([make_item(doc, "commerce")])
+    assert "attribute on the target" in measure_note(roles, "commerce", "amount", "VARCHAR")
+    assert measure_note(roles, "commerce", "amount", "INT64") == ""
+    assert measure_note(roles, "commerce", "other", "VARCHAR") == ""
+
+
+def test_the_platform_conversion_warning_is_classified():
+    msg = ("Incompatible column type MEASURE. Using correct column type ATTRIBUTE for column "
+           "having name m_date and db_column_name m_date.<br/>Object with GUID x already exists. "
+           "New GUID will be used. <br/>")
+    found = classify_import_errors([{"name": "role_probe", "status": "WARNING", "error": msg}])
+    assert [(f["kind"], f["column"], f["severity"]) for f in found] == [
+        ("measure_became_attribute", "m_date", "warning")]
