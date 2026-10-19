@@ -571,6 +571,16 @@ def _target_conn_label() -> str:
                              if v}))
 
 
+def _source_connection_names():
+    """(names, error) for the source cluster's connections, read once per session."""
+    if "_src_conn_names" not in st.session_state:
+        try:
+            st.session_state._src_conn_names = (source_client().list_connection_names(), None)
+        except Exception as e:
+            st.session_state._src_conn_names = (None, str(e))
+    return st.session_state._src_conn_names
+
+
 def _source_table_coords() -> dict:
     """db / schema / db_table and the source connection of every promoted table, read from the
     RAW source export (before any remap), keyed by lowercased table name."""
@@ -823,31 +833,59 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Connections")
-    st.caption("For each connection the promoted content uses, the target connection it should "
-               "point at.")
-    # Rows: the connections in the current export, plus any this team already has a choice for.
-    # Choices come from the target cluster's own list, so nothing has to be typed or guessed.
+    st.caption("Each source connection the selected content uses, and the target connection it "
+               "should point at on the target cluster.")
+    # Rows: connections of the selected content (known as soon as something is ticked), of the
+    # prepared bundle, any this team already has a choice for, and any added by hand below.
     _found_c = st.session_state.get("_export_conn_names") or []
     _saved_c = saved_map(team_cfg, _found_c)
+    _manual_c = st.session_state.setdefault("_manual_src_conns", set())
+    _rows_c = sorted(set(_found_c) | set(st.session_state.get("_selected_conn_names") or [])
+                     | set(_saved_c) | _manual_c)
     _tnames, _terr = _target_connection_names()
     _CHOOSE = "(choose a target connection)"
     _conn_picks = {}
-    if not (set(_found_c) | set(_saved_c)):
-        st.caption("_Listed here once the selection has been prepared on Source Audit._")
-    for _sc in sorted(set(_found_c) | set(_saved_c)):
-        _cur = _saved_c.get(_sc) or (_sc if _tnames and _sc in _tnames else "")
+    if not _rows_c:
+        st.caption("_None yet: select content in step 1, or add a source connection below._")
+    for _sc in _rows_c:
+        _from = ("saved for this team" if _saved_c.get(_sc)
+                 else "same name on the target" if _tnames and _sc in _tnames else "")
+        _cur = _saved_c.get(_sc) or (_sc if _from else "")
         _ck = f"connmap::{team_name}::{_sc}"
+        st.markdown(f"**Source:** {_sc}")
         if _tnames is not None:
             _opts = [_CHOOSE] + list(_tnames) + ([_cur] if _cur and _cur not in _tnames else [])
-            _v = st.selectbox(_sc, _opts, index=_opts.index(_cur) if _cur else 0, key=_ck,
-                              help="Target connection for content on this source connection.")
+            _v = st.selectbox("Target connection", _opts, index=_opts.index(_cur) if _cur else 0,
+                              key=_ck, help="The connection on the target cluster that content on "
+                                            "this source connection should use.")
             _conn_picks[_sc] = "" if _v == _CHOOSE else _v
         else:
-            _conn_picks[_sc] = st.text_input(_sc, value=_cur, key=_ck).strip()
+            _conn_picks[_sc] = st.text_input("Target connection", value=_cur, key=_ck).strip()
+        if _conn_picks[_sc] and _conn_picks[_sc] == _cur and _from:
+            st.caption(f"Pre-selected: {_from}.")
+    if st.session_state.get("_selected_conn_err"):
+        st.warning(f"Couldn't read the selected tables' connections: "
+                   f"{st.session_state['_selected_conn_err']}")
     if _terr:
         st.warning(f"Couldn't read the target's connections: {_terr}")
-    if st.button("↻ Refresh target connections", key="refresh_tgt_conns"):
+
+    # Add a mapping for any source connection, before or without selecting content.
+    _snames, _serr = _source_connection_names()
+    _addable = [n for n in (_snames or []) if n not in _rows_c]
+    _ADD = "(pick a source connection)"
+    def _add_src_conn(_k=f"connadd::{team_name}"):
+        _v = st.session_state.get(_k)
+        if _v and _v != _ADD:
+            st.session_state.setdefault("_manual_src_conns", set()).add(_v)
+        st.session_state[_k] = _ADD
+    if _addable:
+        st.selectbox("Add a source connection", [_ADD] + _addable, key=f"connadd::{team_name}",
+                     on_change=_add_src_conn)
+    elif _serr:
+        st.warning(f"Couldn't read the source's connections: {_serr}")
+    if st.button("↻ Refresh connections", key="refresh_tgt_conns"):
         st.session_state.pop("_tgt_conn_names", None)
+        st.session_state.pop("_src_conn_names", None)
         st.rerun()
 
     st.caption("Remap the database / schema names too (leave blank to keep them as-is).")
@@ -1188,15 +1226,17 @@ if step == 0:
 
         c1, c2 = st.columns([3, 1])
         with c1:
-            flt = st.text_input("Search name or tags", "", key="asset_filter",
-                                placeholder="type to narrow the list").strip()
+            flt = st.text_input("Search", "", key="asset_filter",
+                                placeholder="name, type, author, tag, date or obj_id").strip()
         with c2:
             type_opts = ["All"] + sorted(t for t in df["type"].unique() if t)
             type_sel  = st.selectbox("Type", type_opts, key="asset_type")
 
         if flt:
-            df = df[df["name"].str.contains(flt, case=False, na=False)
-                    | df["tags"].str.contains(flt, case=False, na=False)]
+            # Every visible field, so "anuj" finds what Anuj authored, not only names with it.
+            _hay = df[["name", "type", "author", "modified", "created", "tags", "obj_id"]] \
+                .fillna("").astype(str).agg(" ".join, axis=1)
+            df = df[_hay.str.contains(flt, case=False, na=False, regex=False)]
         if type_sel != "All":
             df = df[df["type"] == type_sel]
 
@@ -1292,6 +1332,15 @@ if step == 0:
                     present = set(target_client()._resolve_names_to_ids(mt_names, "LOGICAL_TABLE").keys())
                 except Exception as _e:
                     present, present_err = set(), str(_e)
+            # Which source connections the selection sits on, known now rather than after export,
+            # so the sidebar can show them for mapping straight away.
+            try:
+                _tc = source_client().table_connections(dep["table_ids"])
+                st.session_state._selected_conn_names = sorted({c for c in _tc.values() if c})
+                st.session_state._selected_conn_err = None
+            except Exception as _e:
+                st.session_state._selected_conn_names = []
+                st.session_state._selected_conn_err = str(_e)
             st.session_state.dep_info        = dep
             st.session_state._promo_id2name  = id2name
             st.session_state._promo_present  = present
@@ -1307,10 +1356,14 @@ if step == 0:
                        "prod_leaf", "dev_table_refs", "dev_model_refs", "dev_leaf_refs",
                        "transformed_items", "match_results", "table_remap"):
                 st.session_state.pop(_k, None)
+            st.rerun()   # the sidebar drew before this resolved; redraw it with the connections
         elif not picks:
-            for _k in ("dep_info", "selected_ids"):
+            _had_conns = bool(st.session_state.get("_selected_conn_names"))
+            for _k in ("dep_info", "selected_ids", "_selected_conn_names", "_selected_conn_err"):
                 st.session_state.pop(_k, None)
             st.session_state._resolved_key = None
+            if _had_conns:
+                st.rerun()   # the sidebar drew with the old selection's connections
 
         dep = st.session_state.get("dep_info")
         if dep:

@@ -383,6 +383,24 @@ class TSClient:
                 return o.get("metadata_id")
         return None
 
+    def table_connections(self, table_ids) -> Dict[str, str]:
+        """{table_id: connection name} from the tables' metadata headers (dataSourceName), in one
+        call, so the connections a selection uses are known before anything is exported. Raises on
+        failure rather than returning an empty map."""
+        ids = [i for i in (table_ids or []) if i]
+        if not ids:
+            return {}
+        try:
+            data = self._post("/api/rest/2.0/metadata/search",
+                              {"metadata": [{"identifier": i, "type": "LOGICAL_TABLE"} for i in ids],
+                               "record_size": len(ids)})
+        except requests.HTTPError as e:
+            code = e.response.status_code if e.response is not None else "?"
+            raise RuntimeError(f"Reading the selected tables' connections failed (HTTP {code})") from e
+        rows = data if isinstance(data, list) else (data or {}).get("metadata", [])
+        return {r.get("metadata_id"): ((r.get("metadata_header") or {}).get("dataSourceName") or "")
+                for r in rows if r.get("metadata_id")}
+
     def list_connection_names(self) -> list:
         """Every connection name visible on this cluster, sorted, for the connection picker.
         Raises on failure: an empty list has to mean the cluster has none, not that the read
