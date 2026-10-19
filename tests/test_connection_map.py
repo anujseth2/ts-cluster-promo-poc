@@ -97,3 +97,62 @@ def test_transform_without_a_map_keeps_the_older_pair_behaviour(make_table_doc):
     doc = make_table_doc(connection="Anything")
     out, _ = transform_doc(doc, source_connection="", target_connection="DB Prod")
     assert out["table"]["connection"]["name"] == "DB Prod"
+
+
+# ── database.schema per source connection ────────────────────────────────────────────────────
+
+from services.connection_map import (
+    saved_locations, locations_by_connection, target_copies, effective_locations,
+)
+
+_SEL = {
+    "a": {"name": "a", "connection": "DB Dev", "db": "hive", "schema": "dev_s",
+          "target": {"connection": "DB Prod", "db": "hive", "schema": "prod_s"}},
+    "b": {"name": "b", "connection": "DB Dev", "db": "hive", "schema": "dev_s",
+          "target": {"connection": "DB Prod", "db": "hive", "schema": "prod_s"}},
+    "c": {"name": "c", "connection": "DB Dev", "db": "hive", "schema": "other", "target": None},
+    "d": {"name": "d", "connection": "SF Dev", "db": "ANALYTICS", "schema": "PUBLIC",
+          "target": {"connection": "SF Prod", "db": "ANALYTICS", "schema": "PUBLIC"}},
+}
+
+
+def test_saved_locations_reads_the_pair_list():
+    cfg = {"location_map": [{"source_db": "hive", "source_schema": "dev_s",
+                             "target_db": "hive", "target_schema": "prod_s"}]}
+    assert saved_locations(cfg) == {("hive", "dev_s"): ("hive", "prod_s")}
+
+
+def test_locations_are_grouped_by_connection_then_pair():
+    by = locations_by_connection(_SEL)
+    assert by["DB Dev"] == {("hive", "dev_s"): ["a", "b"], ("hive", "other"): ["c"]}
+    assert by["SF Dev"] == {("ANALYTICS", "PUBLIC"): ["d"]}
+
+
+def test_target_copies_reports_connection_location_and_missing():
+    tc = target_copies(_SEL, "DB Dev")
+    assert tc["connections"] == {"DB Prod"} and tc["missing"] == ["c"]
+    assert target_copies(_SEL, "DB Dev", ("hive", "dev_s"))["locations"] == {("hive", "prod_s")}
+
+
+def test_effective_locations_follow_existing_target_tables_unless_saved():
+    eff = effective_locations({}, _SEL)
+    assert eff == {("hive", "dev_s"): ("hive", "prod_s")}       # identity pairs aren't listed
+    saved = {("hive", "dev_s"): ("hive", "chosen")}
+    assert effective_locations(saved, _SEL)[("hive", "dev_s")] == ("hive", "chosen")
+
+
+def test_transform_maps_database_and_schema_as_a_pair(make_table_doc):
+    one = make_table_doc(db="hive", schema="dev_s")
+    other = make_table_doc(db="other_db", schema="dev_s")      # same schema name, other database
+    lm = {("hive", "dev_s"): ("hive", "prod_s")}
+    out, _ = transform_doc(one, location_map=lm)
+    untouched, _ = transform_doc(other, location_map=lm)
+    assert (out["table"]["db"], out["table"]["schema"]) == ("hive", "prod_s")
+    assert (untouched["table"]["db"], untouched["table"]["schema"]) == ("other_db", "dev_s")
+
+
+def test_pair_mapping_wins_over_the_older_separate_renames(make_table_doc):
+    doc = make_table_doc(db="hive", schema="dev_s")
+    out, _ = transform_doc(doc, db_map={"hive": "x"}, schema_map={"dev_s": "y"},
+                           location_map={("hive", "dev_s"): ("hive", "prod_s")})
+    assert (out["table"]["db"], out["table"]["schema"]) == ("hive", "prod_s")

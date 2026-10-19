@@ -401,6 +401,27 @@ class TSClient:
         return {r.get("metadata_id"): ((r.get("metadata_header") or {}).get("dataSourceName") or "")
                 for r in rows if r.get("metadata_id")}
 
+    def table_coords(self, table_ids) -> Dict[str, Dict[str, str]]:
+        """{table_name_lower: {"id", "name", "connection", "db", "schema", "db_table"}} for the
+        given ids, from their TML (the metadata header has the connection but not the database
+        and schema). Ids that turn out not to be tables are skipped."""
+        ids = [i for i in (table_ids or []) if i]
+        if not ids:
+            return {}
+        raw = self.export_tml(ids)
+        out = {}
+        for it in (raw if isinstance(raw, list) else raw.get("object", [])):
+            e = it.get("edoc") or "{}"
+            d = json.loads(e) if e.strip().startswith("{") else (yaml.safe_load(e) or {})
+            t = d.get("table") or {}
+            if t.get("name"):
+                out[t["name"].strip().lower()] = {
+                    "id": (it.get("info") or {}).get("id", ""), "name": t["name"],
+                    "connection": (t.get("connection") or {}).get("name", ""),
+                    "db": t.get("db", ""), "schema": t.get("schema", ""),
+                    "db_table": t.get("db_table", "")}
+        return out
+
     def list_connection_names(self) -> list:
         """Every connection name visible on this cluster, sorted, for the connection picker.
         Raises on failure: an empty list has to mean the cluster has none, not that the read

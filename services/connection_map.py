@@ -69,3 +69,64 @@ def unmapped(found, eff_map: dict) -> list:
 def target_for(source_name: str, eff_map: dict) -> str:
     """The target connection a table on `source_name` lands on (its own name when unmapped)."""
     return eff_map.get(source_name) or source_name
+
+
+# ── database.schema per source connection ──────────────────────────────────────────────────
+
+def saved_locations(team_cfg: dict) -> dict:
+    """{(source_db, source_schema): (target_db, target_schema)} saved for the team."""
+    out = {}
+    for e in team_cfg.get("location_map") or []:
+        s = (e.get("source_db") or "", e.get("source_schema") or "")
+        t = (e.get("target_db") or "", e.get("target_schema") or "")
+        if any(s) and any(t):
+            out[s] = t
+    return out
+
+
+def locations_by_connection(sel_tables: dict) -> dict:
+    """{source_connection: {(db, schema): [table names]}} for the selected tables."""
+    out = {}
+    for t in (sel_tables or {}).values():
+        conn = t.get("connection") or ""
+        out.setdefault(conn, {}).setdefault((t.get("db") or "", t.get("schema") or ""), []).append(t["name"])
+    return out
+
+
+def target_copies(sel_tables: dict, source_connection: str, pair=None) -> dict:
+    """Where the selected tables on `source_connection` (optionally only those in one source
+    database.schema `pair`) already live on the target:
+    {"connections": {name, ...}, "locations": {(db, schema), ...}, "on_target": [names],
+     "missing": [names]}."""
+    conns, locs, on, missing = set(), set(), [], []
+    for t in (sel_tables or {}).values():
+        if (t.get("connection") or "") != source_connection:
+            continue
+        if pair is not None and (t.get("db") or "", t.get("schema") or "") != pair:
+            continue
+        tg = t.get("target")
+        if tg:
+            on.append(t["name"])
+            if tg.get("connection"):
+                conns.add(tg["connection"])
+            locs.add((tg.get("db") or "", tg.get("schema") or ""))
+        else:
+            missing.append(t["name"])
+    return {"connections": conns, "locations": locs, "on_target": on, "missing": missing}
+
+
+def effective_locations(saved: dict, sel_tables: dict) -> dict:
+    """The database.schema mapping the transform applies: the saved choices, plus, for a source
+    pair whose selected tables all already live under one database.schema on the target, that
+    one. Shipping the source's coordinates instead would re-point those existing tables."""
+    out = dict(saved)
+    for conn, pairs in locations_by_connection(sel_tables).items():
+        for pair in pairs:
+            if pair in out:
+                continue
+            locs = target_copies(sel_tables, conn, pair)["locations"]
+            if len(locs) == 1:
+                t = next(iter(locs))
+                if t != pair:
+                    out[pair] = t
+    return out

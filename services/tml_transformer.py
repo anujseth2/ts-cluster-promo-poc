@@ -100,8 +100,16 @@ def _remap_connection(node: dict, source_connection: str, target_connection: str
             conn["name"] = target_connection
 
 
-def _remap_location(node: dict, db_map: dict, schema_map: dict):
-    """Rewrite db / schema to the target warehouse's names (skip variable tokens)."""
+def _remap_location(node: dict, db_map: dict, schema_map: dict,
+                    location_map: Optional[dict] = None):
+    """Rewrite db / schema to the target warehouse's names (skip variable tokens).
+
+    `location_map` ({(db, schema): (db, schema)}) maps a database and schema as a pair, so two
+    databases that share a schema name are told apart; it wins over the older separate maps."""
+    key = (node.get("db") or "", node.get("schema") or "")
+    if location_map and key in location_map and not any(_is_var(x) for x in key if x):
+        node["db"], node["schema"] = location_map[key]
+        return
     for key, mapping in (("db", db_map), ("schema", schema_map)):
         val = node.get(key)
         if val and not _is_var(val) and mapping and val in mapping:
@@ -119,6 +127,7 @@ def transform_doc(
     table_remap: Optional[dict] = None,
     column_case_map: Optional[dict] = None,
     connection_map: Optional[dict] = None,
+    location_map: Optional[dict] = None,
 ) -> Tuple[dict, List[str]]:
     """
     Apply the data-layer transforms to a single TML document dict.
@@ -166,7 +175,7 @@ def transform_doc(
                 if tr.get(k):
                     obj[k] = tr[k]
         else:
-            _remap_location(obj, db_map, schema_map)
+            _remap_location(obj, db_map, schema_map, location_map)
 
         # Align column casing to the target warehouse (case-sensitive binding). Recase only
         # db_column_name; leave the logical `name` alone so references by name still resolve.
@@ -186,7 +195,7 @@ def transform_doc(
             for t in obj.get(key, []):
                 t.pop("fqn", None)
                 _remap_connection(t, source_connection, target_connection, connection_map)
-                _remap_location(t, db_map, schema_map)
+                _remap_location(t, db_map, schema_map, location_map)
 
     elif typ == "answer":
         # An answer references its MODEL via tables[] carrying a source-cluster fqn. That fqn
@@ -224,6 +233,7 @@ def transform_items(
     table_remap: Optional[dict] = None,
     column_case_map: Optional[dict] = None,
     connection_map: Optional[dict] = None,
+    location_map: Optional[dict] = None,
 ) -> Tuple[List[dict], List[dict]]:
     """
     Transform a list of raw API items (each with 'edoc' string + 'info' dict).
@@ -240,7 +250,7 @@ def transform_items(
 
         doc, warns = transform_doc(doc, source_connection, target_connection,
                                    db_map, schema_map, table_remap, column_case_map,
-                                   connection_map)
+                                   connection_map, location_map)
         for w in warns:
             all_warnings.append({"object": name, "issue": w})
 

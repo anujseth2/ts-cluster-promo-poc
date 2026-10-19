@@ -43,6 +43,7 @@ from services.table_matcher import column_signature
 from services.version_info import version_info, version_label
 from services.connection_map import (
     connections_in, saved_map, effective_map, unmapped as unmapped_connections, target_for,
+    saved_locations, locations_by_connection, target_copies, effective_locations,
 )
 from services.feedback_replace import feedback_preview, replace_prep, replace_finalize
 from services.reconcile import reconcile
@@ -823,37 +824,100 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Connections")
-    st.caption("Each source connection the selected content uses, and the target connection it "
-               "should point at on the target cluster.")
+    st.caption("Each source connection the selected content uses, the target connection it should "
+               "point at, and the database and schema its tables land in.")
     # Rows: only the connections the picked content uses, known as soon as something is ticked
     # and confirmed by the prepared bundle. A saved choice pre-fills a row; it doesn't add one.
     _found_c = st.session_state.get("_export_conn_names") or []
     _saved_c = saved_map(team_cfg, _found_c)
-    _rows_c = sorted(set(_found_c) | set(st.session_state.get("_selected_conn_names") or []))
+    _sel_t   = st.session_state.get("_sel_tables") or {}
+    _rows_c  = sorted(set(_found_c) | set(st.session_state.get("_selected_conn_names") or []))
+    # "Use existing target tables" ships no table TML: the model binds to the tables already on
+    # the target, so their connection, database and schema are given, not chosen.
+    _existing = str(st.session_state.get("tables_mode", "")).startswith("Use existing")
+    _saved_loc = saved_locations(team_cfg)
+    _legacy_db = team_cfg.get("db_map") or {}
+    _legacy_sc = team_cfg.get("schema_map") or {}
+    _locs_by_c = locations_by_connection(_sel_t)
     _tnames, _terr = _target_connection_names()
     _CHOOSE = "(choose a target connection)"
-    _conn_picks = {}
+    _conn_picks, _loc_picks = {}, {}
     if not _rows_c:
         st.caption("_Pick content in step 1 to see the connections it uses._")
     for _sc in _rows_c:
-        _from = ("saved for this team" if _saved_c.get(_sc)
-                 else "same name on the target" if _tnames and _sc in _tnames else "")
-        _cur = _saved_c.get(_sc) or (_sc if _from else "")
+        _copies = target_copies(_sel_t, _sc)
         _ck = f"connmap::{team_name}::{_sc}"
         st.markdown(f"**Source:** {_sc}")
-        if _tnames is not None:
-            _opts = [_CHOOSE] + list(_tnames) + ([_cur] if _cur and _cur not in _tnames else [])
-            _v = st.selectbox("Target connection", _opts, index=_opts.index(_cur) if _cur else 0,
-                              key=_ck, help="The connection on the target cluster that content on "
-                                            "this source connection should use.")
-            _conn_picks[_sc] = "" if _v == _CHOOSE else _v
+        if _existing and len(_copies["connections"]) == 1:
+            _lock = next(iter(_copies["connections"]))
+            st.text_input("Target connection", value=_lock, key=f"{_ck}::locked::{_lock}",
+                          disabled=True)
+            st.caption("Locked: it's the connection the tables already on the target use.")
+            _conn_picks[_sc] = _lock
         else:
-            _conn_picks[_sc] = st.text_input("Target connection", value=_cur, key=_ck).strip()
-        if _conn_picks[_sc] and _conn_picks[_sc] == _cur and _from:
-            st.caption(f"Pre-selected: {_from}.")
+            _from = ("saved for this team" if _saved_c.get(_sc)
+                     else "same name on the target" if _tnames and _sc in _tnames else "")
+            _cur = _saved_c.get(_sc) or (_sc if _from else "")
+            if _tnames is not None:
+                _opts = [_CHOOSE] + list(_tnames) + ([_cur] if _cur and _cur not in _tnames else [])
+                _v = st.selectbox("Target connection", _opts,
+                                  index=_opts.index(_cur) if _cur else 0, key=_ck,
+                                  help="The connection on the target cluster that content on this "
+                                       "source connection should use.")
+                _conn_picks[_sc] = "" if _v == _CHOOSE else _v
+            else:
+                _conn_picks[_sc] = st.text_input("Target connection", value=_cur, key=_ck).strip()
+            if _conn_picks[_sc] and _conn_picks[_sc] == _cur and _from:
+                st.caption(f"Pre-selected: {_from}.")
+            if _existing and len(_copies["connections"]) > 1:
+                st.warning("The tables already on the target sit on more than one connection ("
+                           + ", ".join(sorted(_copies["connections"])) + "), so there's no single "
+                           "one to lock to.")
+            elif (not _existing and _conn_picks[_sc] and _copies["connections"]
+                  and _conn_picks[_sc] not in _copies["connections"]):
+                _n = len(_copies["on_target"])
+                st.caption(f"On the target today, {', '.join(_copies['on_target'])} "
+                           f"{'is' if _n == 1 else 'are'} on "
+                           f"{', '.join(sorted(_copies['connections']))}. Promoting moves "
+                           f"{'it' if _n == 1 else 'them'} to {_conn_picks[_sc]}, updated in place "
+                           "with the same ID and dependents.")
+        # Where this connection's tables land: one row per source database.schema.
+        for _pair, _tbls in sorted((_locs_by_c.get(_sc) or {}).items()):
+            _pc = target_copies(_sel_t, _sc, _pair)
+            _plabel = ".".join(x for x in _pair if x) or "(no database or schema)"
+            st.caption(f"**{_plabel}** · {len(_tbls)} table(s)")
+            _pk = f"loc::{team_name}::{_sc}::{_pair[0]}::{_pair[1]}"
+            _locked = (next(iter(_pc["locations"]))
+                       if _existing and len(_pc["locations"]) == 1 else None)
+            _legacy = (_legacy_db.get(_pair[0], _pair[0]), _legacy_sc.get(_pair[1], _pair[1]))
+            if _locked:
+                _dflt, _why = _locked, "Locked: where these tables already are on the target."
+            elif _pair in _saved_loc:
+                _dflt, _why = _saved_loc[_pair], "Pre-filled: saved for this team."
+            elif _legacy != _pair:
+                _dflt, _why = _legacy, "Pre-filled: from the older single database/schema setting."
+            elif len(_pc["locations"]) == 1:
+                _dflt = next(iter(_pc["locations"]))
+                _why = ("Pre-filled: where these tables already are on the target."
+                        if _dflt != _pair else "")
+            else:
+                _dflt, _why = _pair, ""
+            _c1, _c2 = st.columns(2)
+            _suffix = f"::locked::{_dflt[0]}::{_dflt[1]}" if _locked else ""
+            _tdb = _c1.text_input("Target database", value=_dflt[0], key=f"{_pk}::db{_suffix}",
+                                  disabled=bool(_locked))
+            _tsc = _c2.text_input("Target schema", value=_dflt[1], key=f"{_pk}::sc{_suffix}",
+                                  disabled=bool(_locked))
+            _loc_picks[_pair] = (_tdb.strip(), _tsc.strip())
+            if _why:
+                st.caption(_why)
+            if _existing and _pc["missing"]:
+                st.caption(f"Not on the target: {', '.join(_pc['missing'])}.")
     if st.session_state.get("_selected_conn_err"):
-        st.warning(f"Couldn't read the selected tables' connections: "
-                   f"{st.session_state['_selected_conn_err']}")
+        st.warning(f"Couldn't read the selected tables: {st.session_state['_selected_conn_err']}")
+    if st.session_state.get("_sel_target_err"):
+        st.warning("Couldn't read where the selected tables are on the target, so nothing is "
+                   f"locked or pre-filled from it: {st.session_state['_sel_target_err']}")
     if _terr:
         st.warning(f"Couldn't read the target's connections: {_terr}")
 
@@ -861,34 +925,28 @@ with st.sidebar:
         st.session_state.pop("_tgt_conn_names", None)
         st.rerun()
 
-    st.caption("Remap the database / schema names too (leave blank to keep them as-is).")
-    _dbm0 = team_cfg.get("db_map", {}) or {}
-    _scm0 = team_cfg.get("schema_map", {}) or {}
-    _src_db0 = next(iter(_dbm0), ""); _tgt_db0 = _dbm0.get(_src_db0, "")
-    _src_sc0 = next(iter(_scm0), ""); _tgt_sc0 = _scm0.get(_src_sc0, "")
-    _dc1, _dc2 = st.columns(2)
-    with _dc1:
-        src_db = st.text_input("Source database", value=_src_db0, key="src_db")
-        src_sc = st.text_input("Source schema",   value=_src_sc0, key="src_sc")
-    with _dc2:
-        tgt_db = st.text_input("Target database", value=_tgt_db0, key="tgt_db")
-        tgt_sc = st.text_input("Target schema",   value=_tgt_sc0, key="tgt_sc")
-
     if st.button("Save connection config"):
-        _before = (st.session_state.get("_export_conn_map"),
-                   teams[team_name].get("db_map", {}), teams[team_name].get("schema_map", {}))
-        # Keep choices for connections outside this export; this export's rows override them.
+        _before = (st.session_state.get("_export_conn_map"), st.session_state.get("_export_loc_map"))
+        # Keep choices for connections and locations outside this selection; its rows override.
         _keep = {k: v for k, v in _saved_c.items() if k not in _conn_picks}
         teams[team_name]["connection_map"] = {**_keep, **{k: v for k, v in _conn_picks.items() if v}}
         # The mapping replaces the single source/target pair; blank them so an older reading of
         # the config can't resurface underneath it.
         teams[team_name]["source_connection"] = ""
         teams[team_name]["target_connection"] = ""
-        teams[team_name]["db_map"]     = {src_db.strip(): tgt_db.strip()} if src_db.strip() and tgt_db.strip() else {}
-        teams[team_name]["schema_map"] = {src_sc.strip(): tgt_sc.strip()} if src_sc.strip() and tgt_sc.strip() else {}
+        _locs_new = {k: v for k, v in _saved_loc.items() if k not in _loc_picks}
+        _locs_new.update({k: v for k, v in _loc_picks.items() if all(v) and v != k})
+        _loc_rows = []
+        for _src_pair, _tgt_pair in sorted(_locs_new.items()):
+            _loc_rows.append({"source_db": _src_pair[0], "source_schema": _src_pair[1],
+                              "target_db": _tgt_pair[0], "target_schema": _tgt_pair[1]})
+        teams[team_name]["location_map"] = _loc_rows
+        # The per-pair rows replace the older separate database and schema renames.
+        teams[team_name]["db_map"] = {}
+        teams[team_name]["schema_map"] = {}
         save_teams(teams)
         _after = (effective_map(teams[team_name], _found_c, _tnames),
-                  teams[team_name]["db_map"], teams[team_name]["schema_map"])
+                  effective_locations(saved_locations(teams[team_name]), _sel_t))
         # A bundle prepared under the old choices is stale: prepare it again on the next page.
         if "transformed_items" in st.session_state and _after != _before:
             st.session_state._conn_dirty = True
@@ -1000,6 +1058,11 @@ def _prepare_bundle():
             _cmap = effective_map(teams[team_name], _found_conns, _tgt_names)
             st.session_state._export_conn_names = _found_conns
             st.session_state._export_conn_map = _cmap
+            # database.schema as pairs: saved choices, else where the tables already are on the
+            # target. The older separate renames still apply to anything neither covers.
+            _lmap = effective_locations(saved_locations(teams[team_name]),
+                                        st.session_state.get("_sel_tables") or {})
+            st.session_state._export_loc_map = _lmap
             # Align promoted table columns to the TARGET warehouse's casing. Some warehouses bind
             # external columns case-sensitively (e.g. Databricks), so a source column CID cannot
             # import against a target column cid. Primary source of truth is the TARGET connection
@@ -1018,8 +1081,10 @@ def _prepare_bundle():
                 tr = _trm.get(nm.strip().lower(), {})
                 promoted.append({
                     "name":     nm,
-                    "database": _dbm.get(t.get("db", ""), t.get("db", "")),
-                    "schema":   _scm.get(t.get("schema", ""), t.get("schema", "")),
+                    "database": ((_lmap.get((t.get("db", ""), t.get("schema", ""))) or [None])[0]
+                                 or _dbm.get(t.get("db", ""), t.get("db", ""))),
+                    "schema":   ((_lmap.get((t.get("db", ""), t.get("schema", ""))) or [None, None])[1]
+                                 or _scm.get(t.get("schema", ""), t.get("schema", ""))),
                     "table":    tr.get("db_table") or t.get("db_table", ""),
                     "connection": (t.get("connection") or {}).get("name", ""),
                     "target_connection": target_for(
@@ -1102,6 +1167,7 @@ def _prepare_bundle():
                 table_remap=st.session_state.get("table_remap", {}),
                 column_case_map=applied_case_map,
                 connection_map=_cmap,
+                location_map=_lmap,
             )
             # Prune any tables the user chose to drop out of the model (not-on-target excludes).
             prune = st.session_state.get("prune_tables", set())
@@ -1314,8 +1380,28 @@ if step == 0:
                 st.session_state._selected_conn_names = sorted({c for c in _tc.values() if c})
                 st.session_state._selected_conn_err = None
             except Exception as _e:
+                _tc = {}
                 st.session_state._selected_conn_names = []
                 st.session_state._selected_conn_err = str(_e)
+            # Each selected table's database.schema, read from its TML. Kept apart from the
+            # connection read, so a failure here still leaves the connections to map.
+            try:
+                _src_tc = source_client().table_coords([i for i, c in _tc.items() if c])
+            except Exception as _e:
+                _src_tc = {}
+                st.session_state._selected_conn_err = f"database and schema: {_e}"
+            # Where each one already lives on the target (connection, database, schema). A failed
+            # read is kept apart from "not on the target", so nothing is locked or assumed from it.
+            _tgt_tc, st.session_state._sel_target_err = {}, None
+            if _src_tc:
+                try:
+                    _tids = target_client()._resolve_names_to_ids(
+                        [v["name"] for v in _src_tc.values()], "LOGICAL_TABLE")
+                    _tgt_tc = target_client().table_coords(list(_tids.values()))
+                except Exception as _e:
+                    st.session_state._sel_target_err = str(_e)
+            st.session_state._sel_tables = {k: {**v, "target": _tgt_tc.get(k)}
+                                            for k, v in _src_tc.items()}
             st.session_state.dep_info        = dep
             st.session_state._promo_id2name  = id2name
             st.session_state._promo_present  = present
@@ -1334,7 +1420,8 @@ if step == 0:
             st.rerun()   # the sidebar drew before this resolved; redraw it with the connections
         elif not picks:
             _had_conns = bool(st.session_state.get("_selected_conn_names"))
-            for _k in ("dep_info", "selected_ids", "_selected_conn_names", "_selected_conn_err"):
+            for _k in ("dep_info", "selected_ids", "_selected_conn_names", "_selected_conn_err",
+                       "_sel_tables", "_sel_target_err"):
                 st.session_state.pop(_k, None)
             st.session_state._resolved_key = None
             if _had_conns:
