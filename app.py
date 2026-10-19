@@ -571,16 +571,6 @@ def _target_conn_label() -> str:
                              if v}))
 
 
-def _source_connection_names():
-    """(names, error) for the source cluster's connections, read once per session."""
-    if "_src_conn_names" not in st.session_state:
-        try:
-            st.session_state._src_conn_names = (source_client().list_connection_names(), None)
-        except Exception as e:
-            st.session_state._src_conn_names = (None, str(e))
-    return st.session_state._src_conn_names
-
-
 def _source_table_coords() -> dict:
     """db / schema / db_table and the source connection of every promoted table, read from the
     RAW source export (before any remap), keyed by lowercased table name."""
@@ -835,18 +825,16 @@ with st.sidebar:
     st.subheader("Connections")
     st.caption("Each source connection the selected content uses, and the target connection it "
                "should point at on the target cluster.")
-    # Rows: connections of the selected content (known as soon as something is ticked), of the
-    # prepared bundle, any this team already has a choice for, and any added by hand below.
+    # Rows: only the connections the picked content uses, known as soon as something is ticked
+    # and confirmed by the prepared bundle. A saved choice pre-fills a row; it doesn't add one.
     _found_c = st.session_state.get("_export_conn_names") or []
     _saved_c = saved_map(team_cfg, _found_c)
-    _manual_c = st.session_state.setdefault("_manual_src_conns", set())
-    _rows_c = sorted(set(_found_c) | set(st.session_state.get("_selected_conn_names") or [])
-                     | set(_saved_c) | _manual_c)
+    _rows_c = sorted(set(_found_c) | set(st.session_state.get("_selected_conn_names") or []))
     _tnames, _terr = _target_connection_names()
     _CHOOSE = "(choose a target connection)"
     _conn_picks = {}
     if not _rows_c:
-        st.caption("_None yet: select content in step 1, or add a source connection below._")
+        st.caption("_Pick content in step 1 to see the connections it uses._")
     for _sc in _rows_c:
         _from = ("saved for this team" if _saved_c.get(_sc)
                  else "same name on the target" if _tnames and _sc in _tnames else "")
@@ -869,23 +857,8 @@ with st.sidebar:
     if _terr:
         st.warning(f"Couldn't read the target's connections: {_terr}")
 
-    # Add a mapping for any source connection, before or without selecting content.
-    _snames, _serr = _source_connection_names()
-    _addable = [n for n in (_snames or []) if n not in _rows_c]
-    _ADD = "(pick a source connection)"
-    def _add_src_conn(_k=f"connadd::{team_name}"):
-        _v = st.session_state.get(_k)
-        if _v and _v != _ADD:
-            st.session_state.setdefault("_manual_src_conns", set()).add(_v)
-        st.session_state[_k] = _ADD
-    if _addable:
-        st.selectbox("Add a source connection", [_ADD] + _addable, key=f"connadd::{team_name}",
-                     on_change=_add_src_conn)
-    elif _serr:
-        st.warning(f"Couldn't read the source's connections: {_serr}")
-    if st.button("↻ Refresh connections", key="refresh_tgt_conns"):
+    if st.button("↻ Refresh target connections", key="refresh_tgt_conns"):
         st.session_state.pop("_tgt_conn_names", None)
-        st.session_state.pop("_src_conn_names", None)
         st.rerun()
 
     st.caption("Remap the database / schema names too (leave blank to keep them as-is).")
