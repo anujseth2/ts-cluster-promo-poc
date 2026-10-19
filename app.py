@@ -1308,7 +1308,9 @@ if step == 0:
             # Which source connections the selection sits on, known now rather than after export,
             # so the sidebar can show them for mapping straight away.
             try:
-                _tc = source_client().table_connections(dep["table_ids"])
+                # Models too: an answer or liveboard built straight on a table lists that table
+                # among its "models". Only tables carry a connection, so models add nothing else.
+                _tc = source_client().table_connections(dep["table_ids"] + dep["model_ids"])
                 st.session_state._selected_conn_names = sorted({c for c in _tc.values() if c})
                 st.session_state._selected_conn_err = None
             except Exception as _e:
