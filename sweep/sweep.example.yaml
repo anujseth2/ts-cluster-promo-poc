@@ -1,0 +1,32 @@
+# Content assignment sweep: example configuration.
+#
+# Copy to sweep.yaml and edit. Credentials never go in this file; set them in the environment
+# (see README.md).
+
+# The level added to content in scope (models, liveboards, answers). READ_ONLY or MODIFY.
+content_level: MODIFY
+# The level added to the tables underneath that content. Only READ_ONLY is accepted: under
+# strict object security the group needs to see the tables, never to edit them.
+table_level: READ_ONLY
+
+# Content by these authors is never touched. "system" is ThoughtSpot's own content.
+exclude_authors: [system]
+
+# Where each run writes its report (CSV) and audit record (JSON).
+audit_dir: sweep_audit
+
+# One entry per team. Each scope shares only to its own group. Content is in a scope when it
+# matches any of its selectors; a scope with no selectors is refused.
+scopes:
+  - name: Respbio
+    group: "<Respbio change-managers group, as created in MIM>"
+    # content carrying any of these tags
+    tags: [respbio]
+    # content created by these users (ThoughtSpot usernames)
+    authors: []
+    # content created by members of these groups, e.g. the team's AD group
+    author_groups: ["<Respbio analysts AD group>"]
+
+  - name: Commercial SBU
+    group: "<Commercial SBU change-managers group>"
+    tags: [commercial-sbu]
