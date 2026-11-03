@@ -3248,7 +3248,7 @@ elif step == 3:
                 "missing_in_target_warehouse", "drop_blocked_by_dependents", "type_mismatch",
                 "invalid_formula_ids", "dangling_ref", "drop_table", "join_unresolved",
                 "model_column_unresolved", "formula_broken_ref", "model_table_no_columns",
-                "invalid_column_property",
+                "invalid_column_property", "target_permission_denied",
             }
             other        = [f for f in findings if f["kind"] not in _handled_kinds]
 
@@ -4524,6 +4524,34 @@ elif step == 3:
                                    "discovered_findings", "discovered_meta"):
                             st.session_state.pop(_k, None)
                         st.rerun()
+
+            # ── the signed-in user can see these on the target but not change them ──
+            # AUTHORIZATION_FAILURE names the objects only by guid, so look the names up as the same
+            # user (they can see them, or the platform would not have got as far as refusing the
+            # update). An object they can't see keeps its guid.
+            _no_edit = [f for f in findings if f["kind"] == "target_permission_denied"]
+            if _no_edit:
+                _by_type = {}
+                for _f in _no_edit:
+                    for _t, _gs in (_f.get("objects") or {}).items():
+                        _by_type.setdefault(_t, []).extend(
+                            g.strip() for g in _gs.split(",") if g.strip())
+                _key = tuple(sorted(g for gs in _by_type.values() for g in gs))
+                _cache = st.session_state.setdefault("_no_edit_names", {})
+                if _key not in _cache:
+                    try:
+                        _cache[_key] = target_client().names_for(_by_type)
+                    except Exception:
+                        _cache[_key] = {}
+                _names = _cache[_key]
+                st.markdown("#### No edit access on the target")
+                st.error("The signed-in user can see these on `" + opt_env("TS_TARGET_HOST")
+                         + "` but not change them, so the import is refused. Nothing was changed.")
+                for _g in dict.fromkeys(_key):
+                    st.markdown(f"- **{_names.get(_g, _g)}**")
+                st.caption("To clear it, give this user, or a group they belong to, edit access on "
+                           "each object above (for a team's content, that is what the content "
+                           "assignment sweep does), then re-validate.")
 
             # ── anything unrecognised ──
             if other:

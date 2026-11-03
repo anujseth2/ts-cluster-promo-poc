@@ -1174,3 +1174,36 @@ def test_converted_measures_lists_what_the_platform_left_out(make_table_doc, mak
                  "column": "units"}]
     assert converted_measures([item], platform) == [
         ("promo_split_region_sales", "amount"), ("promo_split_region_sales", "units")]
+
+
+# The exact AUTHORIZATION_FAILURE a user with view-only access gets on the target (ps-internal,
+# promo.tester, 2026-11-04): the model's own guid is what it may not update; the LOGICAL_COLUMN
+# guids after "or to read child securable objects" are not objects to report.
+_AUTHZ = ("Unable to save worksheet. Error Code: AUTHORIZATION_FAILURE Incident Id: x\n"
+          "Error Message: No permission to update objects:\n{\n  \"LOGICAL_TABLE\": [\n"
+          "    \"4206d1b2-f890-452b-8e03-0eac7152d0cf\"\n  ]\n}\nor to read child securable "
+          "objects:\n{\n  \"LOGICAL_COLUMN\": [\n    \"adbf9609-841a-4c11-b769-53f1e88331d5\"\n  ]\n}")
+
+
+def test_no_edit_access_names_only_the_objects_it_may_not_update():
+    found = classify_import_errors([{"name": "unknown", "status": "ERROR", "error": _AUTHZ}])
+    assert [f["kind"] for f in found] == ["target_permission_denied"]
+    assert found[0]["guids"] == ["4206d1b2-f890-452b-8e03-0eac7152d0cf"]
+
+
+def test_names_for_looks_up_by_type_and_leaves_unseen_guids_out():
+    from services.ts_client import TSClient
+    sent = {}
+
+    class _Resp:
+        status_code = 200
+        def json(self):
+            return [{"metadata_id": "g1", "metadata_name": "sales_customers"}]
+        def raise_for_status(self):
+            pass
+
+    c = TSClient("https://cluster")
+    c._session.post = lambda url, json=None, timeout=None: sent.update(json) or _Resp()
+    assert c.names_for({"LOGICAL_TABLE": ["g1", "g2"]}) == {"g1": "sales_customers"}
+    assert sent["metadata"] == [{"identifier": "g1", "type": "LOGICAL_TABLE"},
+                                {"identifier": "g2", "type": "LOGICAL_TABLE"}]

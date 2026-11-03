@@ -401,6 +401,19 @@ class TSClient:
         return {r.get("metadata_id"): ((r.get("metadata_header") or {}).get("dataSourceName") or "")
                 for r in rows if r.get("metadata_id")}
 
+    def names_for(self, guids_by_type) -> Dict[str, str]:
+        """{guid: name} for {type: [guid, ...]}, as an AUTHORIZATION_FAILURE lists them. Objects this
+        user cannot see are simply absent, so callers fall back to the guid."""
+        wanted = [{"identifier": g, "type": self.metadata_type_for(t)}
+                  for t, gs in (guids_by_type or {}).items() for g in gs if g]
+        if not wanted:
+            return {}
+        data = self._post("/api/rest/2.0/metadata/search",
+                          {"metadata": wanted, "record_size": len(wanted)})
+        rows = data if isinstance(data, list) else (data or {}).get("metadata", [])
+        return {r.get("metadata_id"): r.get("metadata_name") or r.get("metadata_id")
+                for r in rows if r.get("metadata_id")}
+
     def table_coords(self, table_ids) -> Dict[str, Dict[str, str]]:
         """{table_name_lower: {"id", "name", "connection", "db", "schema", "db_table"}} for the
         given ids, from their TML (the metadata header has the connection but not the database
