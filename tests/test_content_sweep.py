@@ -11,7 +11,7 @@ from sweep.content_sweep import (
 
 def test_config_defaults_and_scopes():
     cfg = load_config("scopes:\n  - {name: Respbio, group: rb_cm, tags: [respbio]}\n")
-    assert cfg["content_level"] == "MODIFY" and cfg["table_level"] == "READ_ONLY"
+    assert cfg["content_level"] == "MODIFY" and cfg["table_level"] == "MODIFY"
     assert cfg["exclude_authors"] == ["system"]
     assert cfg["scopes"][0] == {"name": "Respbio", "group": "rb_cm", "tags": ["respbio"],
                                 "authors": [], "author_groups": []}
@@ -22,7 +22,7 @@ def test_config_defaults_and_scopes():
     ("scopes:\n  - {name: x, tags: [t]}", "no group"),
     ("scopes:\n  - {name: x, group: g}", "selects nothing"),
     ("scopes:\n  - {name: x, group: g, tags: []}", "selects nothing"),
-    ("table_level: MODIFY\nscopes:\n  - {name: x, group: g, tags: [t]}", "only be READ_ONLY"),
+    ("table_level: CAN_ADMIN\nscopes:\n  - {name: x, group: g, tags: [t]}", "table_level"),
     ("content_level: CAN_ADMIN\nscopes:\n  - {name: x, group: g, tags: [t]}", "content_level"),
     ("scopes:\n  - {name: x, group: g, tags: [t]}\n  - {name: X, group: h, tags: [u]}", "twice"),
 ])

@@ -4,8 +4,9 @@ Shares each team's content with that team's change-managers group, so a promotio
 member of the group can clear a blocking dependent without administrator rights:
 
   * models, liveboards and answers in scope get the group at edit access (MODIFY);
-  * the tables underneath them get the group at view access (READ_ONLY), because under strict
-    object security a grant on the content alone leaves it invisible.
+  * the tables underneath them get the group at edit access too, because every promotion
+    re-imports its tables and updating a table needs edit on it ("Can manage data" does not
+    cover that). View alone (READ_ONLY) is enough only to see them under strict object security.
 
 What it will and won't do:
 
@@ -44,7 +45,7 @@ import requests
 import yaml
 
 LEVELS = {"NO_ACCESS": 0, "READ_ONLY": 1, "MODIFY": 2}
-CONTENT_CAP, TABLE_CAP = "MODIFY", "READ_ONLY"   # the most the sweep will ever grant
+CONTENT_CAP, TABLE_CAP = "MODIFY", "MODIFY"      # the most the sweep will ever grant
 CONTENT_TYPES = ("LIVEBOARD", "ANSWER", "MODEL")
 MODEL_HEADER_TYPES = {"WORKSHEET", "MODEL"}       # LOGICAL_TABLE headers that are models
 PAGE = 200
@@ -64,8 +65,8 @@ def load_config(text: str) -> dict:
     table_level = str(cfg.get("table_level", TABLE_CAP)).upper()
     if content_level not in ("READ_ONLY", "MODIFY"):
         raise ConfigError(f"content_level must be READ_ONLY or MODIFY, not {content_level}")
-    if table_level != "READ_ONLY":
-        raise ConfigError(f"table_level can only be READ_ONLY, not {table_level}")
+    if table_level not in ("READ_ONLY", "MODIFY"):
+        raise ConfigError(f"table_level must be READ_ONLY or MODIFY, not {table_level}")
     scopes = cfg.get("scopes") or []
     if not scopes:
         raise ConfigError("no scopes configured; the sweep does nothing without an allowlist")

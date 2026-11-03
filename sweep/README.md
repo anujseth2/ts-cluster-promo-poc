@@ -4,8 +4,9 @@ Shares each team's ThoughtSpot content with that team's change-managers group, s
 promotion can clear a blocking dependent with edit access instead of administrator rights.
 
 - Models, liveboards and answers in a team's scope get the team's group at **edit** (MODIFY).
-- The tables underneath them get the group at **view** (READ_ONLY). Under strict object security
-  a grant on the content alone leaves it invisible.
+- The tables underneath them get the group at **edit** too. Every promotion re-imports its
+  tables, and updating a table needs edit on it; "Can manage data" doesn't cover that. View alone
+  (`table_level: READ_ONLY`) only makes them visible under strict object security.
 
 It runs inside your environment, under your own service account, on your schedule. It reads
 metadata and permissions only and talks to nothing but your ThoughtSpot host.
@@ -54,7 +55,8 @@ and the audit record), 2 a configuration problem.
    members, excluding system content.
 3. Finds every table with at least one of those as a dependent.
 4. Reads the grants already defined on each object for the group.
-5. Lists what is missing: content below the content level, tables below the table level.
+5. Lists what is missing: content below the content level, tables below the table level (both
+   edit by default).
 6. With `--apply`, adds the group at that level, then reads every grant back and marks each one
    confirmed or failed. A success response alone is not taken as proof.
 7. Writes `sweep-<run>-report.csv` (one line per object: current grant, what was or would be

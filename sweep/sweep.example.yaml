@@ -5,9 +5,10 @@
 
 # The level added to content in scope (models, liveboards, answers). READ_ONLY or MODIFY.
 content_level: MODIFY
-# The level added to the tables underneath that content. Only READ_ONLY is accepted: under
-# strict object security the group needs to see the tables, never to edit them.
-table_level: READ_ONLY
+# The level added to the tables underneath that content. READ_ONLY or MODIFY. Every promotion
+# re-imports its tables and updating a table needs edit on it, so a group that promotes needs
+# MODIFY. READ_ONLY only makes the tables visible under strict object security.
+table_level: MODIFY
 
 # Content by these authors is never touched. "system" is ThoughtSpot's own content.
 exclude_authors: [system]
