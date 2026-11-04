@@ -38,12 +38,13 @@ Set credentials in the environment, never in the config file:
 | `TS_CA_BUNDLE` | optional, a CA bundle for TLS inspection |
 
 ```
-python sweep/content_sweep.py --config sweep.yaml             # dry run: report only
-python sweep/content_sweep.py --config sweep.yaml --apply     # add the missing shares
-python sweep/content_sweep.py --config sweep.yaml --scope Finance
+python sweep/content_sweep.py --config sweep-dev.yaml             # dry run: report only
+python sweep/content_sweep.py --config sweep-dev.yaml --apply     # add the missing shares
 ```
 
-Copy `sweep.example.yaml` to `sweep.yaml` and fill in each team's group and selectors.
+Copy `sweep.example.yaml` once per cluster (for example `sweep-dev.yaml` and `sweep-test.yaml`,
+since the group's name differs) and fill in the group and the author's username or group. With
+several scopes in one file, `--scope <name>` runs just one of them.
 
 Exit code 0 means the run finished cleanly, 1 that a scope or a share failed (named in the output
 and the audit record), 2 a configuration problem.
