@@ -19,15 +19,15 @@ audit_dir: sweep_audit
 # One entry per team. Each scope shares only to its own group. Content is in a scope when it
 # matches any of its selectors; a scope with no selectors is refused.
 scopes:
-  - name: Respbio
-    group: "<Respbio change-managers group, as created in MIM>"
+  - name: Finance
+    group: "<Finance change-managers group>"
     # content carrying any of these tags
-    tags: [respbio]
+    tags: [finance]
     # content created by these users (ThoughtSpot usernames)
     authors: []
-    # content created by members of these groups, e.g. the team's AD group
-    author_groups: ["<Respbio analysts AD group>"]
+    # content created by members of these groups, e.g. the team's directory group
+    author_groups: ["<Finance analysts group>"]
 
-  - name: Commercial SBU
-    group: "<Commercial SBU change-managers group>"
-    tags: [commercial-sbu]
+  - name: Sales
+    group: "<Sales change-managers group>"
+    tags: [sales]

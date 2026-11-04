@@ -30,7 +30,7 @@ Set credentials in the environment, never in the config file:
 
 | Variable | |
 |---|---|
-| `TS_HOST` | e.g. `https://gsk-test.thoughtspot.cloud` |
+| `TS_HOST` | e.g. `https://your-cluster.thoughtspot.cloud` |
 | `TS_USERNAME` and `TS_SECRET_KEY` | the service account, signed in with trusted authentication |
 | `TS_TOKEN` | alternatively, a bearer token |
 | `TS_ORG_ID` | optional, the org to work in |
@@ -40,7 +40,7 @@ Set credentials in the environment, never in the config file:
 ```
 python sweep/content_sweep.py --config sweep.yaml             # dry run: report only
 python sweep/content_sweep.py --config sweep.yaml --apply     # add the missing shares
-python sweep/content_sweep.py --config sweep.yaml --scope Respbio
+python sweep/content_sweep.py --config sweep.yaml --scope Finance
 ```
 
 Copy `sweep.example.yaml` to `sweep.yaml` and fill in each team's group and selectors.

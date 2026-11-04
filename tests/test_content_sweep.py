@@ -10,10 +10,10 @@ from sweep.content_sweep import (
 # ── configuration refuses anything unsafe ───────────────────────────────────────────────────
 
 def test_config_defaults_and_scopes():
-    cfg = load_config("scopes:\n  - {name: Respbio, group: rb_cm, tags: [respbio]}\n")
+    cfg = load_config("scopes:\n  - {name: Finance, group: fin_cm, tags: [finance]}\n")
     assert cfg["content_level"] == "MODIFY" and cfg["table_level"] == "MODIFY"
     assert cfg["exclude_authors"] == ["system"]
-    assert cfg["scopes"][0] == {"name": "Respbio", "group": "rb_cm", "tags": ["respbio"],
+    assert cfg["scopes"][0] == {"name": "Finance", "group": "fin_cm", "tags": ["finance"],
                                 "authors": [], "author_groups": []}
 
 
