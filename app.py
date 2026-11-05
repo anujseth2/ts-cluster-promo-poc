@@ -42,6 +42,7 @@ from services.target_cascade import (
 )
 from services.table_matcher import column_signature
 from services.version_info import version_info, version_label
+from services import team_choices
 from services.connection_map import (
     connections_in, saved_map, effective_map, unmapped as unmapped_connections, target_for,
     saved_locations, locations_by_connection, target_copies, effective_locations,
@@ -62,6 +63,8 @@ load_dotenv(Path(__file__).parent / ".env")
 # repeatedly, and no sequence of git commands fixes it while the file stays tracked.
 TEAMS_FILE  = Path(__file__).parent / "config" / "teams.json"
 TEAMS_LOCAL = Path(__file__).parent / "config" / "teams.local.json"
+# Each team's choices from earlier runs (drops, recasings, realigns): local and gitignored.
+CHOICES_FILE = Path(__file__).parent / "config" / "choices.local.json"
 
 STEPS = [
     "1 · Select Assets",
@@ -611,6 +614,76 @@ def _source_read_problems() -> list:
     return out
 
 
+def _choices_snapshot() -> dict:
+    """This run's choices in the shape they are remembered in (see services/team_choices)."""
+    src_case = (st.session_state.get("_source_case_durable")
+                or st.session_state.get("_source_col_map") or {})
+    rec_src = {}
+    for _sk in st.session_state.get("recase_approved") or set():
+        _t, _, _c = _sk.partition("::")
+        _v = (src_case.get(_t) or {}).get(_c)
+        if _v:
+            rec_src[_sk] = _v
+    return {"drop_columns": sorted(st.session_state.get("skip_columns") or set()),
+            "prune_tables": sorted(st.session_state.get("prune_tables") or set()),
+            "realign_types": dict(st.session_state.get("realign_types") or {}),
+            "recase_source": rec_src,
+            "recase_target": dict(st.session_state.get("recase_target_approved") or {})}
+
+
+def _load_team_choices(team: str) -> None:
+    """Start a run with what this team decided before. Each choice is scoped to a table and
+    column, so it only takes effect where that column turns up again, and the Source Audit and
+    TML Validation pages list what was loaded, with a way to forget it."""
+    ch = team_choices.load(CHOICES_FILE, team)
+    st.session_state.skip_columns = set(ch["drop_columns"])
+    st.session_state.dropped_col_names = set(ch["drop_columns"])
+    st.session_state.prune_tables = set(ch["prune_tables"])
+    st.session_state.realign_types = dict(ch["realign_types"])
+    st.session_state.recase_target_approved = dict(ch["recase_target"])
+    st.session_state.recase_approved = set(ch["recase_source"])
+    _src = {}
+    for _sk, _v in ch["recase_source"].items():
+        _t, _, _c = _sk.partition("::")
+        _src.setdefault(_t, {})[_c] = _v
+    if _src:
+        st.session_state._source_case_durable = _src
+    st.session_state._choices_loaded_for = team
+    st.session_state._choices_remembered = ch
+    st.session_state._choices_saved = _choices_snapshot()
+
+
+def _remember_choices(team: str) -> None:
+    """Save this run's choices for the team whenever they change. Only once the team's earlier
+    choices were loaded into this run, so a fresh session can never overwrite them with nothing."""
+    if st.session_state.get("_choices_loaded_for") != team:
+        return
+    snap = _choices_snapshot()
+    if snap != st.session_state.get("_choices_saved"):
+        team_choices.save(CHOICES_FILE, team, snap)
+        st.session_state._choices_saved = snap
+
+
+def _remembered_panel(where: str) -> None:
+    """Say which of the team's earlier choices this run started with, and offer to forget them."""
+    ch = st.session_state.get("_choices_remembered") or {}
+    lines = team_choices.describe(ch)
+    if not lines:
+        return
+    with st.expander(f"Applied from this team's earlier runs: {len(lines)} choice(s)", expanded=False):
+        st.caption("Made and approved in an earlier run of this team's content, so this run didn't "
+                   "ask again. Each one only applies where that table and column turn up.")
+        for _ln in lines:
+            st.markdown(f"- {_ln}")
+        if st.button("Forget these and start fresh", key=f"forget_choices_{where}"):
+            for _k in ("skip_columns", "dropped_col_names", "prune_tables", "realign_types",
+                       "recase_target_approved", "recase_approved", "_source_case_durable"):
+                st.session_state.pop(_k, None)
+            st.session_state._choices_remembered = team_choices.empty()
+            st.session_state._conn_dirty = True   # rebuild the bundle without them
+            st.rerun()
+
+
 def _recase_map(scoped_to_case: dict) -> dict:
     """{"Table::col": casing} -> the {table_lower: {col_lower: casing}} shape recasing takes."""
     out = {}
@@ -812,14 +885,22 @@ with st.sidebar:
             _go(0)
     with _hc2:
         if st.button("↺ Reset", use_container_width=True,
-                     help="Clear everything and start a fresh promotion"):
+                     help="Clear everything and start a fresh promotion (keeps the team)"):
+            # Keep the team. Clearing everything used to leave the dropdown showing the old team
+            # while the page silently went back to the first one, so a run could pick up another
+            # team's tags and connections without anyone noticing.
+            _keep_team = st.session_state.get("team_select")
             for _k in list(st.session_state.keys()):
                 del st.session_state[_k]
+            if _keep_team in teams:
+                st.session_state.team_select = _keep_team
             st.session_state.step = 0
             st.rerun()
     st.divider()
     st.header("Team")
-    team_name = st.selectbox("Select team", list(teams.keys()))
+    if st.session_state.get("team_select") not in teams:
+        st.session_state.pop("team_select", None)
+    team_name = st.selectbox("Select team", list(teams.keys()), key="team_select")
     team_cfg  = teams[team_name]
     team_tags = team_cfg.get("tags", [])
     st.caption("Scope tag(s): " + (", ".join(f"`{t}`" for t in team_tags) or "_none set_"))
@@ -1018,7 +1099,9 @@ def _prepare_bundle():
             for _k in ("pr_url", "validation_errors", "validation_ok", "import_phase",
                        "import_core_results", "import_leaf_files", "import_leaf_errors",
                        "import_core_failed", "merge_failed", "silent_drops", "_fb_previews", "_nl_previews", "nl_report",
-                       "fb_replace_report", "_casing_diag"):
+                       "fb_replace_report", "_casing_diag",
+                       # a rebuilt bundle hasn't been validated yet
+                       "discovered_findings", "discovered_meta", "accepted_warnings"):
                 st.session_state.pop(_k, None)
         with st.status("Preparing the promotion bundle…", expanded=True) as _exp_status:
             st.write("① Exporting TML from the source cluster…")
@@ -1250,8 +1333,9 @@ if step == 0:
                         "_tm_target_full", "_tm_source_full", "_target_modeled_map",
                         "_source_case_durable", "_source_read_errors", "_source_type_errors",
                         "recase_target_approved", "tc_recase_selected", "tc_drop_selected",
-                        "_tc_case_to"):
+                        "_tc_case_to", "skip_columns", "prune_tables"):
                 st.session_state.pop(key, None)
+            _load_team_choices(team_name)
 
     assets = st.session_state.get("assets", [])
     unsafe = []   # local: models/tables excluded but absent on target (blocks Next)
@@ -2104,6 +2188,7 @@ elif step == 2:
     # the source. Idempotent (guarded by _need_export inside), and shared with TML Validation, so
     # walking Source Audit → TML Validation does NOT re-export.
     _prepare_bundle()
+    _remembered_panel("audit")
     selected_ids = st.session_state.get("selected_ids", [])
     transformed_items = st.session_state.get("transformed_items")
 
@@ -2250,9 +2335,24 @@ elif step == 2:
             # the realigned type binds; if the two warehouses genuinely disagree, it surfaces there.
             _src_type = st.session_state.get("_source_type_map") or {}
             _gone = st.session_state.get("dropped_col_names", set())
-            _stfind = [f for f in warehouse_type_findings(
-                           st.session_state.get("transformed_items", []), _src_type, connection=_src_conn)
-                       if f"{f['object']}::{f['column']}" not in _gone and f["column"] not in _gone]
+            _for_target = {"realign_types": st.session_state.get("realign_types") or {},
+                           "recase_target": st.session_state.get("recase_target_approved") or {}}
+            _stfind, _st_kept = [], []
+            for f in warehouse_type_findings(
+                    st.session_state.get("transformed_items", []), _src_type, connection=_src_conn):
+                if f"{f['object']}::{f['column']}" in _gone or f["column"] in _gone:
+                    continue
+                if team_choices.realigned_for_target(_for_target, f["object"], f["column"],
+                                                     f.get("source_type") or ""):
+                    _st_kept.append(f)
+                else:
+                    _stfind.append(f)
+            if _st_kept:
+                st.caption("Left as set for the target: " + ", ".join(
+                    f"`{f['object']}.{f['column']}` stays {f.get('source_type')} (the source has "
+                    f"{((_src_type.get(f['object'].strip().lower()) or {}).get(f['column'].lower()) or '?').upper()})"
+                    for f in _st_kept)
+                    + ". Setting it back to the source type would fail on the target again.")
             if _stfind:
                 st.markdown("**Type differs from the source warehouse**")
                 st.caption("The TML type disagrees with the source warehouse. **Realign** rewrites the "
@@ -2360,7 +2460,7 @@ elif step == 2:
             # resolves immediately, exactly like the drop/realign buttons. The single re-export happens
             # only when you leave this page (see the nav button below).
             _rapp = st.session_state.setdefault("recase_approved", set())
-            _case_rows = []
+            _case_rows, _case_kept = [], []
             for _it in st.session_state.get("transformed_items", []):
                 _t = _parse_edoc(_it.get("edoc", "{}")).get("table")
                 if not _t or not _t.get("name"):
@@ -2371,12 +2471,20 @@ elif step == 2:
                 for _c in _t.get("columns", []) or []:
                     _dbn = (_c.get("db_column_name") or "").strip()
                     if _dbn and _cm.get(_dbn.lower()) and _cm[_dbn.lower()] != _dbn:
+                        if team_choices.recased_for_target(_for_target, _t["name"], _dbn):
+                            _case_kept.append(f"`{_t['name']}.{_dbn}` stays `{_dbn}` (the source "
+                                              f"has `{_cm[_dbn.lower()]}`)")
+                            continue
                         _sk = f"{_t['name'].strip().lower()}::{_dbn.lower()}"
                         _case_rows.append({"Table": _t["name"], "From": _dbn,
                                            "To": _cm[_dbn.lower()],
                                            "Approve?": _sk in _rapp, "_scoped": _sk})
+            if _case_kept:
+                st.caption("Casing left as set for the target: " + ", ".join(_case_kept)
+                           + ". Setting it back to the source casing would fail on the target again.")
             if not _case_rows:
-                st.caption("✔ No promoted column's casing differs from the source warehouse.")
+                if not _case_kept:
+                    st.caption("✔ No promoted column's casing differs from the source warehouse.")
             else:
                 # approved rows still showing = approved but not yet applied (in-place apply resolves
                 # a row, so it leaves this list once done).
@@ -2447,6 +2555,7 @@ elif step == 3:
                "spinner/status box means it's working, not hung.")
 
     _prepare_bundle()
+    _remembered_panel("validate")
     selected_ids = st.session_state.get("selected_ids", [])
 
     # SELF-HEAL the bundle in place, every time this page loads. _prepare_bundle only runs on a
@@ -3207,7 +3316,6 @@ elif step == 3:
 
         # ── Stage 2: Column drop (if validation failed) ────────────────────
         val_errors = st.session_state.get("validation_errors", [])
-        val_ok     = st.session_state.get("validation_ok", [])
 
         # Findings come from the discovery probe (the complete union across passes) when it has
         # run; otherwise from the single latest validate. `_discovered` also switches Stage-2 to a
@@ -3487,6 +3595,10 @@ elif step == 3:
                         _items, _man = drop_columns(_items, _drop)
                         _record_drop(_man)
                         st.session_state.setdefault("dropped_col_names", set()).update(_drop)
+                        # Durable like Source Audit drops: a rebuild re-applies them and the team remembers them.
+                        # Only drops scoped to one table; a bare name would strip the column from every table.
+                        st.session_state.setdefault("skip_columns", set()).update(
+                            _k for _k in _drop if "::" in _k)
                     st.session_state.transformed_items = _items
                     _tcr.clear(); _tcd.clear()
                     filtered_fixed = [i for i in st.session_state.transformed_items
@@ -3613,6 +3725,10 @@ elif step == 3:
                         fixed, _man = drop_columns(st.session_state.transformed_items, drop_set)
                         _record_drop(_man)
                         st.session_state.setdefault("dropped_col_names", set()).update(drop_set)
+                        # Durable like Source Audit drops: a rebuild re-applies them and the team remembers them.
+                        # Only drops scoped to one table; a bare name would strip the column from every table.
+                        st.session_state.setdefault("skip_columns", set()).update(
+                            _k for _k in drop_set if "::" in _k)
                         # A drop that leaves a table with 0 columns (or orphans it) must prune the
                         # WHOLE table + cascade its refs, or import hard-fails "0 columns" /
                         # "No matches found for table". The discovery loop already does this on its
@@ -4354,6 +4470,10 @@ elif step == 3:
                         _items, _man = drop_columns(_items, _drop)
                         _record_drop(_man)
                         st.session_state.setdefault("dropped_col_names", set()).update(_drop)
+                        # Durable like Source Audit drops: a rebuild re-applies them and the team remembers them.
+                        # Only drops scoped to one table; a bare name would strip the column from every table.
+                        st.session_state.setdefault("skip_columns", set()).update(
+                            _k for _k in _drop if "::" in _k)
                     st.session_state.transformed_items = _items
                     _tmsel.clear(); _tmrsel.clear()
                     filtered_fixed = [i for i in st.session_state.transformed_items
@@ -4724,6 +4844,10 @@ elif step == 3:
                         st.session_state.transformed_items = fixed
                         _record_drop(_man)
                         st.session_state.setdefault("dropped_col_names", set()).update(_all_drop)
+                        # Durable like Source Audit drops: a rebuild re-applies them and the team remembers them.
+                        # Only drops scoped to one table; a bare name would strip the column from every table.
+                        st.session_state.setdefault("skip_columns", set()).update(
+                            _k for _k in _all_drop if "::" in _k)
                     if _tbl_now:
                         # Prune whole tables (empty / orphaned) and persist so a re-export keeps them
                         # dropped — mirrors the not-on-target prune path.
@@ -4755,7 +4879,7 @@ elif step == 3:
                     if _res:
                         st.rerun()
 
-        elif val_ok or val_ok == []:
+        elif "validation_ok" in st.session_state:   # validated, and nothing blocking
             tbls = mdls = leaves = 0
             for i in filtered_items:
                 d = _parse_edoc(i.get("edoc", "{}"))
@@ -5864,3 +5988,7 @@ elif step == 5:
             _show_errors_verbatim(failed.to_dict("records"), "importfail")
 
     _nav(5)
+
+
+# Remember this run's choices for the team, now that every page has had its say this run.
+_remember_choices(team_name)

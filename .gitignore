@@ -9,3 +9,4 @@ logs/
 .env.bak*
 *.bak
 config/teams.local.json
+config/choices.local.json
