@@ -1207,3 +1207,57 @@ def test_names_for_looks_up_by_type_and_leaves_unseen_guids_out():
     assert c.names_for({"LOGICAL_TABLE": ["g1", "g2"]}) == {"g1": "sales_customers"}
     assert sent["metadata"] == [{"identifier": "g1", "type": "LOGICAL_TABLE"},
                                 {"identifier": "g2", "type": "LOGICAL_TABLE"}]
+
+
+# ── ALL_OR_NONE: read the batch as applied, not as reported ──────────────────────────────────
+# The exact rows ps-internal returned on 2026-10-16 for a valid model batched with a table
+# carrying a column absent from the warehouse. The model row says OK; it did not land.
+_AON_FAILED = [
+    {"name": "Regional Ops Model", "type": "LOGICAL_TABLE", "status": "OK", "error": "",
+     "new_id": "548c0913-7aa1-432e-9cd8-5bb4fdc42f58"},
+    {"name": "unknown", "type": "", "status": "ERROR",
+     "error": "External column with name: samples.bakehouse.sales_customers.NO_SUCH_COLUMN_AON "
+              "does not exist in connection DB Prod.", "new_id": ""},
+]
+
+
+def test_a_failed_all_or_none_batch_lands_nothing_whatever_the_ok_rows_say():
+    from services.import_diagnostics import all_or_none_outcome, NOT_IMPORTED
+    landed, rows = all_or_none_outcome(_AON_FAILED)
+    assert landed is False
+    assert rows[0]["status"] == NOT_IMPORTED, "an OK row in a failed batch was never applied"
+    assert "all-or-nothing" in rows[0]["error"]
+    assert rows[1] == _AON_FAILED[1], "the platform's own refusal is kept verbatim"
+
+
+def test_a_clean_all_or_none_batch_is_left_alone():
+    from services.import_diagnostics import all_or_none_outcome
+    clean = [dict(_AON_FAILED[0]), {"name": "T", "type": "LOGICAL_TABLE", "status": "WARNING",
+                                    "error": "accepted with a note", "new_id": "g"}]
+    landed, rows = all_or_none_outcome(clean)
+    assert landed is True and rows == clean, "WARNING landed; it is not a failure"
+
+
+def test_an_empty_batch_counts_as_landed():
+    # A promotion of only liveboards has no tables or models, so the core batch is empty and
+    # must not stop the run.
+    from services.import_diagnostics import all_or_none_outcome
+    assert all_or_none_outcome([]) == (True, [])
+
+
+def test_not_imported_rows_count_as_failed_on_the_results_page():
+    # The results page counts anything outside OK/WARNING as failed. NOT_IMPORTED must land there.
+    from services.import_diagnostics import all_or_none_outcome
+    _, rows = all_or_none_outcome(_AON_FAILED)
+    assert not [r for r in rows if r["status"].upper() in ("OK", "WARNING")]
+
+
+def test_a_restated_not_imported_row_is_rejected_for_others_not_a_failure_of_its_own():
+    # all_or_none_outcome restates the valid rows of a failed batch as NOT_IMPORTED. On Import
+    # Results they belong with "not imported only because another object failed", so one real
+    # failure doesn't read as two.
+    from services.import_diagnostics import all_or_none_outcome, rejected_for_others
+    _, rows = all_or_none_outcome([
+        {"name": "model", "status": "OK", "error": ""},
+        {"name": "table", "status": "ERROR", "error": "External column with name: x does not exist"}])
+    assert [rejected_for_others(r) for r in rows] == [True, False]
