@@ -5350,7 +5350,10 @@ elif step == 4:
                         leaf_errors = []
                         if leaves:
                             leaf_val   = target_client().import_tml(list(leaves.values()), policy="VALIDATE_ONLY")
-                            leaf_errors = [r for r in leaf_val if r["status"] != "OK"]
+                            # WARNING is ThoughtSpot accepting something (often just "Object with
+                            # GUID ... already exists. New GUID will be used" on a shared cluster),
+                            # not a viz that fails to load. Only real errors go to review.
+                            leaf_errors = [r for r in leaf_val if is_blocking_result(r)]
 
                     if leaf_errors:
                         st.session_state.import_leaf_errors = leaf_errors
