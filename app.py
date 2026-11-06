@@ -674,11 +674,19 @@ def _remembered_panel(where: str) -> None:
     lines = team_choices.describe(ch)
     if not lines:
         return
-    with st.expander(f"Applied from this team's earlier runs: {len(lines)} choice(s)", expanded=False):
+    # A remembered drop is applied before anyone sees it, so a join key among them is said here,
+    # read against the source's own TML (the bundle no longer has the joins it removed).
+    keys = describe_impact(join_key_impact(st.session_state.get("_source_raw_items") or [],
+                                           ch.get("drop_columns") or []))
+    with st.expander(f"Applied from this team's earlier runs: {len(lines)} choice(s)",
+                     expanded=bool(keys)):
         st.caption("Made and approved in an earlier run of this team's content, so this run didn't "
                    "ask again. Each one only applies where that table and column turn up.")
         for _ln in lines:
             st.markdown(f"- {_ln}")
+        if keys:
+            st.warning("\n\n".join(keys) + "\n\nTo keep one, use **Put back** under **Skip specific "
+                       "columns** on TML Validation, or forget all of these below.")
         if st.button("Forget these and start fresh", key=f"forget_choices_{where}"):
             for _k in ("skip_columns", "dropped_col_names", "prune_tables", "realign_types",
                        "recase_target_approved", "recase_approved", "_source_case_durable"):
@@ -686,6 +694,26 @@ def _remembered_panel(where: str) -> None:
             st.session_state._choices_remembered = team_choices.empty()
             st.session_state._conn_dirty = True   # rebuild the bundle without them
             st.rerun()
+
+
+def _put_back(key: str) -> None:
+    """Undo one left-out column. It returns on the next rebuild, and so does any table its drop
+    cut off from the model: dropping a join key prunes the tables it joined, and putting the key
+    back without them would leave those joins pointing at nothing."""
+    k = (key or "").strip().lower()
+    for name in ("skip_columns", "dropped_col_names"):
+        if st.session_state.get(name):
+            st.session_state[name] = {x for x in st.session_state[name] if str(x).strip().lower() != k}
+    cut = {t.strip().lower() for m in join_key_impact(
+        st.session_state.get("_source_raw_items") or [], {key}) for t in m["cut_off_tables"]}
+    if cut and st.session_state.get("prune_tables"):
+        st.session_state.prune_tables = {t for t in st.session_state.prune_tables
+                                         if t.strip().lower() not in cut}
+    rem = st.session_state.get("_choices_remembered")
+    if rem:
+        rem["drop_columns"] = [x for x in rem.get("drop_columns") or [] if x.strip().lower() != k]
+        rem["prune_tables"] = [t for t in rem.get("prune_tables") or [] if t.strip().lower() not in cut]
+    st.session_state._conn_dirty = True   # rebuild from source without it
 
 
 def _join_key_warning(drops) -> None:
@@ -1283,6 +1311,14 @@ def _prepare_bundle():
                 transformed_items, _man = drop_columns(transformed_items, skip_cols)
                 _record_drop(_man)
                 st.session_state.setdefault("dropped_col_names", set()).update(skip_cols)
+                # The same cleanup an applied skip runs: a table the drops emptied or cut off from
+                # the model goes with them. Derived here from the drops themselves, so a remembered
+                # drop rebuilds with its prunes even when the stored prune list was reset (step 1
+                # clears it on a selection change), instead of leaving a disconnected table behind.
+                _cut = {f["table"] for f in table_cleanup_findings(transformed_items)}
+                if _cut:
+                    transformed_items, _ = prune_tables_whole(transformed_items, _cut)
+                    st.session_state.setdefault("prune_tables", set()).update(_cut)
             # Realign stale TML types the operator approved on Source Audit — persisted across
             # re-exports (a fresh export would otherwise re-import the stale type). Scoped
             # `table::col` -> TS token; already-dropped columns are gone, so this is a no-op for them.
@@ -2704,11 +2740,24 @@ elif step == 3:
             # headers: left-aligned natively (a button label is centred and resists restyling) and
             # its own key holds the open/closed state across the reruns that ticking causes, so it
             # never snaps shut mid-selection the way an expander's `expanded` argument does.
+            _left = sorted(st.session_state.get("skip_columns") or set())
             _sec_hdr = (f"**Skip specific columns**  ·  {len(_tbl_cols)} table(s)"
+                        + (f"  ·  {len(_left)} left out" if _left else "")
                         + (f"  ·  {len(_skip_sel)} ticked" if _skip_sel else ""))
             _sec_open = st.checkbox(_sec_hdr, key="skipsec_open")
             st.caption("Leave a column out and keep the rest (optional). Expand a table to tick "
                        "its columns.")
+            # A column already left out is gone from the tables below, so it is listed here instead,
+            # whether it was skipped this run or remembered from an earlier one. Without this the
+            # only way to bring one back was to forget every remembered choice at once.
+            if _left:
+                st.markdown(f"**Left out of this promotion:** {len(_left)} column(s)")
+                for _lk in _left:
+                    _lc1, _lc2 = st.columns([4, 1])
+                    _lc1.markdown(f"`{_lk.replace('::', '.')}`")
+                    if _lc2.button("Put back", key=f"putback::{_lk}"):
+                        _put_back(_lk)
+                        st.rerun()
             _skq, _any_shown = "", False
             if _sec_open:
                 _skq = st.text_input("Filter columns to skip", key="skip_search",
@@ -3258,10 +3307,12 @@ elif step == 3:
                 _run_discover(filtered_items, _disc)
             st.rerun()
         if _dm:
-            _rtail = {"clean": " · validated clean",
+            _n_block = len(distinct_causes(blocking(st.session_state.get("discovered_findings", []))))
+            # "clean" is the throwaway copy after the probe resolved what it found, so with issues
+            # listed it means "clean once these are resolved", never "nothing to do".
+            _rtail = {"clean": (" · clean once these are resolved" if _n_block else " · validated clean"),
                       "no_progress": " · stopped before clean (remaining errors can't be auto-resolved)",
                       "request_failed": " · stopped: connection to the target failed — warm the warehouse and retry"}
-            _n_block = len(distinct_causes(blocking(st.session_state.get("discovered_findings", []))))
             _n_warn  = len(st.session_state.get("accepted_warnings") or [])
             st.caption(f"Validation: {_n_block} issue(s)"
                        + (f" · {_n_warn} accepted with a warning" if _n_warn else "")
@@ -4007,11 +4058,24 @@ elif step == 3:
                         # lags a write and keeps naming it for up to a minute after the cascade.
                         _only_promo = (not _roots and not _unres and not _cblk and not _disp
                                        and not _jgroups)
+                        # The rewrite only happens if the promoted version itself imports. When it
+                        # has its own error in the same validation, the target keeps its current
+                        # copy and that copy is what blocks (GSK 2026-11-06: a 14547 on Source Of
+                        # Business kept it blocking, while this said there was nothing to clear).
+                        _own_err = [f for f in findings if f["kind"] != "drop_blocked_by_dependents"]
                         _msg = ("ThoughtSpot also lists "
                                 + ", ".join(f"**{n}**" for n in _inpromo)
                                 + ", which is what this promotion is updating. The import rewrites "
                                   "it with the column already gone, so there is nothing to clear.")
-                        if _only_promo:
+                        if _own_err:
+                            st.warning("ThoughtSpot also lists "
+                                       + ", ".join(f"**{n}**" for n in _inpromo)
+                                       + ", which this promotion is updating. The import only "
+                                         "rewrites it once the promoted version validates, and "
+                                         "this validation found other problems on this page. "
+                                         "Until those are fixed the target keeps its current copy, "
+                                         "and that copy is what blocks the column.")
+                        elif _only_promo:
                             st.success(_msg + " **That is the only thing still listed, so run "
                                               "validation again.** The target's dependency state "
                                               "lags a write by up to a minute, which is usually "

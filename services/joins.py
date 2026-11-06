@@ -164,8 +164,11 @@ def join_key_impact(items, drops) -> list:
                          and any(n in comp and comp & main for comp in before))
             lost = [c.get("name") or "" for c in node.get("columns") or []
                     if (c.get("column_id") or "").split("::")[0] in cut]
+            table_of = {(mt.get("alias") or mt.get("name") or ""): (mt.get("name") or "")
+                        for mt in entries}
             out.append({"model": node.get("name") or "", "columns": sorted(keys), "joins": gone,
-                        "cut_off": cut, "lost_columns": [x for x in lost if x]})
+                        "cut_off": cut, "lost_columns": [x for x in lost if x],
+                        "cut_off_tables": sorted({table_of.get(a, a) for a in cut})})
     return out
 
 

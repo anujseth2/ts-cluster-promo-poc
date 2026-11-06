@@ -223,10 +223,14 @@ def classify_import_errors(results):
                                      "columns": [], "dependents": []})
                     made = True
             # Format B: "Deleted columns have dependents.<br/>- <b>COLUMN</b><ul><li>DEP</li>…</ul>"
-            # — names the deleted COLUMN and its dependent object(s). Far more actionable.
+            # — names the deleted COLUMN and its dependent object(s). Far more actionable. One
+            # message can carry several columns, each its own "- <b>COL</b>…<ul>…</ul>" block after
+            # the one header; reading only the first hid the rest (GSK 2026-11-06: Diagnosis was
+            # shown and DIAGNOSIS_CATEGORY, with the two joins blocking it, was not).
+            _hdr = re.search(r"Deleted columns have dependents\.\s*<br/?>", msg)
             for m in re.finditer(
-                    r"Deleted columns have dependents\.\s*<br/?>\s*-\s*<b>([^<]+)</b>(.*?)</ul>",
-                    msg, re.S):
+                    r"-\s*<b>([^<]+)</b>\s*(?:</?br/?>\s*)*<ul>(.*?)</ul>",
+                    msg[_hdr.end():] if _hdr else "", re.S):
                 col  = m.group(1).strip()
                 deps = [d.strip() for d in re.findall(r"<li>([^<]+)</li>", m.group(2)) if d.strip()]
                 if col:
@@ -1837,6 +1841,22 @@ def _refs_table_prefix(obj, table_targets):
     return False
 
 
+def _aliases_of(docs, table_targets):
+    """The aliases a model gives the target tables. A model that uses a table twice names each
+    copy by its alias, and its columns, joins and formulas refer to `[alias::col]`, never to the
+    table name, so a table drop has to treat every alias as the table. (GSK 2026-11-06: pruning
+    dim_launch_date_alignment_sob left `dim_launch_date_alignment_sob (Monthly)::LAUNCH_MONTH_NUMBER`
+    behind, and ThoughtSpot refused the model with 14547.)"""
+    out = set()
+    for doc in docs:
+        for key in ("model", "worksheet"):
+            for mt in ((doc.get(key) or {}).get("model_tables") or []):
+                if ((mt.get("name") or "").strip().lower() in table_targets
+                        and (mt.get("alias") or "").strip()):
+                    out.add(mt["alias"].strip().lower())
+    return out
+
+
 def _model_table_columns(docs, table_targets):
     """Column keys (db-name + display, lowercased) for every model column belonging to a
     target table (matched by column_id prefix), plus the display names for reporting."""
@@ -1902,6 +1922,7 @@ def _table_drop_plan(items, table_names):
     dropped_col_names) plus human-readable lists (columns, joins, formulas, vizzes)."""
     targets = {t.strip().lower() for t in table_names}
     docs = [_parse_edoc(it) for it in items]
+    targets |= _aliases_of(docs, targets)
     phys_keys, phys_display = _model_table_columns(docs, targets)
 
     all_formulas = []
