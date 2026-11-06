@@ -26,6 +26,7 @@ from services.tml_transformer import (
 from services.import_diagnostics import (
     classify_import_errors, drop_columns, silent_drop_findings, column_dependents, column_usage,
     drop_vizzes, table_drop_preview, drop_tables, warehouse_missing_findings, friendly_error,
+    set_aside_warehouse_missing,
     column_drop_cascade, finding_key, dangling_reference_findings, table_cleanup_findings,
     realign_column_types, warehouse_type_to_ts, warehouse_type_findings, type_family, type_class,
     recase_columns, model_tables_without_columns, prune_tables_whole, prune_stale_realignments,
@@ -2870,6 +2871,20 @@ elif step == 3:
             _tick = progress or (lambda *_a: None)
             work = [dict(it) for it in items]
             seen, passes, clean, reason = {}, 0, False, "no_progress"
+            # ThoughtSpot reports ONE missing column per table per validation, so a table missing
+            # four columns costs four rounds (GSK RespBio 2026-11-06: five passes, where September
+            # runs that dropped the same columns first took one). The target warehouse read at
+            # export already knows every missing column, so hide all of those on the copy before
+            # the first pass. Warehouse-verified only: a guess from the modeled columns could hide
+            # a column that is really there.
+            work, _pre = set_aside_warehouse_missing(
+                work, st.session_state.get("_warehouse_col_map") or {},
+                connection=_target_conn_label())
+            if _pre:
+                for f in _pre:
+                    seen.setdefault(finding_key(f), f)
+                _tick(f"{len(_pre)} column(s) the target warehouse doesn't have are set aside on "
+                      "the copy before validating, so they don't each cost a round.", 0.05)
             # Warnings ThoughtSpot accepted, kept apart from the issues to resolve.
             accepted_warnings = {}
             SAFETY = 40   # backstop only; real termination is clean / no-progress

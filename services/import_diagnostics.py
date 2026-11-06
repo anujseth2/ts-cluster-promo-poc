@@ -419,11 +419,17 @@ def distinct_causes(findings):
     findings = list(findings or [])
     detailed = {(f.get("object") or "").strip().lower() for f in findings
                 if f.get("kind") == "drop_blocked_by_dependents" and f.get("columns")}
+    # The column-level form usually arrives named "unknown", so its table can't be matched to the
+    # table-level notice. When ThoughtSpot has named any blocked column, the table-level notices
+    # are echoes of those columns, not problems of their own (GSK 2026-11-06: four of them counted
+    # as four extra issues on top of the three columns actually blocked).
+    any_detailed = bool(detailed)
     seen = {}
     for f in findings:
         k = f.get("kind")
         obj = (f.get("object") or "").strip().lower()
-        if k == "drop_blocked_by_dependents" and not f.get("columns") and obj in detailed:
+        if k == "drop_blocked_by_dependents" and not f.get("columns") and (
+                obj in detailed or any_detailed):
             continue
         key = (k, _normalised_error(f.get("error"))) if k == "other" else finding_key(f)
         seen.setdefault(key, f)
@@ -665,6 +671,24 @@ def dangling_reference_findings(items):
                                 "error": (f"Column '{c.get('name','?')}' surfaces {w} — a formula "
                                           f"that no longer exists. Dropping the column resolves it.")})
     return out
+
+
+def set_aside_warehouse_missing(items, cdw_map, connection=""):
+    """For the validation probe: take every column the target warehouse verifiably lacks out of a
+    COPY before the first validation, with whatever that empties or cuts off. ThoughtSpot reports
+    one missing column per table per validation, so a table missing four columns otherwise costs
+    four rounds (GSK RespBio 2026-11-06: five passes where the same set, dropped first, took one).
+    Verified columns only: a guess from modeled columns could set aside one that is really there.
+    Returns (new_items, findings), findings in the same shape validation produces."""
+    found = [f for f in warehouse_missing_findings(items, cdw_map or {}, connection=connection)
+             if f.get("verified")]
+    if not found:
+        return items, []
+    out, _ = drop_columns(items, {f"{f['object']}::{f['column']}" for f in found})
+    cut = {f["table"] for f in table_cleanup_findings(out)}
+    if cut:
+        out, _ = prune_tables_whole(out, cut)
+    return out, found
 
 
 def warehouse_missing_findings(items, cdw_map, fallback_map=None, connection=""):
