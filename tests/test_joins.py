@@ -85,3 +85,9 @@ def test_the_block_explanation_says_what_is_true_for_each_case():
 def test_a_lowercased_drop_key_is_shown_as_the_join_spells_it():
     (imp,) = jn.join_key_impact(ITEMS, {FACT + "::diagnosis_category"})
     assert imp["columns"] == [FACT + "::DIAGNOSIS_CATEGORY"]
+
+
+def test_a_model_outside_the_promotion_points_at_the_sweep():
+    j = [{"from": "d (east)", "with": "f"}]
+    s = jn.describe_join_block("K", "M", ["d_to_f_abc1234"], j, None, False)
+    assert "What the target holds" in s

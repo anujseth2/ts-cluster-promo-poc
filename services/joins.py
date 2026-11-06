@@ -213,6 +213,10 @@ def describe_join_block(column: str, model: str, names: list, joins: list,
     if dropped_here:
         s += (" This run is dropping the column: keep it instead (recase it, realign it, or add it "
               "to the warehouse) unless the model really should lose these joins.")
+    elif promoted is None and model:
+        s += (" The promoted table no longer has the column. Either it goes back into the source "
+              f"table, or **{model}** loses these joins on the target: tick it under **What the "
+              "target holds** to see everything that removes before deciding.")
     else:
         s += (" The promoted table no longer has the column. Either it goes back into the source "
               "table, or whoever owns the model on the target changes these joins first.")

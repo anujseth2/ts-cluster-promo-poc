@@ -590,3 +590,55 @@ def test_a_bare_column_with_no_table_known_still_matches():
                                {"ddd_brand_status"}, lambda i: _j.dumps(doc), lambda i: [],
                                qualified=set())
     assert actions[0]["removed"] == ["fact_subnational_respbio_br::ddd_brand_status"]
+
+
+# A join key on the target (GSK Source Of Business, 2026-11-06): the fact joins one dim on its
+# own key and two aliases of another dim on a composite key that includes DIAGNOSIS_CATEGORY.
+_F, _D = "fact_sob", "dim_launch"
+_ON = "[" + _D + "::M] = [" + _F + "::M] AND [" + _D + "::DIAGNOSIS] = [" + _F + "::DIAGNOSIS_CATEGORY]"
+
+
+def _sob(all_joins_use_key=False):
+    sob_on = ("[dim_sob::D] = [" + _F + "::DIAGNOSIS_CATEGORY]" if all_joins_use_key
+              else "[dim_sob::D] = [" + _F + "::Week_ID]")
+    return json.dumps({"model": {"name": "Source Of Business", "model_tables": [
+        {"name": _F},
+        {"name": "dim_sob", "joins": [{"with": _F, "on": sob_on}]},
+        {"name": _D, "alias": _D + " (Monthly)", "joins": [{"with": _F, "on": _ON}]},
+        {"name": _D, "alias": _D + " (weekly)", "joins": [{"with": _F, "on": _ON}]}],
+        "columns": [
+            {"name": "Diagnosis Category", "column_id": _F + "::DIAGNOSIS_CATEGORY"},
+            {"name": "Week", "column_id": "dim_sob::D"},
+            {"name": "Launch Month Number", "column_id": _D + " (Monthly)::LAUNCH_MONTH_NUMBER"},
+            {"name": "Launch Week Number", "column_id": _D + " (weekly)::LAUNCH_WEEK_NUMBER"}]}})
+
+
+def test_a_join_key_can_be_swept_and_the_plan_says_what_goes_with_it():
+    tml = {"m": _sob(), "a1": _answer("Launch Curve", "Launch Month Number"),
+           "a2": _answer("Weekly", "Week")}
+    deps = {"m": [{"id": "a1", "name": "Launch Curve", "type": "QUESTION_ANSWER_BOOK"},
+                  {"id": "a2", "name": "Weekly", "type": "QUESTION_ANSWER_BOOK"}]}
+    actions, blocked = plan_cascade(
+        [{"id": "m", "name": "Source Of Business", "type": "LOGICAL_TABLE"}],
+        {"diagnosis_category"}, tml.get, lambda i: deps.get(i, []),
+        qualified={_F + "::diagnosis_category"})
+    assert blocked == []
+    by = {a["id"]: a for a in actions}
+    jk = by["m"]["join_key"]
+    assert len(jk["joins"]) == 2 and jk["tables"] == [_D]
+    assert jk["lost_columns"] == ["Launch Month Number", "Launch Week Number"]
+    assert "JOIN KEY" in by["m"]["detail"]
+    model = json.loads(by["m"]["new_edoc"])["model"]
+    assert _D not in json.dumps(model), "the cut-off dim and everything on it is gone"
+    assert [c["name"] for c in model["columns"]] == ["Week"]
+    assert by["a1"]["action"] == "delete", "an answer on a lost launch column goes too"
+    assert "a2" not in by, "an answer on a column that stays is left alone"
+
+
+def test_a_join_key_that_holds_the_columns_own_table_on_is_refused():
+    tml = {"m": _sob(all_joins_use_key=True)}
+    actions, blocked = plan_cascade(
+        [{"id": "m", "name": "Source Of Business", "type": "LOGICAL_TABLE"}],
+        {"diagnosis_category"}, tml.get, lambda i: [],
+        qualified={_F + "::diagnosis_category"})
+    assert actions == [] and blocked and "cut that table off" in blocked[0]["reason"]

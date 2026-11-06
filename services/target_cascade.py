@@ -22,11 +22,20 @@ IO is injected (fetch_tml, fetch_deps) so the walk is testable without a cluster
 """
 
 from services.import_diagnostics import (
-    _parse_edoc, classify_import_errors, dependents_using_columns, drop_columns,
-    strip_vizzes_from_tml,
+    _parse_edoc, classify_import_errors, dependents_using_columns, drop_columns, drop_tables,
+    strip_vizzes_from_tml, table_cleanup_findings,
 )
+from services.joins import join_key_impact
 
 MODEL_KINDS = ("model", "worksheet")
+
+
+def _model_columns(items):
+    doc = _parse_edoc(items[0]) if items else {}
+    for k in MODEL_KINDS:
+        if doc.get(k):
+            return doc[k].get("columns") or []
+    return []
 
 
 def _kind_of(doc):
@@ -205,12 +214,51 @@ def _walk(seeds, column_names, fetch_tml, fetch_deps, skip_ids=(), skip_names=()
                 no_ref.append({"id": oid, "name": obj.get("name"), "kind": "model"})
                 continue                      # this model does not surface the column
             new_items, man = drop_columns([{"edoc": edoc}], scoped)
-            actions.append({"id": oid, "name": obj.get("name"), "type": "LOGICAL_TABLE",
-                            "action": "strip_columns", "new_edoc": new_items[0]["edoc"],
-                            "removed": sorted(scoped), "verify": {"columns": sorted(scoped)},
-                            "detail": "remove " + ", ".join(sorted(scoped))
-                                      + (f"; cascades {len(man.get('formulas') or [])} formula(s)"
-                                         if man.get("formulas") else "")})
+            # A join key. Its joins went with it, and a table that only they connected is now cut
+            # off from the model, which the platform refuses. The owner may still want the column
+            # gone, so the edit prunes those tables too and the plan says exactly what goes; the
+            # app asks for an explicit acknowledgement before applying it.
+            jk = join_key_impact([{"edoc": edoc}], scoped)
+            cut = {f["table"] for f in table_cleanup_findings(new_items)}
+            own = {(mt.get("name") or "").strip().lower()
+                   for mt in (node.get("model_tables") or [])
+                   if (mt.get("alias") or mt.get("name") or "").strip().lower()
+                   in {s.split("::")[0].strip().lower() for s in scoped if "::" in s}}
+            if cut & {t.lower() for t in own} or (cut and len(cut) >= len(
+                    {(mt.get("name") or "").lower() for mt in node.get("model_tables") or []})):
+                blocked.append({"id": oid, "name": obj.get("name"),
+                                "reason": "every join that connects the column's own table uses "
+                                          "the column, so removing it would cut that table off "
+                                          "the model as well. Change the model's joins by hand "
+                                          "first."})
+                continue
+            lost = []
+            if cut:
+                _before = {c.get("name") for c in _model_columns(new_items)}
+                new_items, _ = drop_tables(new_items, cut)
+                lost = sorted(n for n in _before - {c.get("name") for c in _model_columns(new_items)}
+                              if n)
+                # Answers and boards built on those columns depend on this edit too, so the walk
+                # below has to find them as well as the ones using the column itself.
+                want |= {x.strip().lower() for x in lost}
+            detail = "remove " + ", ".join(sorted(scoped))
+            if man.get("formulas"):
+                detail += f"; cascades {len(man.get('formulas') or [])} formula(s)"
+            action = {"id": oid, "name": obj.get("name"), "type": "LOGICAL_TABLE",
+                      "action": "strip_columns", "new_edoc": new_items[0]["edoc"],
+                      "removed": sorted(scoped), "verify": {"columns": sorted(scoped)},
+                      "detail": detail}
+            if jk:
+                joins = [j for m in jk for j in m["joins"]]
+                cut_off = sorted({a for m in jk for a in m["cut_off"]})
+                action["join_key"] = {"joins": joins, "cut_off": cut_off,
+                                      "tables": sorted(cut), "lost_columns": lost}
+                action["detail"] += (
+                    f"; JOIN KEY: removes {len(joins)} join(s) ("
+                    + ", ".join(f"{j['from']} → {j['with']}" for j in joins) + ")"
+                    + (f" and cuts {', '.join(cut_off)} off the model" if cut_off else "")
+                    + (f", taking {', '.join(lost)} with them" if lost else ""))
+            actions.append(action)
             # its own dependents now have to be walked too
             for d in (fetch_deps(oid) or []):
                 did = str(d.get("id") or "")

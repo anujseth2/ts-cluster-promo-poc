@@ -4167,9 +4167,41 @@ elif step == 3:
                             _tb = st.text_input("Confirm", key="blk_del_confirm",
                                                 label_visibility="collapsed",
                                                 placeholder="type DELETE")
+                            # A join key takes joins, and the tables they connected, out of the
+                            # model on the target. The owner can choose that, but separately and
+                            # knowingly: it changes how the model joins, not just what it shows.
+                            _jka = [a for a in _acts if a.get("join_key")]
+                            _jk_ok = True
+                            if _jka:
+                                _jn = sum(len(a["join_key"]["joins"]) for a in _jka)
+                                _jt = sorted({t for a in _jka for t in a["join_key"]["tables"]})
+                                st.warning(
+                                    "**This removes a join key on the target.**\n\n"
+                                    + "\n".join(
+                                        f"- **{a['name']}**: {len(a['join_key']['joins'])} "
+                                        "join(s) go ("
+                                        + ", ".join(f"`{j['from']}` → `{j['with']}`"
+                                                    for j in a["join_key"]["joins"]) + ")"
+                                        + (", cutting off " + ", ".join(
+                                            f"`{t}`" for t in a["join_key"]["cut_off"]) +
+                                           ", which are removed from the model"
+                                           if a["join_key"]["cut_off"] else "")
+                                        + (", with the columns " + ", ".join(
+                                            f"`{c}`" for c in a["join_key"]["lost_columns"])
+                                           if a["join_key"]["lost_columns"] else "")
+                                        for a in _jka)
+                                    + "\n\nAnything built on those columns is in the plan above. "
+                                      "Results from this model can change: it no longer joins "
+                                      "through these tables.")
+                                _jk_ok = st.checkbox(
+                                    f"I understand this removes {_jn} join(s)"
+                                    + (f" and {len(_jt)} table(s) ({', '.join(_jt)})" if _jt else "")
+                                    + " from the model on the target.",
+                                    key="blk_jk_ack")
                             if st.button(f"Apply — {_ns} model(s) stripped, {_nt} board(s) "
                                          f"trimmed, {_nd} deleted", key="blk_del_go",
-                                         disabled=_tb.strip().upper() != "DELETE"):
+                                         disabled=(_tb.strip().upper() != "DELETE"
+                                                   or not _jk_ok)):
                                 import datetime as _dt
                                 _snapdir = (Path(__file__).parent / "logs" / "snapshots"
                                             / _dt.datetime.now().strftime("%Y%m%d-%H%M%S"))
@@ -4319,7 +4351,7 @@ elif step == 3:
                                                     label="Cascade applied, and the target now "
                                                           "accepts the import.",
                                                     state="complete")
-                                    for _k in ("blk_del_confirm", "_casc_key", "_casc_nodes",
+                                    for _k in ("blk_del_confirm", "blk_jk_ack", "_casc_key", "_casc_nodes",
                                                "_casc_roots", "_casc_blocked", "_casc_authors",
                                                "_casc_unres", "_casc_joins", "_casc_inpromo", "_casc_disp", "_casc_res_err",
                                                "discovered_findings", "discovered_meta"):
