@@ -42,6 +42,10 @@ from services.target_cascade import (
 )
 from services.table_matcher import column_signature
 from services.version_info import version_info, version_label
+from services.joins import (
+    model_joins, joins_using, match_join_names, join_key_impact, describe_impact,
+    describe_join_block,
+)
 from services import team_choices
 from services.connection_map import (
     connections_in, saved_map, effective_map, unmapped as unmapped_connections, target_for,
@@ -684,6 +688,16 @@ def _remembered_panel(where: str) -> None:
             st.rerun()
 
 
+def _join_key_warning(drops) -> None:
+    """Before a drop is applied: say which ticked columns are join keys, which joins go with them,
+    and what that cuts off from the model. Dropping a join key removes the whole join."""
+    lines = describe_impact(join_key_impact(st.session_state.get("transformed_items") or [],
+                                            drops or ()))
+    if lines:
+        st.warning("\n\n".join(lines) + "\n\nKeep the column instead (recase it, realign it, or add "
+                   "it to the warehouse) unless the model really should lose these joins.")
+
+
 def _recase_map(scoped_to_case: dict) -> dict:
     """{"Table::col": casing} -> the {table_lower: {col_lower: casing}} shape recasing takes."""
     out = {}
@@ -1095,13 +1109,17 @@ def _prepare_bundle():
                     or st.session_state.get("_export_fb_state") != _fb_state
                     or _objids_dirty or _conn_dirty)
     if selected_ids and _need_export:
+        # A new bundle hasn't been validated, whatever discarded the old one (a changed selection,
+        # leaving Source Audit, a connection change). Several callers drop the bundle without
+        # clearing its validation, so clear it here rather than trusting each of them to.
+        for _k in ("validation_errors", "validation_ok",
+                   "discovered_findings", "discovered_meta", "accepted_warnings"):
+            st.session_state.pop(_k, None)
         if "transformed_items" in st.session_state:
-            for _k in ("pr_url", "validation_errors", "validation_ok", "import_phase",
+            for _k in ("pr_url", "import_phase",
                        "import_core_results", "import_leaf_files", "import_leaf_errors",
                        "import_core_failed", "merge_failed", "silent_drops", "_fb_previews", "_nl_previews", "nl_report",
-                       "fb_replace_report", "_casing_diag",
-                       # a rebuilt bundle hasn't been validated yet
-                       "discovered_findings", "discovered_meta", "accepted_warnings"):
+                       "fb_replace_report", "_casing_diag"):
                 st.session_state.pop(_k, None)
         with st.status("Preparing the promotion bundle…", expanded=True) as _exp_status:
             st.write("① Exporting TML from the source cluster…")
@@ -2323,6 +2341,7 @@ elif step == 2:
                     },
                     disabled=["Table", "Column"])
                 st.caption(f"**{len(_ssel)}** source-absent column(s) approved to drop.")
+                _join_key_warning(_ssel)
                 if st.button("Apply source drops", disabled=not _ssel, key="srcabsent_apply"):
                     _apply_src_drops(_ssel, "source_missing_apply")
                     _ssel.clear()
@@ -2438,6 +2457,7 @@ elif step == 2:
                           "anything that sums it will need changing. Drop it instead if that isn't "
                           "wanted.")
                 st.caption(f"**{len(_strsel)}** to realign, **{len(_stsel)}** to drop.")
+                _join_key_warning(_stsel - _strsel)
                 if (_stsel or _strsel) and st.button("Apply source type fixes", key="srctype_apply"):
                     _items = st.session_state.transformed_items
                     _re   = {k: _src_realign_to[k] for k in _strsel if _src_realign_to.get(k)}
@@ -2730,6 +2750,8 @@ elif step == 3:
                         disabled=["Column"])
             if _sec_open and not _any_shown:
                 st.caption("No columns match the filter.")
+            if _skip_sel:
+                _join_key_warning(_skip_sel)
             # Apply/Clear stay reachable whenever something is ticked, even with the section shut —
             # collapsing must never strand a selection the operator has already made.
             _apply_skip = False
@@ -3583,6 +3605,8 @@ elif step == 3:
                     disabled=["#", "Table", "Promoted", "Target", "✓"],
                     exclusive=True)   # Recase? wins over Drop? per row
                 st.caption(f"**{len(_tcr)}** to recase, **{len(_tcd - _tcr)}** to drop.")
+                if not _discovered:
+                    _join_key_warning(_tcd - _tcr)
                 if not _discovered and st.button("Apply recase / drops & re-validate", key="tc_apply",
                                                  disabled=not (_tcr or _tcd)):
                     _items = st.session_state.transformed_items
@@ -3708,6 +3732,8 @@ elif step == 3:
                     disabled=["#", "Table", "Column", "Dependents (source)", "✓", "Connection"])
                 drop_set = set(_sel)
                 st.caption(f"**{len(drop_set)}** column(s) marked to drop.")
+                if not _discovered:
+                    _join_key_warning(drop_set)
 
                 # #7 — what's already gone this run, shown right here (not only on the next page).
                 _done = st.session_state.get("dropped_col_names", set())
@@ -3877,7 +3903,7 @@ elif step == 3:
                     _walk_key = (tuple(sorted(_blk_names)), tuple(sorted(_blk_scan_names)))
                     if st.session_state.get("_casc_key") != _walk_key:
                         for _k in ("_casc_nodes", "_casc_roots", "_casc_blocked", "_casc_disp",
-                                   "_casc_authors", "_casc_unres", "_casc_inpromo",
+                                   "_casc_authors", "_casc_unres", "_casc_joins", "_casc_inpromo",
                                    "_casc_res_err"):
                             st.session_state.pop(_k, None)
                     if "_casc_nodes" not in st.session_state:
@@ -3887,9 +3913,50 @@ elif step == 3:
                             except Exception as _e:
                                 # A refused lookup is not a verdict on what this account can see.
                                 _resolved, _res_err = {}, str(_e)
+                            # Some names are a model's JOINS, not objects. ThoughtSpot names each join
+                            # <table>_to_<table>_<suffix> and no search ever finds that, so recognise
+                            # them from the joins the TML defines: this bundle, the raw source export,
+                            # and the target's own copy of each table or model the list names.
+                            _join_groups, _join_named = [], set()
+                            _jcand = [n for n in _blk_names if not _resolved.get(n.strip().lower())]
+                            if _jcand and not _res_err:
+                                _bdocs = [_parse_edoc(_i.get("edoc", "{}")) for _i in (filtered_items or [])]
+                                _jdocs = _bdocs + [_parse_edoc(_i.get("edoc", "{}")) for _i in
+                                                   (st.session_state.get("_source_raw_items") or [])]
+                                for _h in {h["id"]: h for h in _resolved.values()
+                                           if h.get("type") == "LOGICAL_TABLE"}.values():
+                                    _e = _c_tml(_h["id"])
+                                    if _e:
+                                        _jdocs.append(_parse_edoc(_e))
+                                _bmodels = {(d.get("model") or d.get("worksheet") or {}).get("name")
+                                            for d in _bdocs}
+                                _gone = {str(x).split("::")[-1].strip().lower() for x in
+                                         (st.session_state.get("dropped_col_names") or set())}
+                                for _col in sorted(_col_deps, key=str.lower):
+                                    _jm = match_join_names([n for n in _col_deps[_col] if n in _jcand],
+                                                           _jdocs, column=_col)
+                                    _by_model = {}
+                                    for _n, _js in _jm.items():
+                                        _join_named.add(_n)
+                                        for _j in _js:
+                                            _g = _by_model.setdefault(_j["model"], {"names": [], "joins": []})
+                                            if _n not in _g["names"]:
+                                                _g["names"].append(_n)
+                                            if all((_j["from"], _j["with"]) != (x["from"], x["with"])
+                                                   for x in _g["joins"]):
+                                                _g["joins"].append(_j)
+                                    for _m, _g in _by_model.items():
+                                        _promoted = (None if _m not in _bmodels else bool(joins_using(
+                                            [j for d in _bdocs for j in model_joins(d) if j["model"] == _m],
+                                            _col)))
+                                        _join_groups.append(describe_join_block(
+                                            _col, _m, _g["names"], _g["joins"], _promoted,
+                                            _col.strip().lower() in _gone))
                             _cands, _inpromo, _unres = [], [], []
                             for _n in _blk_names:
                                 _h = _resolved.get(_n.strip().lower())
+                                if _n in _join_named:
+                                    continue
                                 if not _h:
                                     _unres.append(_n)
                                 elif _n.strip().lower() in _promo_names_b:
@@ -3914,6 +3981,7 @@ elif step == 3:
                         st.session_state._casc_blocked = _cblk
                         st.session_state._casc_disp    = _disp
                         st.session_state._casc_unres   = _unres
+                        st.session_state._casc_joins   = _join_groups
                         st.session_state._casc_res_err = _res_err
                         st.session_state._casc_inpromo = _inpromo
                         st.session_state._casc_authors = {c["id"]: c.get("author", "")
@@ -3924,16 +3992,21 @@ elif step == 3:
                     _cblk    = st.session_state.get("_casc_blocked") or []
                     _disp    = st.session_state.get("_casc_disp") or []
                     _unres   = st.session_state.get("_casc_unres") or []
+                    _jgroups = st.session_state.get("_casc_joins") or []
                     _res_err = st.session_state.get("_casc_res_err")
                     _inpromo = st.session_state.get("_casc_inpromo") or []
                     _authors = st.session_state.get("_casc_authors") or {}
+
+                    for _jg in _jgroups:
+                        st.warning(_jg)
 
                     if _inpromo:
                         # Not a blocker and never actionable: the import rewrites it. Saying
                         # "nothing to do" left the operator with no next step when it was the only
                         # thing left, which happens often because the platform's dependency state
                         # lags a write and keeps naming it for up to a minute after the cascade.
-                        _only_promo = not _roots and not _unres and not _cblk and not _disp
+                        _only_promo = (not _roots and not _unres and not _cblk and not _disp
+                                       and not _jgroups)
                         _msg = ("ThoughtSpot also lists "
                                 + ", ".join(f"**{n}**" for n in _inpromo)
                                 + ", which is what this promotion is updating. The import rewrites "
@@ -3996,7 +4069,7 @@ elif step == 3:
                                           "taken when this panel loaded, so use this if anything "
                                           "on the target has changed since."):
                             for _k in ("_casc_nodes", "_casc_roots", "_casc_blocked",
-                                       "_casc_disp", "_casc_authors", "_casc_unres",
+                                       "_casc_disp", "_casc_authors", "_casc_unres", "_casc_joins",
                                        "_casc_inpromo", "_casc_res_err"):
                                 st.session_state.pop(_k, None)
                             st.rerun()
@@ -4184,7 +4257,7 @@ elif step == 3:
                                                     state="complete")
                                     for _k in ("blk_del_confirm", "_casc_key", "_casc_nodes",
                                                "_casc_roots", "_casc_blocked", "_casc_authors",
-                                               "_casc_unres", "_casc_inpromo", "_casc_disp", "_casc_res_err",
+                                               "_casc_unres", "_casc_joins", "_casc_inpromo", "_casc_disp", "_casc_res_err",
                                                "discovered_findings", "discovered_meta"):
                                         st.session_state.pop(_k, None)
                                     for _r in _roots:
@@ -4457,6 +4530,8 @@ elif step == 3:
                 st.caption(f"**{len(_tmrsel)}** to realign, **{len(_tmsel)}** to drop. Realigning "
                            "keeps the column (your approval, not automatic); drop only as a last "
                            "resort.")
+                if not _discovered:
+                    _join_key_warning(_tmsel - _tmrsel)
 
                 if not _discovered and st.button("Apply realign / drops, re-export & re-validate",
                                                  key="tm_apply", disabled=not (_tmsel or _tmrsel)):
@@ -4828,6 +4903,7 @@ elif step == 3:
                            + (f"{len(_all_recase)} recase · " if _all_recase else ""))
                 st.caption("All of the above was found by validating repeatedly until clean — "
                            "tick realign or drop, then resolve everything in a single re-validate.")
+                _join_key_warning(_all_drop)
                 if st.button(f"Apply all resolutions & re-validate  ·  {_lbl_re}{len(_all_drop)} column(s){_lbl_tbl} to drop",
                              type="primary"):
                     if _all_realign:
